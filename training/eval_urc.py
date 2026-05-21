@@ -63,6 +63,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import warnings
 from pathlib import Path
@@ -204,7 +205,10 @@ def generate_completion(model, tokenizer, prompt: str, model_key: str, device) -
         )
 
     new_tokens = output_ids[0, input_ids.shape[1]:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    # Strip any <think>...</think> blocks Qwen3 may emit despite enable_thinking=False
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text
 
 
 def run_generation(model, tokenizer, model_key: str, eval_dir: Path, out_path: Path, n=None) -> list[dict]:
