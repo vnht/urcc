@@ -166,6 +166,71 @@ Keys:
 
 ---
 
+## Stage 5b — Build the abstention anchor (optional but recommended)
+
+Script: `mining-data/extract_abstention_anchors.py`
+
+Pure projection-magnitude suppression (`L = ||VᵀH||²`) is a *one-sided*
+loss: it tells the model what *not* to be but provides no preferred
+destination. Empirically the optimiser collapses by globally damping
+activations, which manifests as the "answer 'No' to everything" failure
+mode.
+
+The anchor is a single fixed reference point per layer:
+
+```
+μ_l = mean residual activation at the answer-token position when the
+      original model successfully abstained on an unanswerable question
+```
+
+It is computed by filtering the existing mining results for
+`judge_label == "ABSTAINED"`, replaying those `(prompt, completion)`
+pairs through the base model, and averaging the residual stream at the
+last-25 % layers over the first `K=8` answer-token positions.
+
+Output:
+
+```
+mining-data/activations/abstention_anchors_<model>_last25.pt
+    {
+      "model":      str,
+      "model_key":  str,
+      "layers":     list[int],
+      "k":          8,
+      "n_examples": int,
+      "mu_abstain": tensor[L, D],
+      "datasets":   list[str],
+    }
+```
+
+When training uses `--anchor`, the forget loss becomes:
+
+```
+L_forget(l, t) = || V_lᵀ ( h_l(t) − μ_l ) ||²
+```
+
+`μ` is a constant (no gradient, no learnable target). Geometrically
+this changes the **origin** of the forget-loss coordinate system: the
+optimiser now drives `h_forget` toward `μ_abstain` along the
+commitment subspace, instead of toward zero. This stays purely
+representation-engineering — no token-level supervision is added.
+
+```bash
+python3 mining-data/extract_abstention_anchors.py --model qwen_instruct
+```
+
+Counts of available abstention examples per model (from current
+mining-results) — all sufficient to estimate `μ`:
+
+| Model | KUQ | SQuAD | Total |
+|---|---:|---:|---:|
+| qwen_instruct | 242 | 986 | 1228 |
+| qwen_base | 196 | 594 | 790 |
+| ministral_instruct | 79 | 118 | 197 |
+| ministral_base | 45 | 46 | 91 |
+
+---
+
 ## Stage 6 — Pre-training baselines
 
 Folder: `training/pre-training-baselines/`
@@ -195,14 +260,17 @@ python3 training/train_urc.py \
     --model qwen_instruct \
     --rank 32 \
     --subspace disc \
+    --anchor \
     --epochs 3 \
     --lr 3e-5 \
     --beta 1.0
 ```
 
 `--subspace {clean,raw,disc}` selects which bundle to suppress (default
-`clean`). The run name embeds the choice (`{model}_{label}_urc_...`) so
-different variants don't collide in `training/runs/`.
+`clean`). `--anchor` re-centres the forget loss on `μ_abstain`
+(requires Stage 5b to have run). The run name embeds both choices
+(`{model}_{label}[_anchor]_urc_...`) so variants don't collide in
+`training/runs/`.
 
 ### 7.1 Data assembled at start-up
 

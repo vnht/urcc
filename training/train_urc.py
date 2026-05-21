@@ -250,6 +250,43 @@ def load_subspace(
     return V_layers, layer_indices, proj_norm_scale, path
 
 
+def load_abstention_anchor(
+    model_key: str, layer_indices: list[int],
+) -> tuple[list[torch.Tensor], Path]:
+    """
+    Returns (mu_layers, source_path).
+    mu_layers[i]: (hidden_dim,) tensor on CPU, aligned with layer_indices[i].
+    Used in compute_forget_loss to centre activations on the abstention manifold:
+        L_forget = || V^T (h_forget - mu) ||^2
+
+    The bundle is built by mining-data/extract_abstention_anchors.py; mu is a
+    fixed constant (no gradient) so it does NOT add a learnable target — it
+    only changes the origin of the forget-loss coordinate system.
+    """
+    p = ACTIVATIONS_DIR / f"abstention_anchors_{model_key}_last25.pt"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Abstention anchor file not found: {p}\n"
+            f"Run: python3 mining-data/extract_abstention_anchors.py --model {model_key}"
+        )
+    bundle = torch.load(p, map_location="cpu", weights_only=False)
+    mu      = bundle["mu_abstain"]            # (L, D)
+    layers  = bundle["layers"]
+    pos     = {l: i for i, l in enumerate(layers)}
+    missing = [l for l in layer_indices if l not in pos]
+    if missing:
+        raise KeyError(
+            f"Anchor bundle missing layers {missing}; has {layers}."
+        )
+    mu_layers = [mu[pos[l]].float() for l in layer_indices]
+    log.info("  Anchor: %s  n=%d  layers=%s",
+             p.name, bundle["n_examples"], layers)
+    log.info("  Anchor norms: %s",
+             "  ".join(f"L{l}={mu_layers[i].norm().item():.3f}"
+                       for i, l in enumerate(layer_indices)))
+    return mu_layers, p
+
+
 # ── Model loading + LoRA ──────────────────────────────────────────────────────
 
 def load_model_and_tokenizer(model_key: str, hf_token: str):
@@ -402,9 +439,13 @@ def compute_forget_loss(
     tokenizer,
     model_key: str,
     device: torch.device,
+    mu_layers: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """
     For each example, project answer-token residuals onto V and minimise norm.
+    If mu_layers is provided, residuals are centred on the abstention anchor
+    before projection: L = || V^T (h - mu) ||^2 (representation transport
+    toward the abstention manifold; mu is fixed, no gradient).
     Returns scalar loss and per-layer projection norm dict.
     """
     total_loss  = torch.tensor(0.0, requires_grad=True)
@@ -439,6 +480,8 @@ def compute_forget_loss(
         for li, (l_idx, h) in enumerate(zip(layer_indices, hiddens)):
             # h: (1, seq_len, D)
             ans_h = h[0, ans_start:ans_start + n_ans, :]  # (n_ans, D)
+            if mu_layers is not None:
+                ans_h = ans_h - mu_layers[li].to(ans_h.device).to(ans_h.dtype)
             V_l   = V_layers[li].to(ans_h.device)          # (D, rank)
             proj  = ans_h @ V_l                             # (n_ans, rank)
             # Expected ‖proj_vec‖² per answer token: sum across rank dims, mean across tokens.
@@ -554,12 +597,13 @@ def get_linear_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
 def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
           epochs: int = EPOCHS, lr: float = LEARNING_RATE,
           es_patience: int = 20, es_delta: float = 0.005, kl_max: float = 0.15,
-          subspace: str = "clean") -> None:
+          subspace: str = "clean", anchor: bool = False) -> None:
     hf_token = os.environ.get("HF_TOKEN", "")
 
-    label = SUBSPACE_VARIANTS[subspace]["label"]
+    label  = SUBSPACE_VARIANTS[subspace]["label"]
+    suffix = "_anchor" if anchor else ""
     run_name = (
-        f"{model_key}_{label}_urc_last25_r{rank}"
+        f"{model_key}_{label}{suffix}_urc_last25_r{rank}"
         f"_beta{beta:g}_ep{epochs}_lr{lr:.0e}"
     )
     out_dir  = RUNS_DIR / run_name
@@ -580,6 +624,12 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
     V_layers, layer_indices, proj_norm_scale, subspace_path = load_subspace(
         model_key, rank, variant=subspace,
     )
+
+    # ── Load abstention anchor (optional) ────────────────────────────────────
+    mu_layers: list[torch.Tensor] | None = None
+    anchor_path: Path | None = None
+    if anchor:
+        mu_layers, anchor_path = load_abstention_anchor(model_key, layer_indices)
 
     # ── Load model + apply LoRA ──────────────────────────────────────────────
     model, tokenizer = load_model_and_tokenizer(model_key, hf_token)
@@ -665,6 +715,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
             l_forget, finfo = compute_forget_loss(
                 model, forget_batch, V_layers, layer_indices,
                 tokenizer, model_key, device,
+                mu_layers=mu_layers,
             )
             # Retain step
             l_retain, rinfo = compute_retain_loss(
@@ -841,6 +892,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
         "model_id":             MODEL_REGISTRY[model_key],
         "method":               SUBSPACE_VARIANTS[subspace]["method"],
         "subspace_variant":     subspace,
+        "anchor":               anchor,
         "lora_rank":            LORA_R,
         "lora_alpha":           LORA_ALPHA,
         "lora_dropout":         LORA_DROPOUT,
@@ -876,6 +928,8 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
         "beta":              beta,
         "proj_norm_scale":   proj_norm_scale,
         "proj_norm_scale_source": "commitment_projection mean from subspace bundle (N=1000)",
+        "anchor":            anchor,
+        "anchor_file":       anchor_path.name if anchor_path is not None else None,
     }
     (out_dir / "subspace_config.json").write_text(
         json.dumps(subspace_config, indent=2)
@@ -900,6 +954,11 @@ def parse_args() -> argparse.Namespace:
                          "'clean' = retain_normalised_subspace_*.pt (default), "
                          "'raw' = raw_subspace_*.pt (uncleaned contrasts), "
                          "'disc' = discriminative_subspace_*.pt (Sigma_C - Sigma_A vs Sigma_R)"))
+    p.add_argument("--anchor", action="store_true",
+                   help=("Centre the forget loss on the abstention anchor: "
+                         "L = ||V^T (h - mu_abstain)||^2. Requires "
+                         "abstention_anchors_<model>_last25.pt (build with "
+                         "mining-data/extract_abstention_anchors.py)."))
     p.add_argument("--epochs",  type=int,   default=EPOCHS,
                    help=f"Number of training epochs (default: {EPOCHS})")
     p.add_argument("--lr",      type=float, default=LEARNING_RATE,
@@ -923,6 +982,7 @@ def main() -> None:
     log.info("  Beta     : %g", args.beta)
     log.info("  Rank     : %d", args.rank)
     log.info("  Subspace : %s", args.subspace)
+    log.info("  Anchor   : %s", "on" if args.anchor else "off")
     log.info("  Epochs   : %d", args.epochs)
     log.info("  LR       : %g", args.lr)
     if args.dry_run:
@@ -930,7 +990,7 @@ def main() -> None:
     train(args.model, beta=args.beta, rank=args.rank, dry_run=args.dry_run,
           epochs=args.epochs, lr=args.lr,
           es_patience=args.es_patience, es_delta=args.es_delta, kl_max=args.kl_max,
-          subspace=args.subspace)
+          subspace=args.subspace, anchor=args.anchor)
 
 
 if __name__ == "__main__":
