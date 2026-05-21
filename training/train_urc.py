@@ -413,7 +413,9 @@ def compute_forget_loss(
             ans_h = h[0, ans_start:ans_start + n_ans, :]  # (n_ans, D)
             V_l   = V_layers[li].to(ans_h.device)          # (D, rank)
             proj  = ans_h @ V_l                             # (n_ans, rank)
-            l_loss = (proj ** 2).mean()
+            # Expected ‖proj_vec‖² per answer token: sum across rank dims, mean across tokens.
+            # Matches `proj_norm_scale = tr(VᵀΣ_C V)` so L_forget_scaled ≈ 1 at start.
+            l_loss = (proj ** 2).sum(dim=-1).mean()
             ex_loss = ex_loss + l_loss
             layer_norms[l_idx].append(float(proj.detach().norm(dim=-1).mean()))
 
@@ -724,7 +726,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
                 accum_proj_norms = []
                 pbar.update(1)
                 pbar.set_postfix(
-                    Lf=f"{float((l_forget / proj_norm_scale).detach()):.3f}",
+                    Lf=f"{float(l_forget_scaled.detach()):.3f}",
                     Lr=f"{float(l_retain.detach()):.3f}",
                 )
 
@@ -863,8 +865,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--es-patience", type=int,   default=20,
                    help="Early stopping: stop if L_forget doesn't improve by "
                         "--es-delta over this many steps (default: 20, 0=off)")
-    p.add_argument("--es-delta",    type=float, default=0.005,
-                   help="Early stopping: minimum improvement in L_forget (default: 0.005)")
+    p.add_argument("--es-delta",    type=float, default=0.05,
+                   help="Early stopping: minimum improvement in L_forget (default: 0.05)")
     p.add_argument("--kl-max",      type=float, default=0.15,
                    help="Stop if retain KL exceeds this value (default: 0.15, 0=off)")
     p.add_argument("--dry-run", action="store_true",
