@@ -185,10 +185,10 @@ def generate_completion(model, tokenizer, prompt: str, model_key: str, device) -
         kw = {}
         if "qwen" in model_key:
             kw["enable_thinking"] = False
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, **kw
+        token_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, **kw
         )
-        input_ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=False).to(device)
+        input_ids = torch.tensor([token_ids], dtype=torch.long).to(device)
 
     with torch.no_grad():
         output_ids = model.generate(
@@ -354,13 +354,12 @@ def _tokenise_ppl(tokenizer, ex: dict, model_key: str) -> tuple[list[int], list[
         full_ids = tokenizer.encode(prompt + " " + response, add_special_tokens=True)
         resp_ids = tokenizer.encode(response, add_special_tokens=False)
     else:
-        prompt_fmt = tokenizer.apply_chat_template(
+        prompt_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=False, add_generation_prompt=True,
+            tokenize=True, add_generation_prompt=True,
         )
-        prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
-        resp_ids   = tokenizer.encode(response,   add_special_tokens=False)
-        full_ids   = prompt_ids + resp_ids
+        resp_ids   = tokenizer.encode(response, add_special_tokens=False)
+        full_ids   = list(prompt_ids) + resp_ids
 
     if len(full_ids) > MAX_SEQ_LEN:
         keep_resp = min(len(resp_ids), MAX_SEQ_LEN)
