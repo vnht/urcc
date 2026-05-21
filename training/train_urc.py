@@ -103,7 +103,7 @@ load_dotenv(REPO_ROOT / ".env")
 MODEL_REGISTRY = {
     "qwen_instruct":      "Qwen/Qwen3.5-9B",
     "qwen_base":          "Qwen/Qwen3.5-9B-Base",
-    "ministral_instruct": "mistralai/Ministral-3-8B-Instruct-2512",
+    "ministral_instruct": "mistralai/Ministral-3-8B-Instruct-2512-BF16",
     "ministral_base":     "mistralai/Ministral-3-8B-Base-2512",
 }
 
@@ -212,7 +212,7 @@ def load_model_and_tokenizer(model_key: str, hf_token: str):
 
     elif model_id.startswith("mistralai/"):
         from transformers import (
-            MistralCommonBackend, Mistral3ForConditionalGeneration, FineGrainedFP8Config,
+            MistralCommonBackend, Mistral3ForConditionalGeneration,
         )
         tokenizer = MistralCommonBackend.from_pretrained(model_id, token=hf_token)
         if sys.platform == "darwin":
@@ -226,7 +226,6 @@ def load_model_and_tokenizer(model_key: str, hf_token: str):
             model = Mistral3ForConditionalGeneration.from_pretrained(
                 model_id, device_map="auto", token=hf_token,
                 tie_word_embeddings=False,
-                quantization_config=FineGrainedFP8Config(dequantize=True),
             )
     else:
         raise ValueError(f"Unsupported model: {model_id}")
@@ -602,7 +601,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
             log.info(
                 "  accum %3d/%d  Lf=%.4f  Lr=%.4f",
                 accum_step, math.ceil(len(forget_data) / FORGET_BATCH_SIZE),
-                float(l_forget), float(l_retain),
+                float(l_forget.detach()), float(l_retain.detach()),
             )
 
             accum_forget = accum_forget + l_forget.detach()

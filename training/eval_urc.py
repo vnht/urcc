@@ -102,7 +102,7 @@ ID_TO_SHORTCUT = {v: k for k, v in SHORTCUTS.items()}
 MODEL_REGISTRY = {
     "qwen_instruct":      "Qwen/Qwen3.5-9B",
     "qwen_base":          "Qwen/Qwen3.5-9B-Base",
-    "ministral_instruct": "mistralai/Ministral-3-8B-Instruct-2512",
+    "ministral_instruct": "mistralai/Ministral-3-8B-Instruct-2512-BF16",
     "ministral_base":     "mistralai/Ministral-3-8B-Base-2512",
 }
 
