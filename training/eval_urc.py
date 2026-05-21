@@ -182,16 +182,16 @@ def generate_completion(model, tokenizer, prompt: str, model_key: str, device) -
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     else:
         messages = [{"role": "user", "content": prompt}]
-        if "qwen" in model_key:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
+        if "ministral" in model_key:
+            token_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True, return_dict=False,
             )
+            input_ids = torch.tensor([token_ids], dtype=torch.long).to(device)
         else:
             text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
-        input_ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=False).to(device)
+            input_ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=False).to(device)
 
     with torch.no_grad():
         output_ids = model.generate(
@@ -357,12 +357,19 @@ def _tokenise_ppl(tokenizer, ex: dict, model_key: str) -> tuple[list[int], list[
         full_ids = tokenizer.encode(prompt + " " + response, add_special_tokens=True)
         resp_ids = tokenizer.encode(response, add_special_tokens=False)
     else:
-        prompt_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=True, add_generation_prompt=True,
-        )
-        resp_ids   = tokenizer.encode(response, add_special_tokens=False)
-        full_ids   = list(prompt_ids) + resp_ids
+        if "ministral" in model_key:
+            prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True, add_generation_prompt=True, return_dict=False,
+            )
+        else:
+            prompt_fmt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            )
+            prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
+        resp_ids = tokenizer.encode(response, add_special_tokens=False)
+        full_ids = list(prompt_ids) + resp_ids
 
     if len(full_ids) > MAX_SEQ_LEN:
         keep_resp = min(len(resp_ids), MAX_SEQ_LEN)

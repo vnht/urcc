@@ -303,14 +303,14 @@ def tokenise_retain(
     else:
         user_msg = [{"role": "user", "content": prompt}]
         if "ministral" in model_key:
-            # MistralCommonBackend: tokenize=True returns a plain list of ints
-            prompt_ids   = tokenizer.apply_chat_template(
-                user_msg, tokenize=True, add_generation_prompt=True,
+            # MistralCommonBackend: return_dict=False returns a plain list[int]
+            prompt_ids = tokenizer.apply_chat_template(
+                user_msg, tokenize=True, add_generation_prompt=True, return_dict=False,
             )
         else:
-            # Qwen / standard tokenizer: tokenize=False avoids BatchEncoding issues
+            # Qwen: tokenize=False avoids BatchEncoding issues
             prompt_fmt = tokenizer.apply_chat_template(
-                user_msg, tokenize=False, add_generation_prompt=True,
+                user_msg, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
             prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
         response_ids = tokenizer.encode(response, add_special_tokens=False)
