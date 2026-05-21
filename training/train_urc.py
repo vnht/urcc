@@ -190,36 +190,64 @@ def load_retain_data() -> list[dict]:
 
 # ── Subspace loading ──────────────────────────────────────────────────────────
 
-def load_subspace(model_key: str, rank: int) -> tuple[list[torch.Tensor], list[int], float]:
+SUBSPACE_VARIANTS = {
+    "clean": {
+        "filename": "retain_normalised_subspace_{model}_last25_r{rank}.pt",
+        "build_cmd": "python3 mining-data/retain_normalised_subspace.py",
+        "label":     "retainnorm",
+        "method":    "retain_normalised_URC",
+    },
+    "raw": {
+        "filename": "raw_subspace_{model}_last25_r{rank}.pt",
+        "build_cmd": "python3 mining-data/raw_subspace.py",
+        "label":     "raw",
+        "method":    "raw_unsupported_URC",
+    },
+    "disc": {
+        "filename": "discriminative_subspace_{model}_last25_r{rank}.pt",
+        "build_cmd": "python3 mining-data/discriminative_subspace.py",
+        "label":     "disc",
+        "method":    "discriminative_URC_C-A",
+    },
+}
+
+
+def load_subspace(
+    model_key: str, rank: int, variant: str = "clean",
+) -> tuple[list[torch.Tensor], list[int], float, Path]:
     """
-    Returns (V_layers, layer_indices, proj_norm_scale).
-    V_layers[i]: (hidden_dim, rank) tensor on CPU, one per layer.
-    proj_norm_scale: mean commitment_projection across layers, computed over
-                     1000 training examples during subspace extraction — used
-                     to normalise L_forget so beta=1 means equal weighting.
+    Returns (V_layers, layer_indices, proj_norm_scale, source_path).
+
+    variant: which subspace bundle to load
+        - "clean" : retain_normalised_subspace_*.pt   (cleaned contrasts; original)
+        - "raw"   : raw_subspace_*.pt                  (uncleaned c_unsupported)
+        - "disc"  : discriminative_subspace_*.pt       (Sigma_C - Sigma_A vs Sigma_R)
     """
-    path = ACTIVATIONS_DIR / f"retain_normalised_subspace_{model_key}_last25_r{rank}.pt"
+    if variant not in SUBSPACE_VARIANTS:
+        raise ValueError(
+            f"Unknown subspace variant {variant!r}. "
+            f"Choose from {list(SUBSPACE_VARIANTS)}."
+        )
+    spec = SUBSPACE_VARIANTS[variant]
+    path = ACTIVATIONS_DIR / spec["filename"].format(model=model_key, rank=rank)
     if not path.exists():
         raise FileNotFoundError(
             f"Subspace file not found: {path}\n"
-            "Run mining-data/retain_normalised_subspace.py first."
+            f"Run: {spec['build_cmd']} --model {model_key} --rank {rank}"
         )
     bundle = torch.load(path, map_location="cpu", weights_only=False)
-    # Key in file uses British spelling; spec uses American — both accepted
     V = bundle.get("V_retain_normalised")
     if V is None:
         V = bundle.get("V_retain_normalized")
     if V is None:
         raise KeyError("Subspace bundle missing V_retain_normalised / V_retain_normalized key.")
     layer_indices = bundle["layers"]
-    # V: (num_layers, hidden_dim, rank)
     V_layers = [V[i].float() for i in range(V.shape[0])]
-    # commitment_projection[l] = tr(V_l^T Σ_C V_l), the expected L_forget per layer
-    # estimated over the full 1000-example training set — principled scale estimate
     proj_norm_scale = float(bundle["commitment_projection"].mean())
+    log.info("  Subspace[%s]: %s", variant, path.name)
     log.info("  Subspace: %d layers, rank=%d, D=%d  proj_norm_scale=%.4f",
              len(V_layers), rank, V.shape[1], proj_norm_scale)
-    return V_layers, layer_indices, proj_norm_scale
+    return V_layers, layer_indices, proj_norm_scale, path
 
 
 # ── Model loading + LoRA ──────────────────────────────────────────────────────
@@ -525,10 +553,15 @@ def get_linear_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
 
 def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
           epochs: int = EPOCHS, lr: float = LEARNING_RATE,
-          es_patience: int = 20, es_delta: float = 0.005, kl_max: float = 0.15) -> None:
+          es_patience: int = 20, es_delta: float = 0.005, kl_max: float = 0.15,
+          subspace: str = "clean") -> None:
     hf_token = os.environ.get("HF_TOKEN", "")
 
-    run_name = f"{model_key}_retainnorm_urc_last25_r{rank}_beta{beta:g}_ep{epochs}_lr{lr:.0e}"
+    label = SUBSPACE_VARIANTS[subspace]["label"]
+    run_name = (
+        f"{model_key}_{label}_urc_last25_r{rank}"
+        f"_beta{beta:g}_ep{epochs}_lr{lr:.0e}"
+    )
     out_dir  = RUNS_DIR / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Run: %s", run_name)
@@ -544,7 +577,9 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
         log.info("  Dry run: trimmed to 8 examples each")
 
     # ── Load subspace ────────────────────────────────────────────────────────
-    V_layers, layer_indices, proj_norm_scale = load_subspace(model_key, rank)
+    V_layers, layer_indices, proj_norm_scale, subspace_path = load_subspace(
+        model_key, rank, variant=subspace,
+    )
 
     # ── Load model + apply LoRA ──────────────────────────────────────────────
     model, tokenizer = load_model_and_tokenizer(model_key, hf_token)
@@ -804,7 +839,8 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
     training_config = {
         "model_key":            model_key,
         "model_id":             MODEL_REGISTRY[model_key],
-        "method":               "retain_normalized_URC",
+        "method":               SUBSPACE_VARIANTS[subspace]["method"],
+        "subspace_variant":     subspace,
         "lora_rank":            LORA_R,
         "lora_alpha":           LORA_ALPHA,
         "lora_dropout":         LORA_DROPOUT,
@@ -829,9 +865,10 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
     )
 
     subspace_config = {
-        "method":            "retain_normalized_URC",
-        "basis_file":        f"retain_normalized_subspace_{model_key}_last25_r{rank}.pt",
-        "basis_key":         "V_retain_normalized",
+        "method":            SUBSPACE_VARIANTS[subspace]["method"],
+        "variant":           subspace,
+        "basis_file":        subspace_path.name,
+        "basis_key":         "V_retain_normalised",
         "rank":              rank,
         "layers":            "last_25_percent",
         "layer_indices":     layer_indices,
@@ -858,6 +895,11 @@ def parse_args() -> argparse.Namespace:
                    help="Weight on retain KL loss (default: 1.0)")
     p.add_argument("--rank",    type=int,   default=DEFAULT_RANK,
                    help="Subspace rank to load (default: 8)")
+    p.add_argument("--subspace", choices=list(SUBSPACE_VARIANTS), default="clean",
+                   help=("Which subspace bundle to suppress: "
+                         "'clean' = retain_normalised_subspace_*.pt (default), "
+                         "'raw' = raw_subspace_*.pt (uncleaned contrasts), "
+                         "'disc' = discriminative_subspace_*.pt (Sigma_C - Sigma_A vs Sigma_R)"))
     p.add_argument("--epochs",  type=int,   default=EPOCHS,
                    help=f"Number of training epochs (default: {EPOCHS})")
     p.add_argument("--lr",      type=float, default=LEARNING_RATE,
@@ -877,16 +919,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     log.info("URC training")
-    log.info("  Model  : %s", args.model)
-    log.info("  Beta   : %g", args.beta)
-    log.info("  Rank   : %d", args.rank)
-    log.info("  Epochs : %d", args.epochs)
-    log.info("  LR     : %g", args.lr)
+    log.info("  Model    : %s", args.model)
+    log.info("  Beta     : %g", args.beta)
+    log.info("  Rank     : %d", args.rank)
+    log.info("  Subspace : %s", args.subspace)
+    log.info("  Epochs   : %d", args.epochs)
+    log.info("  LR       : %g", args.lr)
     if args.dry_run:
-        log.info("  Mode   : DRY RUN")
+        log.info("  Mode     : DRY RUN")
     train(args.model, beta=args.beta, rank=args.rank, dry_run=args.dry_run,
           epochs=args.epochs, lr=args.lr,
-          es_patience=args.es_patience, es_delta=args.es_delta, kl_max=args.kl_max)
+          es_patience=args.es_patience, es_delta=args.es_delta, kl_max=args.kl_max,
+          subspace=args.subspace)
 
 
 if __name__ == "__main__":

@@ -111,19 +111,33 @@ commitment variance the chosen rank captures.
 
 ## Stage 5 — Build the retain-normalised commitment subspace
 
-Script: `mining-data/retain_normalised_subspace.py`
+Three subspace formulations are available; all share the same retain-span
+projection plumbing and produce drop-in compatible bundles for training.
+
+| Variant | Script | Σ_C source | What it picks |
+|---|---|---|---|
+| `clean` (default) | `mining-data/retain_normalised_subspace.py` | `c_unsupported_clean` (post supported-PCA cleaning) | Σ_C v = γ Σ_R v |
+| `raw`             | `mining-data/raw_subspace.py`               | `c_unsupported` (no cleaning) | Σ_C v = γ Σ_R v |
+| `disc`            | `mining-data/discriminative_subspace.py`    | raw `c_unsupported` and `c_supported` | (Σ_C − Σ_A) v = γ Σ_R v |
+
+`disc` is the most behaviourally targeted: it explicitly subtracts the
+supported-answerable covariance, so the resulting directions suppress
+unsupported commitment far more than legitimate answer-giving (C/A ≈ 4
+vs 0.96 for `raw`). Side-by-side analysis lives in
+`mining-data/compare_subspaces.py` and the build scripts.
 
 For each layer `l` we want directions `v` along which **commitment is large
-but retain is small**. That is the generalised eigenproblem
+but retain is small** (and, for `disc`, also large *relative to supported
+answering*). That is the generalised eigenproblem
 
 ```
-Σ_C v = γ Σ_R v
+Σ_C v = γ Σ_R v          # clean / raw
+(Σ_C − Σ_A) v = γ Σ_R v  # disc
 ```
 
-where `Σ_C` is the cleaned-contrast covariance and `Σ_R` is the retain
-covariance. Naively solving this in `D × D` collapses into the null space
-of `Σ_R` because retain only spans `~ N_retain` dimensions. The script
-fixes that with retain-span projection:
+Naively solving this in `D × D` collapses into the null space of `Σ_R`
+because retain only spans `~ N_retain` dimensions. The scripts fix that
+with retain-span projection:
 
 1. SVD of centred `R_l` → retain basis `W ∈ ℝ^{D × k}`,
    `k = min(N_retain − 1, retain_rank)`.
@@ -132,10 +146,12 @@ fixes that with retain-span projection:
    `k`-space.
 4. Map the top-`rank` eigenvectors back to `ℝ^D` and unit-normalise.
 
-Output bundle (per model, per rank):
+Output bundle (per model, per rank, per variant):
 
 ```
-mining-data/activations/retain_normalised_subspace_<model>_last25_r<rank>.pt
+mining-data/activations/retain_normalised_subspace_<model>_last25_r<rank>.pt   # clean
+mining-data/activations/raw_subspace_<model>_last25_r<rank>.pt                  # raw
+mining-data/activations/discriminative_subspace_<model>_last25_r<rank>.pt       # disc
 ```
 
 Keys:
@@ -144,7 +160,7 @@ Keys:
 |-----------------------------|----------------|--------------------------------------------------------------------------|
 | `V_retain_normalised`       | `(L, D, rank)` | The orthonormal commitment-direction matrix per layer                    |
 | `generalized_eigenvalues`   | `(L, rank)`    | γ values; bigger = more commitment per unit retain                       |
-| `commitment_projection`     | `(L,)`         | `tr(Vᵀ Σ_C V)` per layer — used to scale `L_forget` so β=1 is balanced  |
+| `commitment_projection`     | `(L,)`         | `tr(Vᵀ Σ_C V)` per layer — averaged across layers to give `proj_norm_scale`, the denominator of `L_forget` |
 | `retain_projection`         | `(L,)`         | `tr(Vᵀ Σ_R V)` per layer — sanity-check; should be ~1 after retain-span normalisation |
 | `layers`                    | list           | Layer indices (the last 25 % slice)                                      |
 
@@ -178,10 +194,15 @@ Script: `training/train_urc.py`
 python3 training/train_urc.py \
     --model qwen_instruct \
     --rank 32 \
+    --subspace disc \
     --epochs 3 \
     --lr 3e-5 \
     --beta 1.0
 ```
+
+`--subspace {clean,raw,disc}` selects which bundle to suppress (default
+`clean`). The run name embeds the choice (`{model}_{label}_urc_...`) so
+different variants don't collide in `training/runs/`.
 
 ### 7.1 Data assembled at start-up
 
@@ -216,18 +237,25 @@ questions.
 For each forget example we tokenise `prompt + y_com_prefix_k8`, identify the
 last `K_ANSWER_TOKENS = 8` positions (the answer tokens), and at every layer
 in the last-25 % slice project the residual stream onto the commitment
-subspace:
+subspace. The per-layer loss is the expected squared projection-vector norm
+per answer token (sum over rank dims, mean over tokens):
 
 ```
-proj    = h_answer_tokens @ V_l            # (n_ans, rank)
-L_l     = mean(‖proj‖²)                    # scalar per layer
-L_forget = mean over layers of L_l
+proj    = h_answer_tokens @ V_l                          # (n_ans, rank)
+L_l     = mean_token(‖proj_vec‖²) = (proj²).sum(-1).mean()
+L_forget_raw    = mean over selected layers of L_l
+L_forget_scaled = L_forget_raw / proj_norm_scale
 ```
 
-This is averaged across the batch and **scaled by `proj_norm_scale`** (the
-mean `commitment_projection` from the bundle). The scaling ensures
-`L_forget ≈ 1` at initialisation, so β=1 truly weighs the two losses
-equally.
+`proj_norm_scale = mean_layers(tr(Vᵀ Σ_C V))` is the expected per-token
+‖proj_vec‖² at initialisation, computed from the same contrasts used to
+build the subspace. It comes directly out of the subspace bundle as
+`commitment_projection.mean()`.
+
+**Same units, same meaning** — both numerator and denominator measure
+expected per-token commitment magnitude, so `L_forget_scaled ≈ 1` at the
+start of training and trends toward 0 as projections shrink. This holds
+across rank settings: rank-8, rank-32 and rank-64 all start near 1.
 
 #### Retain loss `L_retain`
 
@@ -263,7 +291,7 @@ L_total = L_forget_scaled + β · L_retain
 | Hyper-parameter      | Value                                          |
 |----------------------|------------------------------------------------|
 | Optimiser            | AdamW                                          |
-| Learning rate        | `--lr` (default `1e-5`, current default `3e-5`) |
+| Learning rate        | `--lr` (default `1e-5`; `3e-5` works well in practice) |
 | Weight decay         | 0                                              |
 | Warmup ratio         | 3 % of total steps                             |
 | Schedule             | linear warmup → linear decay to 0              |
@@ -294,7 +322,7 @@ Two checks run **after every optimiser step**:
 
 | Trigger                                                                         | Default        |
 |---------------------------------------------------------------------------------|----------------|
-| `L_forget` does not improve by at least `--es-delta` over `--es-patience` steps | 0.005 / 20     |
+| `L_forget` does not improve by at least `--es-delta` over `--es-patience` steps | 0.05 / 20      |
 | Retain `KL` exceeds `--kl-max`                                                  | 0.15           |
 
 Either check can be disabled by passing `0`.
