@@ -1,0 +1,39 @@
+# SURO project dependencies.
+#
+# Recommended install (Colab/H100): use --upgrade so that pre-installed packages
+# like `torchao` are bumped to the versions we require. Without -U, pip will
+# happily leave an incompatible 0.10.x in place.
+#
+#   pip install -U -r requirements.txt
+#
+# If you ever pin/unpin transformers, also clear pip cache to avoid stale
+# git checkouts:  pip install --force-reinstall transformers
+
+python-dotenv
+cerebras_cloud_sdk
+transformers @ git+https://github.com/huggingface/transformers
+torch
+accelerate
+mistral-common>=1.8.6
+kernels
+hf_xet
+matplotlib
+scikit-learn
+datasets
+psutil
+
+# ── PEFT + its hard requirement ───────────────────────────────────────────
+# PEFT 0.19's LoRA dispatcher imports torchao and refuses to load if the
+# installed version is < 0.16.0, even when we are not actually using torchao
+# quantization. Colab pre-installs torchao 0.10.x, so we MUST upgrade it.
+peft>=0.19.0
+torchao>=0.16.0; sys_platform == 'linux'
+
+# ── Optional CUDA fast-path kernels (Linux only — skipped on macOS) ───────
+# Pure-python wheel: safe to install everywhere on Linux.
+flash-linear-attention; sys_platform == 'linux'
+
+# `causal-conv1d` is intentionally NOT pinned: it needs nvcc + CUDA dev headers
+# to build from source on Colab/H100, and Qwen3.5 / Ministral don't use it.
+# Install manually if you need it for a different model:
+#   pip install causal-conv1d --no-build-isolation
