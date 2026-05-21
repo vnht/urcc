@@ -171,10 +171,13 @@ def load_retain_data() -> list[dict]:
 
 # ── Subspace loading ──────────────────────────────────────────────────────────
 
-def load_subspace(model_key: str, rank: int) -> tuple[list[torch.Tensor], list[int]]:
+def load_subspace(model_key: str, rank: int) -> tuple[list[torch.Tensor], list[int], float]:
     """
-    Returns (V_layers, layer_indices).
+    Returns (V_layers, layer_indices, proj_norm_scale).
     V_layers[i]: (hidden_dim, rank) tensor on CPU, one per layer.
+    proj_norm_scale: mean commitment_projection across layers, computed over
+                     1000 training examples during subspace extraction — used
+                     to normalise L_forget so beta=1 means equal weighting.
     """
     path = ACTIVATIONS_DIR / f"retain_normalised_subspace_{model_key}_last25_r{rank}.pt"
     if not path.exists():
@@ -192,8 +195,12 @@ def load_subspace(model_key: str, rank: int) -> tuple[list[torch.Tensor], list[i
     layer_indices = bundle["layers"]
     # V: (num_layers, hidden_dim, rank)
     V_layers = [V[i].float() for i in range(V.shape[0])]
-    log.info("  Subspace: %d layers, rank=%d, D=%d", len(V_layers), rank, V.shape[1])
-    return V_layers, layer_indices
+    # commitment_projection[l] = tr(V_l^T Σ_C V_l), the expected L_forget per layer
+    # estimated over the full 1000-example training set — principled scale estimate
+    proj_norm_scale = float(bundle["commitment_projection"].mean())
+    log.info("  Subspace: %d layers, rank=%d, D=%d  proj_norm_scale=%.4f",
+             len(V_layers), rank, V.shape[1], proj_norm_scale)
+    return V_layers, layer_indices, proj_norm_scale
 
 
 # ── Model loading + LoRA ──────────────────────────────────────────────────────
@@ -514,7 +521,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
         log.info("  Dry run: trimmed to 8 examples each")
 
     # ── Load subspace ────────────────────────────────────────────────────────
-    V_layers, layer_indices = load_subspace(model_key, rank)
+    V_layers, layer_indices, proj_norm_scale = load_subspace(model_key, rank)
 
     # ── Load model + apply LoRA ──────────────────────────────────────────────
     model, tokenizer = load_model_and_tokenizer(model_key, hf_token)
@@ -578,6 +585,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
     prev_forget: float | None = None
     prev_retain: float | None = None
     prev_proj:   float | None = None
+    prev_proj:   float | None = None
 
     pbar = tqdm(total=total_optim_steps, desc=run_name, unit="step", dynamic_ncols=True)
 
@@ -600,7 +608,8 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
                 model, retain_batch, tokenizer, model_key, device,
             )
 
-            l_total = l_forget + beta * l_retain
+            l_forget_scaled = l_forget / proj_norm_scale
+            l_total = l_forget_scaled + beta * l_retain
             l_total_scaled = l_total / GRAD_ACCUM_STEPS
             l_total_scaled.backward()
 
@@ -608,10 +617,10 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
             log.info(
                 "  accum %3d/%d  Lf=%.4f  Lr=%.4f",
                 accum_step, math.ceil(len(forget_data) / FORGET_BATCH_SIZE),
-                float(l_forget.detach()), float(l_retain.detach()),
+                float(l_forget_scaled.detach()), float(l_retain.detach()),
             )
 
-            accum_forget = accum_forget + l_forget.detach()
+            accum_forget = accum_forget + l_forget_scaled.detach()
             accum_retain = accum_retain + l_retain.detach()
             layer_norms  = finfo.get("layer_proj_norms", {})
             if layer_norms:
@@ -717,6 +726,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
     train_summary = {
         **summary_initial,
         **summary_final,
+        "proj_norm_scale":     round(proj_norm_scale, 6),
         "delta_L_forget":       _total_delta("L_forget"),
         "delta_top100_KL":      _total_delta("top100_retain_KL"),
         "delta_mean_proj_norm": _total_delta("mean_proj_norm"),
@@ -753,6 +763,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
         "beta":                 beta,
         "k_answer_tokens":      K_ANSWER_TOKENS,
         "top_k_kl":             TOP_K_KL,
+        "proj_norm_scale":      proj_norm_scale,
         "forget_examples":      len(forget_data),
         "retain_examples":      len(retain_data),
         "total_optim_steps":    total_optim_steps,
@@ -762,14 +773,16 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
     )
 
     subspace_config = {
-        "method":       "retain_normalized_URC",
-        "basis_file":   f"retain_normalized_subspace_{model_key}_last25_r{rank}.pt",
-        "basis_key":    "V_retain_normalized",
-        "rank":         rank,
-        "layers":       "last_25_percent",
-        "layer_indices": layer_indices,
-        "k_answer_tokens": K_ANSWER_TOKENS,
-        "beta":         beta,
+        "method":            "retain_normalized_URC",
+        "basis_file":        f"retain_normalized_subspace_{model_key}_last25_r{rank}.pt",
+        "basis_key":         "V_retain_normalized",
+        "rank":              rank,
+        "layers":            "last_25_percent",
+        "layer_indices":     layer_indices,
+        "k_answer_tokens":   K_ANSWER_TOKENS,
+        "beta":              beta,
+        "proj_norm_scale":   proj_norm_scale,
+        "proj_norm_scale_source": "commitment_projection mean from subspace bundle (N=1000)",
     }
     (out_dir / "subspace_config.json").write_text(
         json.dumps(subspace_config, indent=2)
