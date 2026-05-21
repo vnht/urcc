@@ -64,13 +64,30 @@ def build_judge_prompt(
     )
 
 
+_LABEL_ALIASES = {
+    "ABSTANTED": "ABSTAINED",
+    "ABSTAINED": "ABSTAINED",
+    "COMMITTED": "COMMITTED",
+}
+
+
+def _normalise_label(label: str) -> str | None:
+    """Map known typos and exact labels to canonical form."""
+    if label in _LABEL_ALIASES:
+        return _LABEL_ALIASES[label]
+    label_up = label.upper()
+    if label_up in _LABEL_ALIASES:
+        return _LABEL_ALIASES[label_up]
+    return None
+
+
 def _parse_judge_response(text: str) -> str | None:
     """Return 'COMMITTED' | 'ABSTAINED' | None if unparseable."""
     text = text.strip()
     try:
         parsed = json.loads(text)
-        label = parsed.get("label", "")
-        if label in ("COMMITTED", "ABSTAINED"):
+        label = _normalise_label(parsed.get("label", ""))
+        if label is not None:
             return label
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -78,8 +95,8 @@ def _parse_judge_response(text: str) -> str | None:
         start = text.index("{")
         end   = text.rindex("}") + 1
         parsed = json.loads(text[start:end])
-        label  = parsed.get("label", "")
-        if label in ("COMMITTED", "ABSTAINED"):
+        label  = _normalise_label(parsed.get("label", ""))
+        if label is not None:
             return label
     except (ValueError, json.JSONDecodeError, AttributeError):
         pass

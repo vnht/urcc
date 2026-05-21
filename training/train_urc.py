@@ -698,7 +698,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
                 accum_proj_norms = []
                 pbar.update(1)
                 pbar.set_postfix(
-                    Lf=f"{float(l_forget.detach()):.3f}",
+                    Lf=f"{float((l_forget / proj_norm_scale).detach()):.3f}",
                     Lr=f"{float(l_retain.detach()):.3f}",
                 )
 

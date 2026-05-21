@@ -182,13 +182,16 @@ def generate_completion(model, tokenizer, prompt: str, model_key: str, device) -
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     else:
         messages = [{"role": "user", "content": prompt}]
-        kw = {}
         if "qwen" in model_key:
-            kw["enable_thinking"] = False
-        token_ids = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, **kw
-        )
-        input_ids = torch.tensor([token_ids], dtype=torch.long).to(device)
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        else:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+        input_ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=False).to(device)
 
     with torch.no_grad():
         output_ids = model.generate(
