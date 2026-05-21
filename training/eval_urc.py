@@ -134,7 +134,7 @@ def load_model_with_adapter(model_key: str, model_id: str, run_dir: Path, hf_tok
         from transformers import AutoModelForCausalLM, AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
         base_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto", token=hf_token,
+            model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
         )
 
     elif model_id.startswith("mistralai/"):
@@ -151,7 +151,7 @@ def load_model_with_adapter(model_key: str, model_id: str, run_dir: Path, hf_tok
             base_model = base_model.to("mps" if torch.backends.mps.is_available() else "cpu")
         else:
             base_model = Mistral3ForConditionalGeneration.from_pretrained(
-                model_id, torch_dtype=torch.bfloat16, device_map="auto",
+                model_id, dtype=torch.bfloat16, device_map="auto",
                 token=hf_token, tie_word_embeddings=False,
             )
     else:
@@ -209,18 +209,20 @@ def run_generation(model, tokenizer, model_key: str, eval_dir: Path, out_path: P
     instances = []
     for dataset in ("kuq", "squad"):
         path = eval_dir / f"{dataset}_1000.jsonl"
+        rows_ds = []
         for line in path.read_text().splitlines():
             if line.strip():
                 row = json.loads(line)
-                instances.append({
+                rows_ds.append({
                     "dataset": dataset,
                     "id": row["id"],
                     "answerable": row["answerable"],
                     "question": row["question"],
                     "context": row.get("context"),
                 })
-    if n:
-        instances = instances[:n]
+        if n:
+            rows_ds = rows_ds[:n]
+        instances.extend(rows_ds)
 
     done_ids: set = set()
     if out_path.exists():
@@ -614,9 +616,14 @@ def main() -> None:
 
     if comparison["ppl"].get("baseline_ppl") is not None:
         p = comparison["ppl"]
-        log.info("  %-10s  %-6s  %10.3f  %10.3f  %+10.3f",
-                 "ultrachat", "PPL",
-                 p["baseline_ppl"], p["post_training_ppl"], p["delta_ppl"])
+        post_ppl  = p.get("post_training_ppl")
+        delta_ppl = p.get("delta_ppl")
+        if post_ppl is not None and delta_ppl is not None:
+            log.info("  %-10s  %-6s  %10.3f  %10.3f  %+10.3f",
+                     "ultrachat", "PPL", p["baseline_ppl"], post_ppl, delta_ppl)
+        else:
+            log.info("  %-10s  %-6s  %10.3f  %10s  %10s",
+                     "ultrachat", "PPL", p["baseline_ppl"], "—(skipped)", "—")
 
     log.info("")
     log.info("Done -> %s", eval_out)

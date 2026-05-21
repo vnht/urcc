@@ -143,7 +143,7 @@ MAX_GRAD_NORM       = 1.0
 FORGET_BATCH_SIZE   = 4
 RETAIN_BATCH_SIZE   = 4
 GRAD_ACCUM_STEPS    = 4
-LOG_EVERY           = 10
+LOG_EVERY           = 1
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -207,7 +207,7 @@ def load_model_and_tokenizer(model_key: str, hf_token: str):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto", token=hf_token,
+            model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
         )
 
     elif model_id.startswith("mistralai/"):
@@ -224,8 +224,9 @@ def load_model_and_tokenizer(model_key: str, hf_token: str):
             model = model.to("mps" if torch.backends.mps.is_available() else "cpu")
         else:
             model = Mistral3ForConditionalGeneration.from_pretrained(
-                model_id, torch_dtype=torch.bfloat16, device_map="auto",
-                token=hf_token, tie_word_embeddings=False,
+                model_id, device_map="auto", token=hf_token,
+                tie_word_embeddings=False,
+                quantization_config=FineGrainedFP8Config(dequantize=True),
             )
     else:
         raise ValueError(f"Unsupported model: {model_id}")
@@ -382,7 +383,7 @@ def compute_forget_loss(
             proj  = ans_h @ V_l                             # (n_ans, rank)
             l_loss = (proj ** 2).mean()
             ex_loss = ex_loss + l_loss
-            layer_norms[l_idx].append(float(proj.norm(dim=-1).mean()))
+            layer_norms[l_idx].append(float(proj.detach().norm(dim=-1).mean()))
 
         ex_loss = ex_loss / len(layer_indices)
         total_loss = total_loss + ex_loss
@@ -567,6 +568,11 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
     summary_initial: dict = {}
     summary_final:   dict = {}
 
+    # Previous step values for delta reporting
+    prev_forget: float | None = None
+    prev_retain: float | None = None
+    prev_proj:   float | None = None
+
     pbar = tqdm(total=total_optim_steps, desc=run_name, unit="step", dynamic_ncols=True)
 
     for _epoch in range(EPOCHS):
@@ -592,6 +598,13 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
             l_total_scaled = l_total / GRAD_ACCUM_STEPS
             l_total_scaled.backward()
 
+            accum_step = (forget_pos // FORGET_BATCH_SIZE)
+            log.info(
+                "  accum %3d/%d  Lf=%.4f  Lr=%.4f",
+                accum_step, math.ceil(len(forget_data) / FORGET_BATCH_SIZE),
+                float(l_forget), float(l_retain),
+            )
+
             accum_forget = accum_forget + l_forget.detach()
             accum_retain = accum_retain + l_retain.detach()
             layer_norms  = finfo.get("layer_proj_norms", {})
@@ -611,7 +624,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
 
                 # Logging
                 if optim_step % LOG_EVERY == 0 or optim_step == 1:
-                    n_accum = max(GRAD_ACCUM_STEPS, 1)
+                    n_accum    = max(GRAD_ACCUM_STEPS, 1)
                     avg_forget = float(accum_forget) / n_accum
                     avg_retain = float(accum_retain) / n_accum
                     avg_total  = avg_forget + beta * avg_retain
@@ -619,12 +632,26 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
                                   if accum_proj_norms else 0.0)
                     lr_now = scheduler.get_last_lr()[0]
 
+                    def _delta(cur, prev):
+                        if prev is None:
+                            return "     —"
+                        d = cur - prev
+                        return f"{d:+.4f}"
+
                     log.info(
-                        "  step=%d  L_total=%.4f  L_forget=%.4f  top100_KL=%.4f"
-                        "  proj=%.4f  lr=%.2e  grad=%.3f",
-                        optim_step, avg_total, avg_forget, avg_retain,
-                        mean_proj, lr_now, float(grad_norm),
+                        "  step=%d/%d  L_total=%.4f  "
+                        "L_forget=%.4f(%s)  KL=%.4f(%s)  "
+                        "proj=%.4f(%s)  lr=%.2e  grad=%.3f",
+                        optim_step, total_optim_steps, avg_total,
+                        avg_forget, _delta(avg_forget, prev_forget),
+                        avg_retain, _delta(avg_retain, prev_retain),
+                        mean_proj,  _delta(mean_proj,  prev_proj),
+                        lr_now, float(grad_norm),
                     )
+
+                    prev_forget = avg_forget
+                    prev_retain = avg_retain
+                    prev_proj   = mean_proj
                     row = {
                         "step":              optim_step,
                         "L_total":           round(avg_total,  6),
@@ -664,12 +691,32 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
     log_file.close()
 
     # ── Save train_summary.json ───────────────────────────────────────────────
+    # Read the full loss_log to compute deltas from first to last logged step
+    loss_log_rows: list[dict] = []
+    try:
+        with open(log_path) as f:
+            reader = csv.DictReader(f)
+            loss_log_rows = list(reader)
+    except Exception:
+        pass
+
+    def _total_delta(field: str) -> float | None:
+        if len(loss_log_rows) < 2:
+            return None
+        try:
+            return round(float(loss_log_rows[-1][field]) - float(loss_log_rows[0][field]), 6)
+        except (KeyError, ValueError):
+            return None
+
     train_summary = {
         **summary_initial,
         **summary_final,
-        "num_steps":           optim_step,
-        "num_forget_examples": len(forget_data),
-        "num_retain_examples": len(retain_data),
+        "delta_L_forget":       _total_delta("L_forget"),
+        "delta_top100_KL":      _total_delta("top100_retain_KL"),
+        "delta_mean_proj_norm": _total_delta("mean_proj_norm"),
+        "num_steps":            optim_step,
+        "num_forget_examples":  len(forget_data),
+        "num_retain_examples":  len(retain_data),
     }
     (out_dir / "train_summary.json").write_text(
         json.dumps(train_summary, indent=2)

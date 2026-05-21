@@ -153,7 +153,7 @@ def load_model(model_key: str, model_id: str, hf_token: str):
         from transformers import AutoModelForCausalLM  # type: ignore[import]
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="auto",
             token=hf_token,
         )

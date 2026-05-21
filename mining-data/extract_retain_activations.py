@@ -133,7 +133,7 @@ def load_model_and_tokenizer(model_key: str, model_id: str, hf_token: str):
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import]
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map="auto", token=hf_token,
+            model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
         )
 
     elif model_id.startswith("mistralai/"):
