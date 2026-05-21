@@ -295,9 +295,17 @@ def tokenise_retain(
         return full_ids, len(prompt_ids)
     else:
         user_msg = [{"role": "user", "content": prompt}]
-        prompt_ids   = tokenizer.apply_chat_template(
-            user_msg, tokenize=True, add_generation_prompt=True,
-        )
+        if "ministral" in model_key:
+            # MistralCommonBackend: tokenize=True returns a plain list of ints
+            prompt_ids   = tokenizer.apply_chat_template(
+                user_msg, tokenize=True, add_generation_prompt=True,
+            )
+        else:
+            # Qwen / standard tokenizer: tokenize=False avoids BatchEncoding issues
+            prompt_fmt = tokenizer.apply_chat_template(
+                user_msg, tokenize=False, add_generation_prompt=True,
+            )
+            prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
         response_ids = tokenizer.encode(response, add_special_tokens=False)
         full_ids     = list(prompt_ids) + response_ids
         return full_ids, len(prompt_ids)
@@ -681,8 +689,8 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
                 accum_proj_norms = []
                 pbar.update(1)
                 pbar.set_postfix(
-                    Lf=f"{float(l_forget):.3f}",
-                    Lr=f"{float(l_retain):.3f}",
+                    Lf=f"{float(l_forget.detach()):.3f}",
+                    Lr=f"{float(l_retain.detach()):.3f}",
                 )
 
     pbar.close()
