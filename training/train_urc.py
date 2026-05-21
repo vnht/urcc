@@ -92,7 +92,9 @@ BASE_DIR          = Path(__file__).parent
 REPO_ROOT         = BASE_DIR.parent
 ACTIVATIONS_DIR   = REPO_ROOT / "mining-data" / "activations"
 MINING_SEL_DIR    = REPO_ROOT / "mining-data" / "mining-selected"
-RETAIN_DATA_PATH  = REPO_ROOT / "mining-data" / "sampled" / "ultrachat_retain_1000.jsonl"
+RETAIN_DATA_PATH      = REPO_ROOT / "mining-data" / "sampled" / "ultrachat_retain_1000.jsonl"
+RETAIN_KUQ_PATH       = REPO_ROOT / "mining-data" / "sampled" / "kuq_answerable_500.jsonl"
+RETAIN_SQUAD_PATH     = REPO_ROOT / "mining-data" / "sampled" / "squad_answerable_500.jsonl"
 RUNS_DIR          = BASE_DIR / "runs"
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -165,7 +167,24 @@ def load_forget_data(model_key: str) -> list[dict]:
 
 def load_retain_data() -> list[dict]:
     records = [json.loads(l) for l in RETAIN_DATA_PATH.read_text().splitlines() if l.strip()]
-    log.info("  Loaded %d retain examples", len(records))
+
+    # Add answerable QA pairs so the retain loss penalises "always say No"
+    for path, template in (
+        (RETAIN_KUQ_PATH,   KUQ_PROMPT_TEMPLATE),
+        (RETAIN_SQUAD_PATH, SQUAD_PROMPT_TEMPLATE),
+    ):
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            prompt = template.format(
+                question=row["question"],
+                context=row.get("context", ""),
+            )
+            records.append({"prompt": prompt, "response": row["correct_answer"]})
+
+    random.shuffle(records)
+    log.info("  Loaded %d retain examples (ultrachat + answerable QA)", len(records))
     return records
 
 
