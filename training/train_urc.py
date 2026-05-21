@@ -503,7 +503,8 @@ def get_linear_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
-          epochs: int = EPOCHS, lr: float = LEARNING_RATE) -> None:
+          epochs: int = EPOCHS, lr: float = LEARNING_RATE,
+          es_patience: int = 20, es_delta: float = 0.005, kl_max: float = 0.15) -> None:
     hf_token = os.environ.get("HF_TOKEN", "")
 
     run_name = f"{model_key}_retainnorm_urc_last25_r{rank}_beta{beta:g}_ep{epochs}_lr{lr:.0e}"
@@ -581,6 +582,11 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
     # Track initial and final logged values for train_summary
     summary_initial: dict = {}
     summary_final:   dict = {}
+
+    # Early stopping state
+    es_best_forget: float = float("inf")
+    es_steps_no_improve: int = 0
+    stopped_early: bool = False
 
     # Previous step values for delta reporting
     prev_forget: float | None = None
@@ -703,6 +709,33 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
                     Lr=f"{float(l_retain.detach()):.3f}",
                 )
 
+                # ── Early stopping checks ─────────────────────────────────
+                if es_patience > 0:
+                    if avg_forget < es_best_forget - es_delta:
+                        es_best_forget = avg_forget
+                        es_steps_no_improve = 0
+                    else:
+                        es_steps_no_improve += 1
+                    if es_steps_no_improve >= es_patience:
+                        log.info(
+                            "  Early stop: L_forget hasn't improved by %.4f "
+                            "in %d steps (best=%.4f)",
+                            es_delta, es_patience, es_best_forget,
+                        )
+                        stopped_early = True
+                        break
+
+                if kl_max > 0 and avg_retain > kl_max:
+                    log.info(
+                        "  Early stop: KL=%.4f exceeded kl_max=%.4f",
+                        avg_retain, kl_max,
+                    )
+                    stopped_early = True
+                    break
+
+        if stopped_early:
+            break
+
     pbar.close()
     log_file.close()
 
@@ -734,6 +767,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
         "num_steps":            optim_step,
         "num_forget_examples":  len(forget_data),
         "num_retain_examples":  len(retain_data),
+        "stopped_early":        stopped_early,
     }
     (out_dir / "train_summary.json").write_text(
         json.dumps(train_summary, indent=2)
@@ -807,6 +841,13 @@ def parse_args() -> argparse.Namespace:
                    help=f"Number of training epochs (default: {EPOCHS})")
     p.add_argument("--lr",      type=float, default=LEARNING_RATE,
                    help=f"Peak learning rate (default: {LEARNING_RATE})")
+    p.add_argument("--es-patience", type=int,   default=20,
+                   help="Early stopping: stop if L_forget doesn't improve by "
+                        "--es-delta over this many steps (default: 20, 0=off)")
+    p.add_argument("--es-delta",    type=float, default=0.005,
+                   help="Early stopping: minimum improvement in L_forget (default: 0.005)")
+    p.add_argument("--kl-max",      type=float, default=0.15,
+                   help="Stop if retain KL exceeds this value (default: 0.15, 0=off)")
     p.add_argument("--dry-run", action="store_true",
                    help="Use only 8 examples per split for a quick smoke test")
     return p.parse_args()
@@ -823,7 +864,8 @@ def main() -> None:
     if args.dry_run:
         log.info("  Mode   : DRY RUN")
     train(args.model, beta=args.beta, rank=args.rank, dry_run=args.dry_run,
-          epochs=args.epochs, lr=args.lr)
+          epochs=args.epochs, lr=args.lr,
+          es_patience=args.es_patience, es_delta=args.es_delta, kl_max=args.kl_max)
 
 
 if __name__ == "__main__":
