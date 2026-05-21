@@ -502,10 +502,11 @@ def get_linear_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None:
+def train(model_key: str, beta: float, rank: int, dry_run: bool = False,
+          epochs: int = EPOCHS, lr: float = LEARNING_RATE) -> None:
     hf_token = os.environ.get("HF_TOKEN", "")
 
-    run_name = f"{model_key}_retainnorm_urc_last25_r{rank}_beta{beta:g}"
+    run_name = f"{model_key}_retainnorm_urc_last25_r{rank}_beta{beta:g}_ep{epochs}_lr{lr:.0e}"
     out_dir  = RUNS_DIR / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Run: %s", run_name)
@@ -533,12 +534,12 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
     # ── Optimizer + scheduler ────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=LEARNING_RATE,
+        lr=lr,
         weight_decay=0.0,
     )
 
     forget_steps_per_epoch = math.ceil(len(forget_data) / FORGET_BATCH_SIZE)
-    total_optim_steps = math.ceil(forget_steps_per_epoch / GRAD_ACCUM_STEPS) * EPOCHS
+    total_optim_steps = math.ceil(forget_steps_per_epoch / GRAD_ACCUM_STEPS) * epochs
     warmup_steps = max(1, int(total_optim_steps * WARMUP_RATIO))
     scheduler = get_linear_warmup_scheduler(optimizer, warmup_steps, total_optim_steps)
     log.info("  Total optimiser steps: %d  (warmup: %d)", total_optim_steps, warmup_steps)
@@ -589,7 +590,7 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
 
     pbar = tqdm(total=total_optim_steps, desc=run_name, unit="step", dynamic_ncols=True)
 
-    for _epoch in range(EPOCHS):
+    for _epoch in range(epochs):
         random.shuffle(forget_data)
         forget_pos = 0
 
@@ -753,8 +754,8 @@ def train(model_key: str, beta: float, rank: int, dry_run: bool = False) -> None
         "lora_alpha":           LORA_ALPHA,
         "lora_dropout":         LORA_DROPOUT,
         "target_modules":       LORA_TARGET_MODULES,
-        "learning_rate":        LEARNING_RATE,
-        "epochs":               EPOCHS,
+        "learning_rate":        lr,
+        "epochs":               epochs,
         "warmup_ratio":         WARMUP_RATIO,
         "max_grad_norm":        MAX_GRAD_NORM,
         "forget_batch_size":    FORGET_BATCH_SIZE,
@@ -802,6 +803,10 @@ def parse_args() -> argparse.Namespace:
                    help="Weight on retain KL loss (default: 1.0)")
     p.add_argument("--rank",    type=int,   default=DEFAULT_RANK,
                    help="Subspace rank to load (default: 8)")
+    p.add_argument("--epochs",  type=int,   default=EPOCHS,
+                   help=f"Number of training epochs (default: {EPOCHS})")
+    p.add_argument("--lr",      type=float, default=LEARNING_RATE,
+                   help=f"Peak learning rate (default: {LEARNING_RATE})")
     p.add_argument("--dry-run", action="store_true",
                    help="Use only 8 examples per split for a quick smoke test")
     return p.parse_args()
@@ -813,9 +818,12 @@ def main() -> None:
     log.info("  Model  : %s", args.model)
     log.info("  Beta   : %g", args.beta)
     log.info("  Rank   : %d", args.rank)
+    log.info("  Epochs : %d", args.epochs)
+    log.info("  LR     : %g", args.lr)
     if args.dry_run:
         log.info("  Mode   : DRY RUN")
-    train(args.model, beta=args.beta, rank=args.rank, dry_run=args.dry_run)
+    train(args.model, beta=args.beta, rank=args.rank, dry_run=args.dry_run,
+          epochs=args.epochs, lr=args.lr)
 
 
 if __name__ == "__main__":
