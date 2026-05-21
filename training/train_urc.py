@@ -295,12 +295,11 @@ def tokenise_retain(
         return full_ids, len(prompt_ids)
     else:
         user_msg = [{"role": "user", "content": prompt}]
-        prompt_fmt = tokenizer.apply_chat_template(
-            user_msg, tokenize=False, add_generation_prompt=True,
+        prompt_ids   = tokenizer.apply_chat_template(
+            user_msg, tokenize=True, add_generation_prompt=True,
         )
-        prompt_ids   = _encode(tokenizer, prompt_fmt, add_special_tokens=False)
-        response_ids = _encode(tokenizer, response,   add_special_tokens=False)
-        full_ids     = prompt_ids + response_ids
+        response_ids = tokenizer.encode(response, add_special_tokens=False)
+        full_ids     = list(prompt_ids) + response_ids
         return full_ids, len(prompt_ids)
 
 
