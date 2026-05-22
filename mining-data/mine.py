@@ -3,7 +3,7 @@
 URC training data mining script.
 
 Generates one deterministic completion per model per instance from four models,
-judges each with gpt-oss-120b, and retains COMMITTED completions as URC training data.
+judges each with gpt-oss-120b, and retains COMMIT completions as URC training data.
 
 Usage:
     python mine.py                        # full run, all four models
@@ -63,6 +63,7 @@ from judge import (  # type: ignore[import]
     JUDGE_MODEL_ID, JUDGE_CEREBRAS_ID, JUDGE_TEMPLATE,
     build_judge_prompt as _build_judge_prompt_shared,
     _parse_judge_response, call_judge, make_cerebras_client,
+    normalise_label, COMMIT, ABSTAIN,
 )
 
 # Recorded in output metadata; do_sample=False is the actual decoding mode
@@ -129,7 +130,15 @@ def load_instances() -> list[dict]:
                 "context": None,
             })
 
-    squad_path = SAMPLED_DIR / "squad_unanswerable_2000.jsonl"
+    # Prefer the smallest expanded-pool file present (2250 → 2500 → 2000) so we can
+    # cap new mining work without rewriting code. The "extra" rows beyond 2000 are
+    # only mined when running with --resume.
+    for candidate in ("squad_unanswerable_2250.jsonl",
+                      "squad_unanswerable_2500.jsonl",
+                      "squad_unanswerable_2000.jsonl"):
+        squad_path = SAMPLED_DIR / candidate
+        if squad_path.exists():
+            break
     with open(squad_path) as f:
         for i, line in enumerate(f):
             line = line.strip()
@@ -210,11 +219,46 @@ def _free_model_memory() -> None:
     gc.collect()
 
 
+def _existing_example_ids(model_id: str) -> set[str]:
+    """Return example_ids already judged for this model (across both datasets)."""
+    slug = model_short_name(model_id)
+    seen: set[str] = set()
+    for path in RESULTS_DIR.glob(f"{slug}_*.jsonl"):
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("example_id"):
+                seen.add(row["example_id"])
+    return seen
+
+
 def run_generation_phase(
     instances: list[dict],
     model_id: str,
+    skip_existing: bool = False,
 ) -> list[dict]:
-    """Generate one completion per instance for model_id."""
+    """Generate one completion per instance for model_id.
+
+    If skip_existing=True, instances whose example_id is already present in
+    mining-results/{model_slug}_*.jsonl are skipped (resume support).
+    """
+    if skip_existing:
+        already = _existing_example_ids(model_id)
+        before = len(instances)
+        instances = [
+            i for i in instances
+            if make_example_id(i["dataset"], i["source_index"], model_id) not in already
+        ]
+        log.info("  skip_existing : %d already mined, %d remaining", before - len(instances), len(instances))
+        if not instances:
+            log.info("  All instances already mined for %s; skipping generation.", model_id)
+            return []
+
     log.info("")
     log.info("=" * 64)
     log.info("GENERATE  %s", model_id)
@@ -333,9 +377,9 @@ def run_judging_phase(all_gen_rows: list[dict]) -> list[dict]:
             "judge_time_s": round(elapsed, 3),
         })
 
-        if label == "COMMITTED":
+        if label == COMMIT:
             committed += 1
-        elif label == "ABSTAINED":
+        elif label == ABSTAIN:
             abstained += 1
         else:
             errors += 1
@@ -431,6 +475,7 @@ def is_prompt_echo_only(completion: str, prompt: str) -> bool:
 def write_output_files(
     judged_rows: list[dict],
     prefix_map: dict[str, dict],
+    merge_existing: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """
     Write one JSONL file per (model × dataset) pair.
@@ -447,14 +492,15 @@ def write_output_files(
     for row in judged_rows:
         example_id = row["example_id"]
         clean = row.get("full_completion_clean", "")
-        label = row.get("judge_label")
+        raw_label = row.get("judge_label")
+        label = normalise_label(raw_label)
         rejection_reason: str | None = None
 
         if not clean:
             rejection_reason = "empty_completion"
-        elif label == "judge_error":
+        elif raw_label == "judge_error":
             rejection_reason = "invalid_json_from_judge"
-        elif label in ("ABSTAINED", None) or label != "COMMITTED":
+        elif label != COMMIT:
             rejection_reason = "abstained"
         elif is_prompt_echo_only(clean, row["generation_prompt"]):
             rejection_reason = "prompt_echo_only"
@@ -516,6 +562,13 @@ def write_output_files(
 
     for (slug, dataset), rows in sorted(groups.items()):
         path = RESULTS_DIR / f"{slug}_{dataset}.jsonl"
+        if merge_existing and path.exists():
+            existing_rows = [
+                json.loads(l) for l in path.read_text().splitlines() if l.strip()
+            ]
+            new_ids = {r["example_id"] for r in rows}
+            kept = [r for r in existing_rows if r.get("example_id") not in new_ids]
+            rows = kept + rows
         with open(path, "w") as f:
             for r in rows:
                 f.write(json.dumps(r) + "\n")
@@ -540,14 +593,16 @@ def write_summary(
         return [r for r in rows if r.get("generator_model") == model_id]
 
     def _label(rows: list[dict], label: str) -> int:
+        if label in (COMMIT, ABSTAIN):
+            return sum(1 for r in rows if normalise_label(r.get("judge_label")) == label)
         return sum(1 for r in rows if r.get("judge_label") == label)
 
     def dataset_counts(dataset: str) -> dict:
         j = _ds(judged_rows, dataset)
         return {
             "generated": len(j),
-            "committed": _label(j, "COMMITTED"),
-            "abstained": _label(j, "ABSTAINED"),
+            "committed": _label(j, COMMIT),
+            "abstained": _label(j, ABSTAIN),
             "judge_errors": _label(j, "judge_error"),
             "retained": len(_ds(retained, dataset)),
             "rejected": len(_ds(rejected, dataset)),
@@ -557,8 +612,8 @@ def write_summary(
         j = _model(judged_rows, model_id)
         return {
             "generated": len(j),
-            "committed": _label(j, "COMMITTED"),
-            "abstained": _label(j, "ABSTAINED"),
+            "committed": _label(j, COMMIT),
+            "abstained": _label(j, ABSTAIN),
             "judge_errors": _label(j, "judge_error"),
             "retained": len(_model(retained, model_id)),
             "rejected": len(_model(rejected, model_id)),
@@ -568,8 +623,8 @@ def write_summary(
         j = _model(_ds(judged_rows, dataset), model_id)
         r = _model(_ds(retained, dataset), model_id)
         return {
-            "committed": _label(j, "COMMITTED"),
-            "abstained": _label(j, "ABSTAINED"),
+            "committed": _label(j, COMMIT),
+            "abstained": _label(j, ABSTAIN),
             "retained": len(r),
         }
 
@@ -585,8 +640,8 @@ def write_summary(
         "judge_model": JUDGE_MODEL_ID,
         "decoding": DECODING,
         "total_generations": len(all_gen_rows),
-        "total_committed": _label(judged_rows, "COMMITTED"),
-        "total_abstained": _label(judged_rows, "ABSTAINED"),
+        "total_committed": _label(judged_rows, COMMIT),
+        "total_abstained": _label(judged_rows, ABSTAIN),
         "total_rejected": len(rejected),
         "total_retained": len(retained),
         "counts_by_dataset": {
@@ -644,6 +699,12 @@ def parse_args() -> argparse.Namespace:
         help="Re-apply retention rules and prefix extraction to existing result files "
              "(no generation or judging — fast)",
     )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip instances already mined for the given model (looks at example_ids "
+             "present in mining-results/) and append-merge new rows into existing files.",
+    )
     return p.parse_args()
 
 
@@ -670,7 +731,7 @@ def reprocess() -> None:
     log.info("Loaded %d rows from %d files", len(all_rows), len(existing))
 
     # Re-extract prefixes for committed rows, per model
-    committed_rows = [r for r in all_rows if r.get("judge_label") == "COMMITTED"]
+    committed_rows = [r for r in all_rows if normalise_label(r.get("judge_label")) == COMMIT]
     log.info("")
     log.info("=" * 64)
     log.info("PREFIX EXTRACTION")
@@ -725,7 +786,7 @@ def main() -> None:
     models_to_run = [model_filter] if model_filter else GENERATION_MODELS
     all_gen_rows: list[dict] = []
     for model_id in models_to_run:
-        gen_rows = run_generation_phase(instances, model_id)
+        gen_rows = run_generation_phase(instances, model_id, skip_existing=args.resume)
         all_gen_rows.extend(gen_rows)
     log.info("")
     log.info("Total generations: %d", len(all_gen_rows))
@@ -738,7 +799,7 @@ def main() -> None:
     log.info("=" * 64)
     log.info("PREFIX EXTRACTION")
 
-    committed_rows = [r for r in judged_rows if r.get("judge_label") == "COMMITTED"]
+    committed_rows = [r for r in judged_rows if normalise_label(r.get("judge_label")) == COMMIT]
     log.info("  Committed completions: %d", len(committed_rows))
 
     prefix_map: dict[str, dict] = {}
@@ -751,7 +812,7 @@ def main() -> None:
     log.info("")
     log.info("=" * 64)
     log.info("WRITING OUTPUT FILES")
-    retained, rejected = write_output_files(judged_rows, prefix_map)
+    retained, rejected = write_output_files(judged_rows, prefix_map, merge_existing=args.resume)
 
     # ── Phase 5: Summary ─────────────────────────────────────────────────────
     summary = write_summary(all_gen_rows, retained, rejected, judged_rows)

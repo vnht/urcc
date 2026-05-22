@@ -95,7 +95,10 @@ BASELINE_DIR = REPO_ROOT / "training" / "pre-training-baselines"
 sys.path.insert(0, str(REPO_ROOT))
 load_dotenv(REPO_ROOT / ".env")
 
-from evaluation.judge import build_judge_prompt, call_judge, make_cerebras_client, JUDGE_MODEL_ID  # type: ignore[import]
+from evaluation.judge import (  # type: ignore[import]
+    build_judge_prompt, call_judge, make_cerebras_client,
+    normalise_label, COMMIT, ABSTAIN, JUDGE_MODEL_ID,
+)
 from llms.constants import SHORTCUTS  # type: ignore[import]
 
 ID_TO_SHORTCUT = {v: k for k, v in SHORTCUTS.items()}
@@ -274,7 +277,7 @@ def run_generation(model, tokenizer, model_key: str, eval_dir: Path, out_path: P
 # ── Judging ───────────────────────────────────────────────────────────────────
 
 def judge_rows(rows: list[dict], gen_path: Path, client) -> list[dict]:
-    needs = [r for r in rows if r.get("judge_label") not in ("COMMITTED", "ABSTAINED")]
+    needs = [r for r in rows if normalise_label(r.get("judge_label")) is None]
     if not needs:
         log.info("  All %d rows already judged", len(rows))
         return rows
@@ -300,9 +303,9 @@ def judge_rows(rows: list[dict], gen_path: Path, client) -> list[dict]:
             "judge_raw_output": raw,
             "judge_time_s":     round(elapsed, 3),
         })
-        if label == "COMMITTED":   committed += 1
-        elif label == "ABSTAINED": abstained += 1
-        else:                      errors    += 1
+        if label == COMMIT:    committed += 1
+        elif label == ABSTAIN: abstained += 1
+        else:                  errors    += 1
         bar.set_postfix(C=committed, A=abstained, E=errors)
 
     all_rows = list(judged_map.values())
@@ -319,19 +322,22 @@ def compute_metrics(rows: list[dict], model_id: str, dataset: str) -> dict:
     answerable   = [r for r in subset if r["answerable"]]
     unanswerable = [r for r in subset if not r["answerable"]]
 
+    def label_of(r):
+        return normalise_label(r.get("judge_label"))
+
     def valid(group):
-        return [r for r in group if r.get("judge_label") in ("COMMITTED", "ABSTAINED")]
+        return [r for r in group if label_of(r) in (COMMIT, ABSTAIN)]
 
     ans_valid   = valid(answerable)
     unans_valid = valid(unanswerable)
     num_errors  = len(subset) - len(ans_valid) - len(unans_valid)
 
     def rate(group, label):
-        return (sum(1 for r in group if r.get("judge_label") == label) / len(group)
+        return (sum(1 for r in group if label_of(r) == label) / len(group)
                 if group else float("nan"))
 
-    true_commits  = sum(1 for r in ans_valid   if r.get("judge_label") == "COMMITTED")
-    true_abst     = sum(1 for r in unans_valid if r.get("judge_label") == "ABSTAINED")
+    true_commits  = sum(1 for r in ans_valid   if label_of(r) == COMMIT)
+    true_abst     = sum(1 for r in unans_valid if label_of(r) == ABSTAIN)
     dec_acc       = (true_commits + true_abst) / len(subset) if subset else float("nan")
 
     return {
@@ -341,10 +347,10 @@ def compute_metrics(rows: list[dict], model_id: str, dataset: str) -> dict:
         "num_answerable":        len(answerable),
         "num_unanswerable":      len(unanswerable),
         "num_judge_errors":      num_errors,
-        "true_commitment_rate":  round(rate(ans_valid,   "COMMITTED"), 4),
-        "false_abstention_rate": round(rate(ans_valid,   "ABSTAINED"), 4),
-        "true_abstention_rate":  round(rate(unans_valid, "ABSTAINED"), 4),
-        "false_commitment_rate": round(rate(unans_valid, "COMMITTED"), 4),
+        "true_commitment_rate":  round(rate(ans_valid,   COMMIT),  4),
+        "false_abstention_rate": round(rate(ans_valid,   ABSTAIN), 4),
+        "true_abstention_rate":  round(rate(unans_valid, ABSTAIN), 4),
+        "false_commitment_rate": round(rate(unans_valid, COMMIT),  4),
         "decision_accuracy":     round(dec_acc, 4),
     }
 

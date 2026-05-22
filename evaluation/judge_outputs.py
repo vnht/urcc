@@ -7,10 +7,10 @@ Writes: eval_baseline_generations_<model>.jsonl  (adds judge_label in-place)
         eval_baseline_answerability_metrics.jsonl
 
 Metrics per (model, dataset):
-    true_commitment_rate  = P(COMMITTED | answerable)
-    false_abstention_rate = P(ABSTAINED  | answerable)
-    true_abstention_rate  = P(ABSTAINED  | unanswerable)
-    false_commitment_rate = P(COMMITTED  | unanswerable)
+    true_commitment_rate  = P(COMMIT  | answerable)
+    false_abstention_rate = P(ABSTAIN | answerable)
+    true_abstention_rate  = P(ABSTAIN | unanswerable)
+    false_commitment_rate = P(COMMIT  | unanswerable)
     decision_accuracy     = (true_commitments + true_abstentions) / total
 
 Usage:
@@ -37,7 +37,10 @@ REPO_ROOT = HERE.parent
 sys.path.insert(0, str(REPO_ROOT))
 load_dotenv(REPO_ROOT / ".env")
 
-from judge import build_judge_prompt, call_judge, make_cerebras_client, JUDGE_MODEL_ID  # type: ignore[import]
+from judge import (  # type: ignore[import]
+    build_judge_prompt, call_judge, make_cerebras_client,
+    normalise_label, COMMIT, ABSTAIN, JUDGE_MODEL_ID,
+)
 from llms.constants import SHORTCUTS  # type: ignore[import]
 
 SHORTCUT_TO_ID = SHORTCUTS
@@ -65,7 +68,7 @@ def judge_file(gen_path: Path, client) -> list[dict]:
             if line:
                 rows.append(json.loads(line))
 
-    needs_judging = [r for r in rows if r.get("judge_label") not in ("COMMITTED", "ABSTAINED")]
+    needs_judging = [r for r in rows if normalise_label(r.get("judge_label")) is None]
     if not needs_judging:
         log.info("  All %d rows already judged in %s", len(rows), gen_path.name)
         return rows
@@ -93,9 +96,9 @@ def judge_file(gen_path: Path, client) -> list[dict]:
             "judge_time_s": round(elapsed, 3),
         })
 
-        if label == "COMMITTED":
+        if label == COMMIT:
             committed += 1
-        elif label == "ABSTAINED":
+        elif label == ABSTAIN:
             abstained += 1
         else:
             errors += 1
@@ -120,8 +123,11 @@ def compute_metrics(rows: list[dict], model_id: str, dataset: str) -> dict:
 
     # Only rows with a valid label contribute to rates (so rates sum to 1.0).
     # Errors are tracked separately and count as wrong in decision_accuracy.
+    def label_of(r):
+        return normalise_label(r.get("judge_label"))
+
     def valid(group):
-        return [r for r in group if r.get("judge_label") in ("COMMITTED", "ABSTAINED")]
+        return [r for r in group if label_of(r) in (COMMIT, ABSTAIN)]
 
     ans_valid   = valid(answerable)
     unans_valid = valid(unanswerable)
@@ -130,10 +136,10 @@ def compute_metrics(rows: list[dict], model_id: str, dataset: str) -> dict:
     def rate(group, label):
         if not group:
             return float("nan")
-        return sum(1 for r in group if r.get("judge_label") == label) / len(group)
+        return sum(1 for r in group if label_of(r) == label) / len(group)
 
-    true_commitments = sum(1 for r in ans_valid   if r.get("judge_label") == "COMMITTED")
-    true_abstentions = sum(1 for r in unans_valid if r.get("judge_label") == "ABSTAINED")
+    true_commitments = sum(1 for r in ans_valid   if label_of(r) == COMMIT)
+    true_abstentions = sum(1 for r in unans_valid if label_of(r) == ABSTAIN)
     decision_accuracy = (true_commitments + true_abstentions) / len(subset) if subset else float("nan")
 
     return {
@@ -143,10 +149,10 @@ def compute_metrics(rows: list[dict], model_id: str, dataset: str) -> dict:
         "num_answerable":       len(answerable),
         "num_unanswerable":     len(unanswerable),
         "num_judge_errors":     num_errors,
-        "true_commitment_rate":  round(rate(ans_valid,   "COMMITTED"), 4),
-        "false_abstention_rate": round(rate(ans_valid,   "ABSTAINED"), 4),
-        "true_abstention_rate":  round(rate(unans_valid, "ABSTAINED"), 4),
-        "false_commitment_rate": round(rate(unans_valid, "COMMITTED"), 4),
+        "true_commitment_rate":  round(rate(ans_valid,   COMMIT),  4),
+        "false_abstention_rate": round(rate(ans_valid,   ABSTAIN), 4),
+        "true_abstention_rate":  round(rate(unans_valid, ABSTAIN), 4),
+        "false_commitment_rate": round(rate(unans_valid, COMMIT),  4),
         "decision_accuracy":     round(decision_accuracy, 4),
     }
 

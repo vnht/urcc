@@ -14,121 +14,121 @@
     "max_new_tokens": 64,
     "num_samples_per_model": 1
   },
-  "total_generations": 16000,
-  "total_committed": 12588,
-  "total_abstained": 2306,
-  "total_rejected": 4252,
-  "total_retained": 11748,
+  "total_generations": 250,
+  "total_committed": 84,
+  "total_abstained": 166,
+  "total_rejected": 170,
+  "total_retained": 80,
   "counts_by_dataset": {
     "kuq": {
-      "generated": 8000,
-      "committed": 7435,
-      "abstained": 562,
-      "judge_errors": 3,
-      "retained": 7419,
-      "rejected": 581
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
     },
     "squad": {
-      "generated": 8000,
-      "committed": 5153,
-      "abstained": 1744,
-      "judge_errors": 7,
-      "retained": 4329,
-      "rejected": 3671
+      "generated": 250,
+      "committed": 84,
+      "abstained": 166,
+      "judge_errors": 0,
+      "retained": 80,
+      "rejected": 170
     }
   },
   "counts_by_generator_model": {
     "Qwen/Qwen3.5-9B": {
-      "generated": 4000,
-      "committed": 2769,
-      "abstained": 1228,
-      "judge_errors": 3,
-      "retained": 2754,
-      "rejected": 1246
+      "generated": 250,
+      "committed": 84,
+      "abstained": 166,
+      "judge_errors": 0,
+      "retained": 80,
+      "rejected": 170
     },
     "Qwen/Qwen3.5-9B-Base": {
-      "generated": 4000,
-      "committed": 3039,
-      "abstained": 790,
-      "judge_errors": 3,
-      "retained": 2466,
-      "rejected": 1534
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
     },
     "mistralai/Ministral-3-8B-Instruct-2512": {
-      "generated": 4000,
-      "committed": 3799,
-      "abstained": 197,
-      "judge_errors": 4,
-      "retained": 3563,
-      "rejected": 437
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
     },
     "mistralai/Ministral-3-8B-Base-2512": {
-      "generated": 4000,
-      "committed": 2981,
-      "abstained": 91,
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
       "judge_errors": 0,
-      "retained": 2965,
-      "rejected": 1035
+      "retained": 0,
+      "rejected": 0
     }
   },
   "counts_by_dataset_and_model": {
     "kuq": {
       "Qwen/Qwen3.5-9B": {
-        "committed": 1758,
-        "abstained": 242,
-        "retained": 1758
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       },
       "Qwen/Qwen3.5-9B-Base": {
-        "committed": 1803,
-        "abstained": 196,
-        "retained": 1794
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       },
       "mistralai/Ministral-3-8B-Instruct-2512": {
-        "committed": 1919,
-        "abstained": 79,
-        "retained": 1912
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       },
       "mistralai/Ministral-3-8B-Base-2512": {
-        "committed": 1955,
-        "abstained": 45,
-        "retained": 1955
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       }
     },
     "squad": {
       "Qwen/Qwen3.5-9B": {
-        "committed": 1011,
-        "abstained": 986,
-        "retained": 996
+        "committed": 84,
+        "abstained": 166,
+        "retained": 80
       },
       "Qwen/Qwen3.5-9B-Base": {
-        "committed": 1236,
-        "abstained": 594,
-        "retained": 672
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       },
       "mistralai/Ministral-3-8B-Instruct-2512": {
-        "committed": 1880,
-        "abstained": 118,
-        "retained": 1651
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       },
       "mistralai/Ministral-3-8B-Base-2512": {
-        "committed": 1026,
-        "abstained": 46,
-        "retained": 1010
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
       }
     }
   },
-  "judge_error_count": 10,
-  "valid_prefix_k4_count": 11748,
-  "valid_prefix_k8_count": 11748,
-  "valid_prefix_k16_count": 10925,
+  "judge_error_count": 0,
+  "valid_prefix_k4_count": 80,
+  "valid_prefix_k8_count": 80,
+  "valid_prefix_k16_count": 66,
   "rejection_reasons": {
-    "abstained": 2306,
-    "empty_completion": 1096,
+    "abstained": 166,
+    "empty_completion": 0,
     "malformed_completion": 0,
-    "invalid_json_from_judge": 10,
-    "invalid_prefix_k8": 497,
-    "prompt_echo_only": 343,
+    "invalid_json_from_judge": 0,
+    "invalid_prefix_k8": 0,
+    "prompt_echo_only": 4,
     "duplicate_completion": 0
   },
-  "generated_at": "2026-05-19T20:35:43.639221"
+  "generated_at": "2026-05-22T12:10:02.321437"
 }

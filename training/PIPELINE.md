@@ -42,7 +42,10 @@ For each model in the registry:
    `squad_unanswerable_2000.jsonl`, generate one **deterministic** completion
    using the model's chat template (or raw prompt for base models).
 3. Send each completion to the Cerebras `gpt-oss-120b` judge with the prompt
-   defined in `evaluation/judge.py` to label it `COMMITTED` or `ABSTAINED`.
+   defined in `evaluation/judge.py` to label it `COMMIT` or `ABSTAIN`
+   (premise rejection counts as `ABSTAIN`). Legacy long-form labels
+   (`COMMITTED`/`ABSTAINED`) in cached files are accepted via
+   `judge.normalise_label()`.
 4. Save **all** rows to `mining-data/mining-results/<model>_<dataset>.jsonl`,
    tagged with the judge label and the first 8 tokens of the committed
    completion (`y_com_prefix_k8`).
@@ -57,7 +60,7 @@ to unlearn.
 
 Script: `mining-data/curate.py`
 
-1. Filter `COMMITTED` rows.
+1. Filter `COMMIT` rows.
 2. Score each row by judge confidence and answer length.
 3. Keep the top 500 per `(model, dataset)` pair, with optional borderline
    backfill if fewer than 500 are eligible.
@@ -184,7 +187,7 @@ The anchor is a single fixed reference point per layer:
 ```
 
 It is computed by filtering the existing mining results for
-`judge_label == "ABSTAINED"`, replaying those `(prompt, completion)`
+`normalise_label(judge_label) == "ABSTAIN"`, replaying those `(prompt, completion)`
 pairs through the base model, and averaging the residual stream at the
 last-25 % layers over the first `K=8` answer-token positions.
 
@@ -444,10 +447,10 @@ Per dataset (KUQ, SQuAD):
 
 | Metric                  | Definition                                              |
 |-------------------------|---------------------------------------------------------|
-| `true_commitment_rate`  | answerable & COMMITTED / answerable                     |
-| `false_abstention_rate` | answerable & ABSTAINED / answerable                     |
-| `true_abstention_rate`  | unanswerable & ABSTAINED / unanswerable                 |
-| `false_commitment_rate` | unanswerable & COMMITTED / unanswerable                 |
+| `true_commitment_rate`  | answerable & COMMIT / answerable                        |
+| `false_abstention_rate` | answerable & ABSTAIN / answerable                       |
+| `true_abstention_rate`  | unanswerable & ABSTAIN / unanswerable                   |
+| `false_commitment_rate` | unanswerable & COMMIT / unanswerable                    |
 | `decision_accuracy`     | (TC + TA) / total non-error                             |
 
 Saved to `eval/eval_answerability_metrics.jsonl`.

@@ -21,7 +21,8 @@ manifold instead of toward zero.
 Inputs (per model):
     mining-data/mining-results/<model_tag>_kuq.jsonl
     mining-data/mining-results/<model_tag>_squad.jsonl
-        keep rows with judge_label == "ABSTAINED"
+        keep rows whose normalised judge_label == ABSTAIN
+        (accepts legacy "ABSTAINED" / "ABSTANTED" via judge.normalise_label)
         use record["generation_prompt"] + record["full_completion_clean"]
 
 Outputs (per model, last-25 % layer slice):
@@ -173,6 +174,9 @@ def gather_abstention_examples(
         MINING_RESULTS_DIR / f"{tag}_kuq.jsonl",
         MINING_RESULTS_DIR / f"{tag}_squad.jsonl",
     ]
+    sys.path.insert(0, str(REPO_ROOT / "evaluation"))
+    from judge import normalise_label, ABSTAIN  # type: ignore[import]
+
     out: list[dict] = []
     sources: list[str] = []
 
@@ -183,7 +187,7 @@ def gather_abstention_examples(
         rows = load_jsonl(p)
         kept: list[dict] = []
         for r in rows:
-            if r.get("judge_label") != "ABSTAINED":
+            if normalise_label(r.get("judge_label")) != ABSTAIN:
                 continue
             prompt = r.get("generation_prompt") or ""
             completion = r.get("full_completion_clean") or r.get("full_completion_raw") or ""
@@ -199,8 +203,9 @@ def gather_abstention_examples(
         if max_per_dataset is not None and len(kept) > max_per_dataset:
             kept = kept[:max_per_dataset]
 
+        n_abstain = sum(1 for r in rows if normalise_label(r.get("judge_label")) == ABSTAIN)
         log.info("  %-30s %d abstention rows -> using %d",
-                 p.name, sum(1 for r in rows if r.get("judge_label") == "ABSTAINED"), len(kept))
+                 p.name, n_abstain, len(kept))
         out.extend(kept)
         sources.append(p.name)
 

@@ -88,14 +88,17 @@ def parse_prompt(prompt: str, dataset: str) -> tuple[str, str | None]:
 def build_results_lookup() -> dict[tuple, dict]:
     """
     Count, per (dataset, source_index), how many of the 4 model runs were
-    COMMITTED vs other. Used to fill num_samples / num_committed / num_other.
+    COMMIT vs other. Used to fill num_samples / num_committed / num_other.
     """
+    sys.path.insert(0, str(REPO_ROOT / "evaluation"))
+    from judge import normalise_label, COMMIT  # type: ignore[import]
+
     lookup: dict[tuple, dict] = defaultdict(lambda: {"total": 0, "committed": 0})
     for path in RESULTS_DIR.glob("*.jsonl"):
         for row in load_jsonl(path):
             key = (row["dataset"], row["source_index"])
             lookup[key]["total"] += 1
-            if row.get("judge_label") == "COMMITTED":
+            if normalise_label(row.get("judge_label")) == COMMIT:
                 lookup[key]["committed"] += 1
     return lookup
 
