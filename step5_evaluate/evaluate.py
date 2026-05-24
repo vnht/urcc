@@ -86,6 +86,7 @@ from _common import (
 
 DEFAULT_MAX_RESPONSE_TOKENS = 256
 DEFAULT_SUMMARY_EVERY = 5
+DEFAULT_MAX_RETRIES = 3
 
 
 # ── Atomic dataset-JSON I/O ───────────────────────────────────────────────────
@@ -381,40 +382,75 @@ def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
         else:
             row["prompt"] = build_answerable_prompt(dataset, r)
 
-        gen_t0 = time.time()
-        try:
-            row["completion"] = generate_greedy(
-                model, tokenizer, model_key, row["prompt"],
-                max_new_tokens=args.max_new_tokens,
-            )
-        except Exception as exc:
-            log.warning("  [%s] gen error: %s", dataset, exc)
-            row["completion"] = ""
-        gen_dt = time.time() - gen_t0
-        gen_total += gen_dt
-        row["gen_time_s"] = round(gen_dt, 3)
+        # Try the full instance (gen + judge) up to args.max_retries times.
+        # An attempt counts as a failure if generation throws, the completion
+        # is empty, or the judge call throws. We keep the artefacts of the
+        # last attempt regardless of outcome.
+        completion = ""
+        label, raw = "ERROR", "not attempted"
+        gen_dt_total = 0.0
+        judge_dt_total = 0.0
 
-        judge_t0 = time.time()
-        if row["completion"]:
-            jp = judge_mod["build_judge_prompt"](
-                question=row["question"],
-                completion=row["completion"],
-                context=row.get("context"),
-            )
+        for attempt in range(1, args.max_retries + 1):
+            attempt_failed = False
+            attempt_reason = ""
+
+            gen_t0 = time.time()
             try:
-                label, raw = judge_mod["call_judge"](client, jp)
+                completion = generate_greedy(
+                    model, tokenizer, model_key, row["prompt"],
+                    max_new_tokens=args.max_new_tokens,
+                )
             except Exception as exc:
-                log.warning("  [%s] judge error: %s", dataset, exc)
-                label, raw = "ERROR", str(exc)
-        else:
-            label, raw = "ERROR", "empty completion"
-        judge_dt = time.time() - judge_t0
-        judge_total += judge_dt
+                log.warning("  [%s] gen error (attempt %d/%d): %s",
+                            dataset, attempt, args.max_retries, exc)
+                completion = ""
+                attempt_failed = True
+                attempt_reason = f"gen exception: {exc}"
+            gen_dt_total += time.time() - gen_t0
 
+            if not completion:
+                attempt_failed = True
+                attempt_reason = attempt_reason or "empty completion"
+                label, raw = "ERROR", attempt_reason
+            else:
+                jp = judge_mod["build_judge_prompt"](
+                    question=row["question"],
+                    completion=completion,
+                    context=row.get("context"),
+                )
+                judge_t0 = time.time()
+                try:
+                    label, raw = judge_mod["call_judge"](client, jp)
+                except Exception as exc:
+                    log.warning("  [%s] judge error (attempt %d/%d): %s",
+                                dataset, attempt, args.max_retries, exc)
+                    label, raw = "ERROR", f"judge exception: {exc}"
+                    attempt_failed = True
+                    attempt_reason = f"judge exception: {exc}"
+                judge_dt_total += time.time() - judge_t0
+
+            if not attempt_failed:
+                break
+
+            if attempt < args.max_retries:
+                log.info("  [%s] retrying instance (%d/%d) — reason: %s",
+                         dataset, attempt + 1, args.max_retries, attempt_reason)
+                time.sleep(2 ** (attempt - 1))
+            else:
+                log.warning("  [%s] giving up after %d attempts — last reason: %s",
+                            dataset, attempt, attempt_reason)
+
+        gen_total += gen_dt_total
+        judge_total += judge_dt_total
+
+        row["completion"]       = completion
+        row["gen_time_s"]       = round(gen_dt_total, 3)
         row["judge_label"]      = label
         row["judge_model"]      = judge_mod["JUDGE_MODEL_ID"]
         row["judge_raw_output"] = raw
-        row["judge_time_s"]     = round(judge_dt, 3)
+        row["judge_time_s"]     = round(judge_dt_total, 3)
+        row["attempts"]         = attempt
         row["model"]            = cfg.MODEL_REGISTRY[model_key]
         row["run"]              = result_name
 
@@ -644,6 +680,9 @@ def parse_args() -> argparse.Namespace:
                    help=f"Cap UltraChat response token length (default {DEFAULT_MAX_RESPONSE_TOKENS}).")
     p.add_argument("--max-ppl-rows", type=int, default=None,
                    help="Cap UltraChat ppl eval to N rows (smoke).")
+    p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                   help=f"Max attempts per instance (gen + judge) before "
+                        f"giving up and recording ERROR (default {DEFAULT_MAX_RETRIES}).")
     p.add_argument("--summary-every", type=int, default=DEFAULT_SUMMARY_EVERY,
                    help=f"Atomically rewrite the dataset JSON every N rows "
                         f"(default {DEFAULT_SUMMARY_EVERY}).")
