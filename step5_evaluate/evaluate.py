@@ -11,35 +11,34 @@ Two modes:
 
 Two evaluations run in one model load:
 
-  (1) Answerability (Categories A/B/C/D)
-      For each held-out KUQ + SQuAD prompt, generate one greedy completion,
-      judge it via judge.py (Cerebras gpt-oss-120b), and report TCR / FCR /
-      TAR / FAR / decision accuracy.
+  (1) Answerability — KUQ + SQuAD
+      For each held-out prompt, generate one greedy completion, judge it via
+      judge.py (Cerebras gpt-oss-120b), and report TCR / FCR / TAR / FAR /
+      decision accuracy.
 
-  (2) UltraChat preservation (Category E, perplexity)
-      For each held-out UltraChat (prompt, response) pair, compute the
-      per-token cross-entropy of the response (capped to --max-response-tokens,
-      default 256) under the model. Report token-level corpus perplexity.
-      Healthy preservation: PPL_post / PPL_base ≈ 1.
+  (2) UltraChat preservation (perplexity)
+      For each held-out (prompt, response) pair, compute per-token
+      cross-entropy of the response (capped to --max-response-tokens,
+      default 256). Healthy preservation: PPL_post / PPL_base ≈ 1.
 
-Reads:  step5_evaluate/data/heldout/{kuq,squad,ultrachat}.jsonl
-        step4_train/data/runs/<run_name>/        (adapter + training_config.json, trained mode only)
-Writes: step5_evaluate/data/results/<name>/
-            generations.jsonl                    answerability per-row
-            answerability_metrics.jsonl          answerability summary
-            perplexity_ultrachat.jsonl           ppl per-row
-            perplexity_ultrachat_summary.json    ppl summary
-            comparison.json                      (optional, vs --baseline)
+Output layout (one JSON file per dataset)
+-----------------------------------------
+    step5_evaluate/data/results/<name>/
+        kuq.json         metrics + per-row details (+ baseline deltas if --baseline)
+        squad.json       metrics + per-row details (+ baseline deltas if --baseline)
+        ultrachat.json   PPL aggregate + per-row details (+ baseline ratios if --baseline)
+
+Each file is the complete record for that dataset.
 
 `<name>` is the run directory's name in trained mode, or
 `baseline_<model_key>` in baseline mode.
 
 Crash-safe & resumable
 ----------------------
-Each row is appended to its file as soon as it has a result. Re-running
-this script skips any row already complete on disk (matched by id within
-its file). The two evaluations are independent — you can use --skip-judge
-or --skip-ppl to run only one.
+The per-dataset JSON file is rewritten atomically every `--summary-every`
+rows (default 5) and at the end of each dataset. On restart, rows whose id
+already appears in `rows` are skipped. The atomic rewrite (write to .tmp,
+then rename) guarantees the on-disk file is never half-written.
 
 Run
 ---
@@ -74,7 +73,6 @@ import config as cfg
 from _common import (
     Progress,
     Stopwatch,
-    append_jsonl,
     build_answerable_prompt,
     build_unanswerable_prompt,
     format_duration,
@@ -83,11 +81,30 @@ from _common import (
     load_model_and_tokenizer,
     log,
     tokenise_chat_prompt_response,
-    write_jsonl,
 )
 
 
 DEFAULT_MAX_RESPONSE_TOKENS = 256
+DEFAULT_SUMMARY_EVERY = 5
+
+
+# ── Atomic dataset-JSON I/O ───────────────────────────────────────────────────
+
+def _load_dataset_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        log.warning("  cannot read %s: %s — starting fresh", path, exc)
+        return None
+
+
+def _save_dataset_json(path: Path, data: dict) -> None:
+    """Atomic write: serialize to .tmp, fsync, then rename over the target."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(path)
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -104,15 +121,14 @@ def _load_adapter_model(run_dir: Path):
     from peft import PeftModel
     model = PeftModel.from_pretrained(model, str(run_dir))
     model.eval()
-    return model, tokenizer, model_key, train_cfg
+    return model, tokenizer, model_key
 
 
 def _load_base_model(model_key: str):
     """Load the bare base model with no adapter — zero-shot baseline."""
     model, tokenizer = load_model_and_tokenizer(model_key, eval_only=True)
     model.eval()
-    train_cfg = {"model_key": model_key, "method": "baseline (no adapter)"}
-    return model, tokenizer, model_key, train_cfg
+    return model, tokenizer, model_key
 
 
 # ── Judging (answerability) ───────────────────────────────────────────────────
@@ -133,13 +149,12 @@ def _import_judge():
     }
 
 
-def _compute_answerability_metrics(rows: list[dict], dataset: str, judge_mod: dict) -> dict:
+def _summarise_answerability(rows: list[dict], judge_mod: dict) -> dict:
     norm = judge_mod["normalise_label"]
     COMMIT, ABSTAIN = judge_mod["COMMIT"], judge_mod["ABSTAIN"]
 
-    subset = [r for r in rows if r["dataset"] == dataset]
-    answerable   = [r for r in subset if r["answerable"]]
-    unanswerable = [r for r in subset if not r["answerable"]]
+    answerable   = [r for r in rows if r.get("answerable")]
+    unanswerable = [r for r in rows if not r.get("answerable")]
 
     def label_of(r):
         return norm(r.get("judge_label"))
@@ -149,7 +164,7 @@ def _compute_answerability_metrics(rows: list[dict], dataset: str, judge_mod: di
 
     av  = valid(answerable)
     uv  = valid(unanswerable)
-    tot = len(subset)
+    tot = len(rows)
     err = tot - len(av) - len(uv)
 
     def rate(g, label):
@@ -161,140 +176,23 @@ def _compute_answerability_metrics(rows: list[dict], dataset: str, judge_mod: di
     ta = sum(1 for r in uv if label_of(r) == ABSTAIN)
     dec_acc = (tc + ta) / tot if tot else float("nan")
 
+    def _round(x):
+        return round(x, 4) if isinstance(x, float) and x == x else x
+
     return {
-        "dataset":              dataset,
-        "num_instances":        tot,
-        "num_answerable":       len(answerable),
-        "num_unanswerable":     len(unanswerable),
-        "num_judge_errors":     err,
-        "true_commitment_rate":  round(rate(av, COMMIT),   4),
-        "false_abstention_rate": round(rate(av, ABSTAIN),  4),
-        "true_abstention_rate":  round(rate(uv, ABSTAIN),  4),
-        "false_commitment_rate": round(rate(uv, COMMIT),   4),
-        "decision_accuracy":     round(dec_acc, 4),
+        "num_instances":         tot,
+        "num_answerable":        len(answerable),
+        "num_unanswerable":      len(unanswerable),
+        "num_judge_errors":      err,
+        "true_commitment_rate":  _round(rate(av, COMMIT)),
+        "false_abstention_rate": _round(rate(av, ABSTAIN)),
+        "true_abstention_rate":  _round(rate(uv, ABSTAIN)),
+        "false_commitment_rate": _round(rate(uv, COMMIT)),
+        "decision_accuracy":     _round(dec_acc),
     }
 
 
-def _row_key(dataset: str, row: dict) -> str:
-    return f"{dataset}::{row.get('id', row.get('source_index', '?'))}"
-
-
-def _run_answerability(args, model, tokenizer, model_key, result_name, out_dir, judge_mod):
-    """Generate + judge KUQ + SQuAD held-out prompts. Returns metrics list."""
-    gen_path = out_dir / "generations.jsonl"
-    existing_rows: list[dict] = load_jsonl(gen_path) if gen_path.exists() else []
-    done_keys: set[str] = {
-        _row_key(r["dataset"], r) for r in existing_rows
-        if r.get("completion") is not None and r.get("judge_label") is not None
-    }
-    if existing_rows:
-        log.info("  [judge] resume: %d rows on disk, %d already complete",
-                 len(existing_rows), len(done_keys))
-
-    client = judge_mod["make_cerebras_client"]()
-
-    todo: list[tuple[str, dict]] = []
-    for dataset in ("kuq", "squad"):
-        eval_path = cfg.heldout_path(dataset)
-        if not eval_path.exists():
-            log.warning("  [judge] eval pool missing: %s — skipping", eval_path)
-            continue
-        pool = load_jsonl(eval_path)
-        if args.max_per_dataset is not None:
-            pool = pool[: args.max_per_dataset]
-        for r in pool:
-            if _row_key(dataset, r) in done_keys:
-                continue
-            todo.append((dataset, r))
-        log.info("  [judge] %s: %d in pool, %d to do",
-                 dataset, len(pool), sum(1 for d, _ in todo if d == dataset))
-
-    counts = {"COMMIT": 0, "ABSTAIN": 0, "ERROR": 0, "OTHER": 0}
-    gen_total = 0.0
-    judge_total = 0.0
-    progress = Progress(total=len(todo), desc="answerability", log_every=10)
-
-    for dataset, r in todo:
-        row = dict(r)
-        row["dataset"] = dataset
-        if not r.get("answerable"):
-            row["prompt"] = build_unanswerable_prompt(dataset, r)
-        else:
-            row["prompt"] = build_answerable_prompt(dataset, r)
-
-        gen_t0 = time.time()
-        try:
-            row["completion"] = generate_greedy(
-                model, tokenizer, model_key, row["prompt"],
-                max_new_tokens=args.max_new_tokens,
-            )
-        except Exception as exc:
-            log.warning("  [judge] gen error: %s", exc)
-            row["completion"] = ""
-        gen_dt = time.time() - gen_t0
-        gen_total += gen_dt
-        row["gen_time_s"] = round(gen_dt, 3)
-
-        judge_t0 = time.time()
-        if row["completion"]:
-            jp = judge_mod["build_judge_prompt"](
-                question=row["question"],
-                completion=row["completion"],
-                context=row.get("context"),
-            )
-            try:
-                label, raw = judge_mod["call_judge"](client, jp)
-            except Exception as exc:
-                log.warning("  [judge] judge error: %s", exc)
-                label, raw = "ERROR", str(exc)
-        else:
-            label, raw = "ERROR", "empty completion"
-        judge_dt = time.time() - judge_t0
-        judge_total += judge_dt
-
-        row["judge_label"]      = label
-        row["judge_model"]      = judge_mod["JUDGE_MODEL_ID"]
-        row["judge_raw_output"] = raw
-        row["judge_time_s"]     = round(judge_dt, 3)
-        row["model"]            = cfg.MODEL_REGISTRY[model_key]
-        row["run"]              = result_name
-
-        bucket = label if label in counts else "OTHER"
-        counts[bucket] += 1
-
-        append_jsonl(gen_path, row)
-        existing_rows.append(row)
-
-        progress.tick(extras={
-            "C": counts["COMMIT"], "A": counts["ABSTAIN"],
-            "E": counts["ERROR"], "O": counts["OTHER"],
-        })
-
-    progress.done(extras={"C": counts["COMMIT"], "A": counts["ABSTAIN"],
-                          "E": counts["ERROR"]})
-    if progress.n:
-        log.info("  [judge] gen total=%s avg=%.2fs/inst   judge total=%s avg=%.2fs/inst",
-                 format_duration(gen_total), gen_total / progress.n,
-                 format_duration(judge_total), judge_total / progress.n)
-
-    metrics: list[dict] = []
-    for dataset in ("kuq", "squad"):
-        m = _compute_answerability_metrics(existing_rows, dataset, judge_mod)
-        m["model"] = cfg.MODEL_REGISTRY[model_key]
-        m["run"]   = result_name
-        metrics.append(m)
-        log.info("  [judge] %-6s acc=%.3f TCR=%.3f FAR=%.3f TAR=%.3f FCR=%.3f",
-                 dataset, m["decision_accuracy"], m["true_commitment_rate"],
-                 m["false_abstention_rate"], m["true_abstention_rate"],
-                 m["false_commitment_rate"])
-
-    metrics_path = out_dir / "answerability_metrics.jsonl"
-    write_jsonl(metrics_path, metrics)
-    log.info("  [judge] Wrote -> %s", metrics_path)
-    return metrics
-
-
-# ── Perplexity (UltraChat preservation) ───────────────────────────────────────
+# ── Perplexity ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def _row_nll(model, tokenizer, model_key: str, prompt: str, response: str,
@@ -334,9 +232,9 @@ def _row_nll(model, tokenizer, model_key: str, prompt: str, response: str,
 
 
 def _summarise_ppl(rows: list[dict]) -> dict:
-    valid = [r for r in rows if r.get("n_tokens", 0) > 0]
+    valid = [r for r in rows if r.get("n_tokens", 0) > 0 and r.get("ppl") is not None]
     if not valid:
-        return {"n_rows": 0}
+        return {"num_instances": len(rows), "num_valid": 0}
 
     sum_nll = sum(r["sum_nll"] for r in valid)
     sum_tok = sum(r["n_tokens"] for r in valid)
@@ -351,7 +249,8 @@ def _summarise_ppl(rows: list[dict]) -> dict:
         return per_row_ppl[i]
 
     return {
-        "n_rows":         len(valid),
+        "num_instances":  len(rows),
+        "num_valid":      len(valid),
         "n_tokens":       sum_tok,
         "token_nll":      round(token_nll, 6),
         "token_ppl":      round(token_ppl, 4),
@@ -362,30 +261,252 @@ def _summarise_ppl(rows: list[dict]) -> dict:
     }
 
 
-def _run_perplexity(args, model, tokenizer, model_key, result_name, out_dir):
-    """Compute UltraChat per-token PPL; writes per-row jsonl + summary json."""
-    pool_path = cfg.heldout_path("ultrachat")
-    if not pool_path.exists():
-        log.warning("  [ppl] held-out UltraChat missing: %s — skipping", pool_path)
+# ── Baseline comparison ───────────────────────────────────────────────────────
+
+_ANSWERABILITY_KEYS = (
+    "decision_accuracy", "true_commitment_rate",
+    "false_abstention_rate", "true_abstention_rate",
+    "false_commitment_rate",
+)
+_PPL_KEYS = ("token_ppl", "row_ppl_mean", "row_ppl_median")
+
+
+def _attach_baseline_answerability(record: dict, baseline_dir: Path | None,
+                                   dataset: str) -> None:
+    if baseline_dir is None:
+        return
+    base_path = baseline_dir / f"{dataset}.json"
+    base = _load_dataset_json(base_path)
+    if base is None or "metrics" not in base:
+        return
+    bm = base["metrics"]
+    cm = record["metrics"]
+    deltas = {}
+    for k in _ANSWERABILITY_KEYS:
+        if k in bm and k in cm and isinstance(bm[k], (int, float)) and isinstance(cm[k], (int, float)):
+            deltas[k] = round(cm[k] - bm[k], 4)
+    record["baseline"]     = {k: bm.get(k) for k in bm}
+    record["baseline_run"] = base.get("run")
+    record["deltas"]       = deltas
+
+
+def _attach_baseline_ppl(record: dict, baseline_dir: Path | None) -> None:
+    if baseline_dir is None:
+        return
+    base_path = baseline_dir / "ultrachat.json"
+    base = _load_dataset_json(base_path)
+    if base is None or "metrics" not in base:
+        return
+    bm = base["metrics"]
+    cm = record["metrics"]
+    ratios = {}
+    deltas = {}
+    for k in _PPL_KEYS:
+        bv, pv = bm.get(k), cm.get(k)
+        if isinstance(bv, (int, float)) and isinstance(pv, (int, float)) and bv:
+            ratios[f"{k}_ratio_post_over_base"]  = round(pv / bv, 4)
+            deltas[f"{k}_delta_post_minus_base"] = round(pv - bv, 4)
+    record["baseline"]     = {k: bm.get(k) for k in bm}
+    record["baseline_run"] = base.get("run")
+    record["ratios"]       = ratios
+    record["deltas"]       = deltas
+
+
+# ── Per-dataset answerability pass ────────────────────────────────────────────
+
+def _build_answerability_record(rows: list[dict], judge_mod: dict, model_key: str,
+                                result_name: str, dataset: str,
+                                eval_path: Path) -> dict:
+    return {
+        "dataset":   dataset,
+        "model":     cfg.MODEL_REGISTRY[model_key],
+        "model_key": model_key,
+        "run":       result_name,
+        "pool":      str(eval_path.relative_to(cfg.REPO_ROOT)),
+        "metrics":   _summarise_answerability(rows, judge_mod),
+        "rows":      rows,
+    }
+
+
+def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
+                               out_dir: Path, dataset: str, judge_mod: dict,
+                               baseline_dir: Path | None) -> dict | None:
+    eval_path = cfg.heldout_path(dataset)
+    if not eval_path.exists():
+        log.warning("  [%s] eval pool missing: %s — skipping", dataset, eval_path)
         return None
 
-    pool = load_jsonl(pool_path)
+    out_path = out_dir / f"{dataset}.json"
+
+    pool = load_jsonl(eval_path)
+    if args.max_per_dataset is not None:
+        pool = pool[: args.max_per_dataset]
+
+    prior = _load_dataset_json(out_path) or {}
+    rows: list[dict] = list(prior.get("rows") or [])
+    done_ids = {
+        r.get("id") for r in rows
+        if r.get("completion") is not None and r.get("judge_label") is not None
+    }
+    if rows:
+        log.info("  [%s] resume: %d rows on disk, %d already complete",
+                 dataset, len(rows), len(done_ids))
+
+    todo = [r for r in pool if r.get("id") not in done_ids]
+    log.info("  [%s] pool: %d   to do: %d", dataset, len(pool), len(todo))
+
+    def flush():
+        rec = _build_answerability_record(
+            rows, judge_mod, model_key, result_name, dataset, eval_path,
+        )
+        _attach_baseline_answerability(rec, baseline_dir, dataset)
+        _save_dataset_json(out_path, rec)
+
+    if not todo:
+        flush()
+        return _load_dataset_json(out_path)
+
+    client = judge_mod["make_cerebras_client"]()
+    counts = {"COMMIT": 0, "ABSTAIN": 0, "ERROR": 0, "OTHER": 0}
+    gen_total = 0.0
+    judge_total = 0.0
+    progress = Progress(total=len(todo), desc=dataset, log_every=10)
+    rows_since_save = 0
+
+    for r in todo:
+        row = dict(r)
+        row["dataset"] = dataset
+        if not r.get("answerable"):
+            row["prompt"] = build_unanswerable_prompt(dataset, r)
+        else:
+            row["prompt"] = build_answerable_prompt(dataset, r)
+
+        gen_t0 = time.time()
+        try:
+            row["completion"] = generate_greedy(
+                model, tokenizer, model_key, row["prompt"],
+                max_new_tokens=args.max_new_tokens,
+            )
+        except Exception as exc:
+            log.warning("  [%s] gen error: %s", dataset, exc)
+            row["completion"] = ""
+        gen_dt = time.time() - gen_t0
+        gen_total += gen_dt
+        row["gen_time_s"] = round(gen_dt, 3)
+
+        judge_t0 = time.time()
+        if row["completion"]:
+            jp = judge_mod["build_judge_prompt"](
+                question=row["question"],
+                completion=row["completion"],
+                context=row.get("context"),
+            )
+            try:
+                label, raw = judge_mod["call_judge"](client, jp)
+            except Exception as exc:
+                log.warning("  [%s] judge error: %s", dataset, exc)
+                label, raw = "ERROR", str(exc)
+        else:
+            label, raw = "ERROR", "empty completion"
+        judge_dt = time.time() - judge_t0
+        judge_total += judge_dt
+
+        row["judge_label"]      = label
+        row["judge_model"]      = judge_mod["JUDGE_MODEL_ID"]
+        row["judge_raw_output"] = raw
+        row["judge_time_s"]     = round(judge_dt, 3)
+        row["model"]            = cfg.MODEL_REGISTRY[model_key]
+        row["run"]              = result_name
+
+        bucket = label if label in counts else "OTHER"
+        counts[bucket] += 1
+
+        rows.append(row)
+        rows_since_save += 1
+
+        progress.tick(extras={
+            "C": counts["COMMIT"], "A": counts["ABSTAIN"],
+            "E": counts["ERROR"], "O": counts["OTHER"],
+        })
+
+        if rows_since_save >= args.summary_every:
+            flush()
+            rows_since_save = 0
+
+    progress.done(extras={"C": counts["COMMIT"], "A": counts["ABSTAIN"],
+                          "E": counts["ERROR"]})
+    if progress.n:
+        log.info("  [%s] gen total=%s avg=%.2fs/inst   judge total=%s avg=%.2fs/inst",
+                 dataset, format_duration(gen_total), gen_total / progress.n,
+                 format_duration(judge_total), judge_total / progress.n)
+
+    flush()
+    rec = _load_dataset_json(out_path) or {}
+    m = rec.get("metrics", {})
+    log.info("  [%s] acc=%.3f TCR=%.3f FAR=%.3f TAR=%.3f FCR=%.3f -> %s",
+             dataset, m.get("decision_accuracy"), m.get("true_commitment_rate"),
+             m.get("false_abstention_rate"), m.get("true_abstention_rate"),
+             m.get("false_commitment_rate"), out_path)
+    if "deltas" in rec and rec["deltas"]:
+        log.info("  [%s] vs baseline -> %s",
+                 dataset,
+                 ", ".join(f"Δ{k}={v:+.3f}" for k, v in rec["deltas"].items()))
+    return rec
+
+
+# ── UltraChat perplexity pass ─────────────────────────────────────────────────
+
+def _build_ppl_record(rows: list[dict], model_key: str, result_name: str,
+                      eval_path: Path, max_response_tokens: int) -> dict:
+    return {
+        "dataset":             "ultrachat",
+        "model":               cfg.MODEL_REGISTRY[model_key],
+        "model_key":           model_key,
+        "run":                 result_name,
+        "pool":                str(eval_path.relative_to(cfg.REPO_ROOT)),
+        "max_response_tokens": max_response_tokens,
+        "metrics":             _summarise_ppl(rows),
+        "rows":                rows,
+    }
+
+
+def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
+                       out_dir: Path, baseline_dir: Path | None) -> dict | None:
+    eval_path = cfg.heldout_path("ultrachat")
+    if not eval_path.exists():
+        log.warning("  [ultrachat] held-out missing: %s — skipping", eval_path)
+        return None
+
+    out_path = out_dir / "ultrachat.json"
+
+    pool = load_jsonl(eval_path)
     if args.max_ppl_rows is not None:
         pool = pool[: args.max_ppl_rows]
 
-    rows_path = out_dir / "perplexity_ultrachat.jsonl"
-    existing: list[dict] = load_jsonl(rows_path) if rows_path.exists() else []
-    done_ids = {r.get("id") for r in existing if r.get("n_tokens") is not None}
-    if existing:
-        log.info("  [ppl] resume: %d rows on disk", len(existing))
+    prior = _load_dataset_json(out_path) or {}
+    rows: list[dict] = list(prior.get("rows") or [])
+    done_ids = {r.get("id") for r in rows if r.get("n_tokens") is not None}
+    if rows:
+        log.info("  [ultrachat] resume: %d rows on disk", len(rows))
 
     todo = [r for r in pool if r.get("id") not in done_ids]
-    log.info("  [ppl] pool: %d rows  to do: %d   max-response-tokens=%d",
+    log.info("  [ultrachat] pool: %d  to do: %d   max-response-tokens=%d",
              len(pool), len(todo), args.max_response_tokens)
 
-    progress = Progress(total=len(todo), desc="ultrachat ppl", log_every=25)
+    def flush():
+        rec = _build_ppl_record(rows, model_key, result_name, eval_path,
+                                args.max_response_tokens)
+        _attach_baseline_ppl(rec, baseline_dir)
+        _save_dataset_json(out_path, rec)
+
+    if not todo:
+        flush()
+        return _load_dataset_json(out_path)
+
+    progress = Progress(total=len(todo), desc="ultrachat", log_every=25)
     fwd_total = 0.0
     skipped_empty = 0
+    rows_since_save = 0
 
     for r in todo:
         prompt   = (r.get("prompt") or "").strip()
@@ -402,7 +523,7 @@ def _run_perplexity(args, model, tokenizer, model_key, result_name, out_dir):
                 max_response_tokens=args.max_response_tokens,
             )
         except Exception as exc:
-            log.warning("  [ppl] error on id=%s: %s", r.get("id"), exc)
+            log.warning("  [ultrachat] error on id=%s: %s", r.get("id"), exc)
             sum_nll, n_tok = 0.0, 0
         dt = time.time() - t0
         fwd_total += dt
@@ -424,91 +545,30 @@ def _run_perplexity(args, model, tokenizer, model_key, result_name, out_dir):
             "model":      cfg.MODEL_REGISTRY[model_key],
             "run":        result_name,
         }
-        append_jsonl(rows_path, out_row)
-        existing.append(out_row)
+        rows.append(out_row)
+        rows_since_save += 1
         progress.tick(extras={"ppl": f"{ppl:.2f}" if n_tok > 0 else "—"})
+
+        if rows_since_save >= args.summary_every:
+            flush()
+            rows_since_save = 0
 
     progress.done()
     if progress.n:
-        log.info("  [ppl] forward total=%s avg=%.3fs/row   skipped (empty)=%d",
+        log.info("  [ultrachat] forward total=%s avg=%.3fs/row   skipped (empty)=%d",
                  format_duration(fwd_total), fwd_total / max(progress.n, 1),
                  skipped_empty)
 
-    summary = _summarise_ppl(existing)
-    summary["model"]               = cfg.MODEL_REGISTRY[model_key]
-    summary["run"]                 = result_name
-    summary["max_response_tokens"] = args.max_response_tokens
-    summary["pool"]                = str(pool_path.relative_to(cfg.REPO_ROOT))
-
-    summary_path = out_dir / "perplexity_ultrachat_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
-    log.info("  [ppl] token_ppl=%s   row_ppl_mean=%s   row_ppl_p95=%s   n_rows=%s",
-             summary.get("token_ppl"), summary.get("row_ppl_mean"),
-             summary.get("row_ppl_p95"), summary.get("n_rows"))
-    log.info("  [ppl] Wrote -> %s", summary_path)
-    return summary
-
-
-# ── Comparison vs baseline ────────────────────────────────────────────────────
-
-def _write_comparison(args, out_dir, post_metrics: list[dict] | None,
-                      post_ppl: dict | None) -> None:
-    if not args.baseline:
-        return
-    base_dir: Path = args.baseline
-    if not base_dir.is_dir():
-        log.warning("  [cmp] --baseline expects a results directory; got %s — skipping comparison",
-                    base_dir)
-        return
-
-    comparison: dict = {"baseline_dir": str(base_dir)}
-
-    # Answerability deltas
-    base_metrics_path = base_dir / "answerability_metrics.jsonl"
-    if post_metrics and base_metrics_path.exists():
-        base_metrics = load_jsonl(base_metrics_path)
-        deltas_per_dataset = []
-        for m in post_metrics:
-            base = next((b for b in base_metrics if b["dataset"] == m["dataset"]
-                         and b.get("model") == m["model"]), None)
-            if base is None:
-                continue
-            deltas_per_dataset.append({
-                "dataset": m["dataset"],
-                "deltas": {
-                    k: round(m[k] - base[k], 4)
-                    for k in ("decision_accuracy", "true_commitment_rate",
-                              "false_abstention_rate", "true_abstention_rate",
-                              "false_commitment_rate")
-                    if k in base
-                },
-                "baseline": {k: base[k] for k in m if k in base},
-                "post":     {k: m[k]    for k in m},
-            })
-        comparison["answerability"] = deltas_per_dataset
-
-    # PPL deltas / ratios
-    base_ppl_path = base_dir / "perplexity_ultrachat_summary.json"
-    if post_ppl and base_ppl_path.exists():
-        try:
-            base_ppl = json.loads(base_ppl_path.read_text())
-            ppl_block = {"baseline": base_ppl, "post": post_ppl}
-            for key in ("token_ppl", "row_ppl_mean", "row_ppl_median"):
-                bv, pv = base_ppl.get(key), post_ppl.get(key)
-                if bv and pv:
-                    ppl_block[f"{key}_ratio_post_over_base"]  = round(pv / bv, 4)
-                    ppl_block[f"{key}_delta_post_minus_base"] = round(pv - bv, 4)
-            comparison["perplexity_ultrachat"] = ppl_block
-        except Exception as exc:
-            log.warning("  [cmp] could not read baseline ppl summary: %s", exc)
-
-    if "answerability" not in comparison and "perplexity_ultrachat" not in comparison:
-        log.warning("  [cmp] no comparable artefacts found in %s — skipping", base_dir)
-        return
-
-    comp_path = out_dir / "comparison.json"
-    comp_path.write_text(json.dumps(comparison, indent=2))
-    log.info("  [cmp] Wrote comparison -> %s", comp_path)
+    flush()
+    rec = _load_dataset_json(out_path) or {}
+    m = rec.get("metrics", {})
+    log.info("  [ultrachat] token_ppl=%s row_ppl_mean=%s row_ppl_p95=%s n=%s -> %s",
+             m.get("token_ppl"), m.get("row_ppl_mean"), m.get("row_ppl_p95"),
+             m.get("num_valid"), out_path)
+    if "ratios" in rec and rec["ratios"]:
+        log.info("  [ultrachat] vs baseline -> %s",
+                 ", ".join(f"{k}={v}" for k, v in rec["ratios"].items()))
+    return rec
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -525,42 +585,45 @@ def run(args: argparse.Namespace) -> None:
         mode = "baseline"
 
     out_dir = cfg.results_dir_for(result_name)
+    baseline_dir: Path | None = None
+    if args.baseline:
+        baseline_dir = args.baseline.resolve()
+        if not baseline_dir.is_dir():
+            log.warning("  --baseline expects a results directory; got %s — ignoring",
+                        baseline_dir)
+            baseline_dir = None
 
     log.info("STEP 5 — EVALUATE  mode=%s  name=%s", mode, result_name)
     log.info("  results_dir: %s", out_dir)
+    if baseline_dir:
+        log.info("  baseline_dir: %s", baseline_dir)
 
     with Stopwatch("model load"):
         if mode == "trained":
-            model, tokenizer, model_key, _ = _load_adapter_model(run_dir)
+            model, tokenizer, model_key = _load_adapter_model(run_dir)
             log.info("  Adapter loaded for %s (%s)",
                      model_key, cfg.MODEL_REGISTRY[model_key])
         else:
-            model, tokenizer, model_key, _ = _load_base_model(args.model)
+            model, tokenizer, model_key = _load_base_model(args.model)
             log.info("  Base model loaded: %s (%s) — no adapter",
                      model_key, cfg.MODEL_REGISTRY[model_key])
 
-    post_metrics: list[dict] | None = None
-    post_ppl: dict | None = None
-
-    # 1) Answerability
     if not args.skip_judge:
         judge_mod = _import_judge()
-        post_metrics = _run_answerability(
-            args, model, tokenizer, model_key, result_name, out_dir, judge_mod,
-        )
+        for dataset in ("kuq", "squad"):
+            _run_dataset_answerability(
+                args, model, tokenizer, model_key, result_name, out_dir,
+                dataset, judge_mod, baseline_dir,
+            )
     else:
         log.info("  [judge] skipped (--skip-judge)")
 
-    # 2) UltraChat perplexity
     if not args.skip_ppl:
-        post_ppl = _run_perplexity(
-            args, model, tokenizer, model_key, result_name, out_dir,
+        _run_ultrachat_ppl(
+            args, model, tokenizer, model_key, result_name, out_dir, baseline_dir,
         )
     else:
-        log.info("  [ppl] skipped (--skip-ppl)")
-
-    # 3) Comparison vs baseline
-    _write_comparison(args, out_dir, post_metrics, post_ppl)
+        log.info("  [ultrachat] skipped (--skip-ppl)")
 
     log.info("STEP 5 done in %s. Outputs in %s",
              format_duration(time.time() - pipeline_t0), out_dir)
@@ -581,6 +644,9 @@ def parse_args() -> argparse.Namespace:
                    help=f"Cap UltraChat response token length (default {DEFAULT_MAX_RESPONSE_TOKENS}).")
     p.add_argument("--max-ppl-rows", type=int, default=None,
                    help="Cap UltraChat ppl eval to N rows (smoke).")
+    p.add_argument("--summary-every", type=int, default=DEFAULT_SUMMARY_EVERY,
+                   help=f"Atomically rewrite the dataset JSON every N rows "
+                        f"(default {DEFAULT_SUMMARY_EVERY}).")
     p.add_argument("--skip-judge", action="store_true",
                    help="Skip the answerability (KUQ + SQuAD) eval.")
     p.add_argument("--skip-ppl", action="store_true",

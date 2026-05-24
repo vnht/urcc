@@ -178,7 +178,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 | 2    | `step2_build_subspace/build_subspace.py`  | `step1_extract_activations/data/activations_<model>.pt`                  | `step2_build_subspace/data/subspace_<model>_r<rank>.pt`             |
 | 3    | `step3_build_anchors/build_anchors.py`    | `step1_extract_activations/data/activations_<model>.pt`                  | `step3_build_anchors/data/anchors_<model>.pt`                       |
 | 4    | `step4_train/train.py`                    | `step0_mine/`, `step2_*/`, `step3_*/` outputs                            | `step4_train/data/runs/<run_name>/`                                 |
-| 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/{kuq,squad,ultrachat}.jsonl`                | `step5_evaluate/data/results/<name>/{answerability_metrics.jsonl,perplexity_ultrachat_summary.json,comparison.json}` |
+| 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/{kuq,squad,ultrachat}.jsonl`                | `step5_evaluate/data/results/<name>/{kuq,squad,ultrachat}.json` (one JSON per dataset, metrics + per-row + baseline deltas) |
 
 ## Run end-to-end
 
