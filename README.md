@@ -71,12 +71,20 @@ utility. `V_l` is computed once and frozen.
 
 ## Anchors (step 3)
 
+Per answerability domain `d ∈ {kuq, squad}`:
+
 ```
-μ_l⁻ = mean over D_F   of  h_l(B)         (legitimate-abstention pole)
-μ_l⁺ = mean over D_R_A of  h_l(C)         (legitimate-commitment pole)
+μ_l⁻(d) = mean over D_F[d]   of  h_l(B[d])         (legitimate-abstention pole, domain d)
+μ_l⁺(d) = mean over D_R_A[d] of  h_l(C[d])         (legitimate-commitment pole, domain d)
 ```
 
-Both fixed.
+Both fixed. The shared subspace V (step 2) captures the *axis* between
+abstain and commit; per-domain poles localise the *target on that axis*
+inside each domain's prompt distribution. KUQ (no context) and SQuAD
+(long context) sit in genuinely different regions of late-layer hidden
+space — `||μ⁻_kuq − μ⁻_squad||` ≈ 30–50 across layers — so a single
+grand-mean pole would miss each domain's true location by ~20% of pole
+magnitude.
 
 ## Loss (step 4)
 
@@ -87,21 +95,24 @@ LoRA adapter `δθ` on `f_θ`. Two components, both of the form
 ```
 L = L_forget + λ · L_retain
 
-L_forget = E_{(x, y) ∈ D_F}                ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ)  −  μ_l⁻      ) ‖² ⟩_{l, t}
+L_forget = E_{(x, y) ∈ D_F}                ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ)  −  μ_l⁻(d_x)  ) ‖² ⟩_{l, t}
 
 L_retain = E_{(x, y) ∈ D_R_A ∪ D_R_G}      ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ)  −  τ_l(x, y) ) ‖² ⟩_{l, t}
 
-τ_l(x, y) = μ_l⁺                  if (x, y) ∈ D_R_A     (legitimate commitment)
+τ_l(x, y) = μ_l⁺(d_x)             if (x, y) ∈ D_R_A     (legitimate commitment, per-domain)
           = h_l(x, y; θ_frozen)   if (x, y) ∈ D_R_G     (general utility, per-token frozen reference)
+
+d_x ∈ {kuq, squad} is the source dataset of example x. V is shared across
+domains; only the poles are per-domain.
 ```
 
 Effect, by category:
 
 | Category | Forward inputs | Anchor target | Effect |
 |---|---|---|---|
-| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻` (B-pole)         | pulled toward legitimate abstention |
-| B (legit-abstain)       | not trained on directly           | —                     | preserved (anchor is fixed)         |
-| C (legit-commit)        | answerable + gold answer          | `μ⁺` (C-pole)         | held in place                       |
+| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻(d_x)` (per-domain B-pole)  | pulled toward legitimate abstention in own domain |
+| B (legit-abstain)       | not trained on directly           | —                              | preserved (anchor is fixed)                       |
+| C (legit-commit)        | answerable + gold answer          | `μ⁺(d_x)` (per-domain C-pole)  | held in place at own-domain commit pole           |
 | D (over-abstain)        | not trained on directly           | —                     | not encouraged (no path to D)       |
 | E (general utility)     | UltraChat (prompt, response)      | `h_l^ref` per token   | held at frozen-base reference       |
 
@@ -146,7 +157,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 ├── step3_build_anchors/
 │   ├── build_anchors.py
 │   └── data/
-│       └── anchors_<model>.pt              μ⁻, μ⁺
+│       └── anchors_<model>.pt              μ⁻(d), μ⁺(d) for d ∈ {kuq, squad}
 │
 ├── step4_train/
 │   ├── train.py

@@ -7,15 +7,21 @@ Two losses, both of the form  ‖ V_lᵀ (h_l - target) ‖²   averaged over
 late layers and answer-token positions. The forget loss pulls
 over-commitment (category A) toward the legitimate-abstention pole μ⁻; the
 retain loss anchors legitimate commitment (C) at its pole μ⁺ and general
-utility (E) at its frozen reference.
+utility (E) at its frozen reference. Each pole is **per answerability
+domain** d ∈ {kuq, squad} so that targets live in the same prompt
+distribution as the example being trained.
 
-    L_forget = E_{(x,y) ∈ D_F}                    ⟨ ‖ V_lᵀ (h_l       − μ_l⁻        ) ‖² ⟩_{l, t}
-    L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}          ⟨ ‖ V_lᵀ (h_l^θ     − τ_l(x, y)   ) ‖² ⟩_{l, t}
+    L_forget = E_{(x,y) ∈ D_F}                    ⟨ ‖ V_lᵀ (h_l       − μ_l⁻(d_x)     ) ‖² ⟩_{l, t}
+    L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}          ⟨ ‖ V_lᵀ (h_l^θ     − τ_l(x, y)     ) ‖² ⟩_{l, t}
 
-    τ_l(x, y) = μ_l⁺               if (x, y) ∈ D_R_A   (legitimate commitment)
+    τ_l(x, y) = μ_l⁺(d_x)          if (x, y) ∈ D_R_A   (legitimate commitment)
               = h_l^ref(x, y, t)   if (x, y) ∈ D_R_G   (general utility)
 
     L = L_forget + λ · L_retain
+
+The discriminative subspace V is **shared across domains** (it captures the
+abstain-vs-commit axis); only the poles are per-domain (they localise the
+target within that axis).
 
 LoRA on `{q,k,v,o,up,down,gate}` projections of the late-layer set; base
 weights frozen.
@@ -116,8 +122,20 @@ def _load_retain(model_key: str) -> list[dict]:
     return pool
 
 
+def _layer_split(t: torch.Tensor) -> list[torch.Tensor]:
+    """Slice a (L, D) tensor into a list of L float (D,) tensors."""
+    return [t[i].float() for i in range(t.shape[0])]
+
+
 def _load_subspace_and_anchors(model_key: str, rank: int):
-    """Returns (V_layers, layer_indices, mu_minus, mu_plus, scale)."""
+    """Returns (V_layers, layer_indices, mu_minus_per, mu_plus_per, scale).
+
+    mu_minus_per / mu_plus_per are dicts keyed by dataset:
+        {"kuq": [tensor(D), …L layers…], "squad": [tensor(D), …L layers…]}
+
+    For backwards-compat with old anchor bundles (no per-domain poles), the
+    grand mean is replicated under both keys.
+    """
     sp = cfg.subspace_path(model_key, rank=rank)
     ap = cfg.anchors_path(model_key)
     if not sp.exists():
@@ -134,9 +152,16 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
         )
 
     V = sb["V"]                     # (L, D, r)
-    V_layers   = [V[i].float() for i in range(V.shape[0])]
-    mu_minus_l = [ab["mu_minus"][i].float() for i in range(ab["mu_minus"].shape[0])]
-    mu_plus_l  = [ab["mu_plus" ][i].float() for i in range(ab["mu_plus"].shape[0])]
+    V_layers = [V[i].float() for i in range(V.shape[0])]
+
+    minus_per_t = ab.get("mu_minus_per") or {"kuq": ab["mu_minus"], "squad": ab["mu_minus"]}
+    plus_per_t  = ab.get("mu_plus_per")  or {"kuq": ab["mu_plus"],  "squad": ab["mu_plus"]}
+    mu_minus_per = {d: _layer_split(t) for d, t in minus_per_t.items()}
+    mu_plus_per  = {d: _layer_split(t) for d, t in plus_per_t.items()}
+
+    if "mu_minus_per" not in ab:
+        log.warning("  anchors bundle has no per-domain poles; falling back to grand mean. "
+                    "Re-run step 3 to build per-domain anchors.")
 
     # diag.OC_proj averages roughly the initial value of L_forget per layer ⇒
     # use it to scale both losses so they start at O(1). Constant scaling does
@@ -147,7 +172,7 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
         oc_means = [d["OC_proj"] for d in sb["diag"]]
         init_scale = max(sum(oc_means) / len(oc_means), 1e-6)
 
-    return V_layers, sb["layers"], mu_minus_l, mu_plus_l, float(init_scale)
+    return V_layers, sb["layers"], mu_minus_per, mu_plus_per, float(init_scale)
 
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
@@ -188,16 +213,22 @@ def _project_to_pole(
 
 def _compute_forget_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
-    V_layers, layer_indices, mu_minus,
+    V_layers, layer_indices, mu_minus_per: dict,
     k_answer_tokens: int,
 ) -> tuple[torch.Tensor, dict]:
     """L_forget — pull category-A activations toward the legitimate-abstention
-    pole μ⁻ along V."""
+    pole μ⁻(d) along V, where d is the example's source dataset (kuq | squad).
+    """
     total = torch.tensor(0.0, requires_grad=True)
     layer_norms: list[float] = []
     n_used = 0
+    by_dataset = {d: 0 for d in mu_minus_per.keys()}
     for r in batch:
-        prompt = build_unanswerable_prompt(r["__dataset__"], r)
+        ds = r["__dataset__"]
+        mu_minus = mu_minus_per.get(ds)
+        if mu_minus is None:
+            continue
+        prompt = build_unanswerable_prompt(ds, r)
         answer = r.get("y_com_prefix_k8") or r.get("full_completion_clean") or ""
         if not prompt.strip() or not answer.strip():
             continue
@@ -223,21 +254,22 @@ def _compute_forget_loss(
         per_ex = per_ex / len(hiddens)
         total = total + per_ex
         n_used += 1
+        by_dataset[ds] = by_dataset.get(ds, 0) + 1
 
     if n_used > 0:
         total = total / n_used
     mean_norm = sum(layer_norms) / len(layer_norms) if layer_norms else 0.0
-    return total, {"n": n_used, "proj_norm": mean_norm}
+    return total, {"n": n_used, "proj_norm": mean_norm, **by_dataset}
 
 
 def _compute_retain_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
-    V_layers, layer_indices, mu_plus,
+    V_layers, layer_indices, mu_plus_per: dict,
     k_answer_tokens: int,
 ) -> tuple[torch.Tensor, dict]:
     """L_retain — anchor each retain example to its legitimate target along V.
 
-      D_R_A (category C — legitimate commitment): target = μ⁺
+      D_R_A (category C — legitimate commitment): target = μ⁺(d_x)  (per-domain)
       D_R_G (category E — general utility):       target = h_l^frozen (per-token)
     """
     total = torch.tensor(0.0, requires_grad=True)
@@ -246,7 +278,11 @@ def _compute_retain_loss(
 
     for r in batch:
         if r["__type__"] == "answerable":
-            prompt = build_answerable_prompt(r["__dataset__"], r)
+            ds = r["__dataset__"]
+            mu_plus = mu_plus_per.get(ds)
+            if mu_plus is None:
+                continue
+            prompt = build_answerable_prompt(ds, r)
             answer = r.get("correct_answer") or ""
             if not prompt.strip() or not answer.strip():
                 continue
@@ -382,10 +418,12 @@ def train(args: argparse.Namespace) -> None:
     if not retain_data:
         raise RuntimeError("Retain pool is empty.")
 
-    V_layers, layer_indices, mu_minus, mu_plus, init_scale = \
+    V_layers, layer_indices, mu_minus_per, mu_plus_per, init_scale = \
         _load_subspace_and_anchors(model_key, rank=args.rank)
     log.info("  V layers=%s  rank=%d  init_scale=%.4f",
              layer_indices, args.rank, init_scale)
+    log.info("  per-domain poles: μ⁻ keys=%s  μ⁺ keys=%s",
+             list(mu_minus_per.keys()), list(mu_plus_per.keys()))
 
     if args.dry_run:
         forget_data = forget_data[:8]
@@ -501,13 +539,13 @@ def train(args: argparse.Namespace) -> None:
             l_forget_raw, finfo = _compute_forget_loss(
                 model=model, batch=forget_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
-                layer_indices=layer_indices, mu_minus=mu_minus,
+                layer_indices=layer_indices, mu_minus_per=mu_minus_per,
                 k_answer_tokens=cfg.K_ANSWER_TOKENS,
             )
             l_retain_raw, _rinfo = _compute_retain_loss(
                 model=model, batch=retain_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
-                layer_indices=layer_indices, mu_plus=mu_plus,
+                layer_indices=layer_indices, mu_plus_per=mu_plus_per,
                 k_answer_tokens=cfg.K_ANSWER_TOKENS,
             )
 
@@ -611,7 +649,9 @@ def train(args: argparse.Namespace) -> None:
     (out_dir / "training_config.json").write_text(json.dumps({
         "model_key":        model_key,
         "model_id":         cfg.MODEL_REGISTRY[model_key],
-        "method":           "UOC two-component (subspace-anchored)",
+        "method":           "UOC two-component (subspace-anchored, per-domain poles)",
+        "per_domain_poles": True,
+        "pole_domains":     list(mu_minus_per.keys()),
         "subspace_rank":    args.rank,
         "lambda_retain":    args.lambda_retain,
         "epochs":           args.epochs,

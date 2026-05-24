@@ -28,7 +28,13 @@ step1_extract_activations/data/activations_<model>.pt  with keys:
     "h_D":      (N_A, L, D)   over-abstention            (D_R_A prompts, templated abstention)
     "h_E":      (N_R, L, D)   general utility            (D_R_G prompt+response)
     "meta_A":   list[{"dataset", "judge_label", "id"}]   (one entry per row of h_A)
+    "meta_B":   list[{"dataset", "id"}]                  (one entry per row of h_B)
     "meta_C":   list[{"dataset", "id"}]                  (one entry per row of h_C)
+    "meta_D":   list[{"dataset", "id"}]                  (one entry per row of h_D)
+
+The per-set ``meta`` lists track each row's source dataset (kuq / squad) so
+that downstream steps (notably step 3 anchors) can compute per-domain poles
+without re-loading the source jsonl files.
 
 Crash-safe & resumable
 ----------------------
@@ -390,7 +396,9 @@ def run(model_key: str, max_per_set: int | None, rebuild: bool = False) -> Path:
         "h_D":      out_D["means"],
         "h_E":      out_E["means"],
         "meta_A":   out_A.get("meta", []),
+        "meta_B":   out_B.get("meta", []),
         "meta_C":   out_C.get("meta", []),
+        "meta_D":   out_D.get("meta", []),
     }
 
     out_path = cfg.activations_path(model_key)

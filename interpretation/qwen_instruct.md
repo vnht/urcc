@@ -165,52 +165,58 @@ set carries inside V.
 
 ---
 
-## 4. Step 3 — pole anchors μ⁻, μ⁺
+## 4. Step 3 — pole anchors μ⁻(d), μ⁺(d)   [per answerability domain]
 
-`step3_build_anchors/data/anchors_qwen_instruct.pt`, both poles shape `[8, 4096]`.
+`step3_build_anchors/data/anchors_qwen_instruct.pt`. Each pole is now
+**per answerability domain** d ∈ {kuq, squad}, shape `[8, 4096]` per
+domain. The shared subspace V from step 2 is unchanged — V captures the
+abstain-vs-commit *axis*, the poles localise the *target on that axis*
+inside each domain's prompt distribution.
 
 ```
-μ_l⁻ = mean over rows of  h_B   (templated abstention on D_F prompts)
-μ_l⁺ = mean over rows of  h_C   (gold answer on D_R_A prompts)
+μ_l⁻(d) = mean over rows of  h_B  whose dataset == d   (templated abstention on D_F[d] prompts)
+μ_l⁺(d) = mean over rows of  h_C  whose dataset == d   (gold answer on D_R_A[d] prompts)
 ```
 
-`n_minus = 1000`, `n_plus = 1000`. Wall-clock: < 1 s.
+`n_minus_per = {kuq: 500, squad: 500}`, `n_plus_per = {kuq: 500, squad: 500}`. Wall-clock: < 1 s.
 
-### Per-layer pole geometry
+### Per-layer pole geometry (per domain)
 
-| Layer | `‖μ⁻‖` | `‖μ⁺‖` | `‖μ⁻ − μ⁺‖` | `‖V⊤(μ⁻ − μ⁺)‖` | shrinkage | `cos(μ⁻, μ⁺)` |
-|------:|-------:|-------:|------------:|----------------:|----------:|--------------:|
-| 24    |  75.72 |  61.13 |  60.22      | 10.38           | 17.2%     | +0.6313       |
-| 25    |  84.34 |  67.63 |  64.65      | 11.14           | 17.2%     | +0.6582       |
-| 26    |  97.53 |  79.37 |  68.77      | 11.37           | 16.5%     | +0.7159       |
-| 27    | 103.79 |  82.46 |  72.86      | 12.04           | 16.5%     | +0.7165       |
-| 28    | 118.41 | 105.90 |  78.89      | 14.65           | 18.6%     | +0.7581       |
-| 29    | 132.02 | 119.51 |  86.22      | 15.47           | 17.9%     | +0.7694       |
-| 30    | 149.26 | 126.26 |  97.31      | 17.74           | 18.2%     | +0.7628       |
-| 31    | 101.67 |  80.57 |  64.51      | 14.09           | 21.8%     | +0.7731       |
+| Layer | `‖μ⁻_kuq‖` | `‖μ⁻_squad‖` | `‖μ⁻_kuq − μ⁻_squad‖` | `‖μ⁺_kuq‖` | `‖μ⁺_squad‖` | `‖μ⁺_kuq − μ⁺_squad‖` |
+|------:|-----------:|-------------:|----------------------:|-----------:|-------------:|----------------------:|
+| 24    |    79.18   |    75.48     |        31.63          |    53.04   |    73.38     |        38.06          |
+| 25    |    88.66   |    83.52     |        34.89          |    57.81   |    81.57     |        41.14          |
+| 26    |   103.74   |    94.93     |        38.69          |    81.26   |    80.76     |        32.46          |
+| 27    |   108.92   |   102.45     |        40.31          |    71.35   |    97.69     |        45.47          |
+| 28    |   125.28   |   115.67     |        45.50          |    93.41   |   122.27     |        49.87          |
+| 29    |   138.47   |   129.84     |        48.50          |   107.35   |   135.96     |        53.69          |
+| 30    |   155.18   |   147.90     |        52.90          |   122.24   |   135.53     |        53.43          |
+| 31    |   105.31   |   100.77     |        33.85          |    84.97   |    80.83     |        39.26          |
 
 ### Reading
 
-* **Real, well-separated anchors.** Full-space `‖μ⁻ − μ⁺‖` = 60–97 across
-  layers. Both poles are large (60–149).
-* **`‖μ⁻‖ > ‖μ⁺‖` consistently** by 14–24. Templated abstention is the same
-  text on every example, so its mean is a sharp representation. Gold answers
-  vary across topics, so averaging suppresses the answer-specific component
-  and leaves mostly the layer's "I'm answering substantively" mode. μ⁻ is
-  the cleaner of the two anchors.
-* **`cos(μ⁻, μ⁺) ≈ 0.7`** — moderate-strong overlap. Healthy: cos near 1
-  would mean the loss has nothing to push on; cos near 0 would mean abstain
-  and commit are unrelated axes (also workable but surprising). 0.7 says
-  abstain and commit share a layer-typical content envelope but differ in a
-  stable, learnable direction.
-* **Projected target distance `‖V⊤(μ⁻ − μ⁺)‖ ≈ 10–18`.** This is what the
-  loss actually sees in V. Largest at L30 (17.7); smallest at L24 (10.4).
-* **Shrinkage 17–22% ≈ 2× random baseline.** A random 32-dim subspace in
-  4096-dim would shrink the pole separation by `√(32/4096) ≈ 8.8%`. We see
-  ~18%, meaning V *partially* aligns with the pole direction — enough to
-  give the forget loss a clear signal toward μ⁻, but not so much that
-  pulling A toward μ⁻ also drags C away from μ⁺. The orthogonal 80% of the
-  pole separation lives outside V where the loss can't reach it.
+* **Domains are 30–53 units apart.** `‖μ⁻_kuq − μ⁻_squad‖` = 32–53 across
+  layers, on the order of `‖μ⁻_kuq − μ⁺_kuq‖` itself. The two domains' abstain
+  representations live in genuinely different regions of late-layer hidden
+  space, not slight perturbations of each other.
+* **The same is true for μ⁺.** `‖μ⁺_kuq − μ⁺_squad‖` = 32–54. The "answering
+  substantively" mode also looks different with vs. without context — SQuAD
+  prompts have a long context that biases the late-layer representation
+  toward extracted-from-context content, while KUQ has none.
+* **A grand-mean μ would be ~16–27 units from each domain's true pole** —
+  on the order of 20–25% of pole magnitude. Per-domain poles eliminate this
+  cross-domain mismatch; KUQ examples are pulled toward `μ⁻_kuq`, SQuAD
+  examples toward `μ⁻_squad`. The training pull stays within each example's
+  natural prompt distribution.
+* **`‖μ⁻‖ > ‖μ⁺‖` per domain.** Templated abstention is the same text every
+  time so its mean is a sharp representation; gold answers vary in topic so
+  averaging suppresses answer-specific content. μ⁻ is the cleaner anchor.
+* **The shared V still captures the axis.** Its construction in step 2 used
+  the contrasts `(h_A − h_B)` and `(h_C − h_D)`; subtracting templated-
+  abstention baselines from each set already removed most of the shared
+  domain-specific envelope, so V points toward the abstain-vs-commit
+  direction common to both domains. Per-domain poles are the *positions on
+  that axis* that differ.
 
 ---
 
@@ -222,37 +228,39 @@ model.
 | Requirement | Observed | Verdict |
 |-------------|----------|---------|
 | A unique low-rank direction where over-commit dominates | `OC/LC = 7×` in `V`, every `γ_k > 0` for `k ≤ 32` | ✓ strong |
-| A target point inside that direction to pull A toward    | `‖V⊤(μ⁻ − μ⁺)‖ ≈ 10–18` per layer                | ✓ strong |
+| A target point inside that direction to pull A toward    | per-domain `‖V⊤(μ⁻(d) − μ⁺(d))‖` order-of `10–18` per layer; KUQ and SQuAD targets sit `30–50` units apart in full hidden space | ✓ strong |
 | Headroom so the pull doesn't damage C and E              | `OC/LC = 7×`, `OC/E = 3×`; `LC_proj ≈ 14`, `E_proj ≡ 32` | ✓ moderate (E is the watch) |
 
 ### Consequence for the loss
 
 ```
 L = L_forget + λ · L_retain
-L_forget        = mean_x∈D_F   ‖V⊤(h_A(x) − μ⁻)‖²
-L_retain[C]     = mean_x∈D_R_A ‖V⊤(h_C(x) − μ⁺)‖²
+L_forget        = mean_x∈D_F   ‖V⊤(h_A(x) − μ⁻(d_x))‖²        # d_x = dataset(x)
+L_retain[C]     = mean_x∈D_R_A ‖V⊤(h_C(x) − μ⁺(d_x))‖²
 L_retain[E]     = mean_x∈D_R_G ‖V⊤(h_E(x) − h_E_frozen(x))‖²
 ```
 
 Initial-step expectations:
 
-* **`L_forget`.** `V⊤ h_A` has RMS `≈ √OC_proj ≈ 10` per layer. `V⊤ μ⁻`
-  sits ~10–18 away. Initial loss is on the order of `100–300` per layer;
-  should fall fast — quadratic with strong gradient.
-* **`L_retain[C]`.** `V⊤ h_C − V⊤ μ⁺` is the projection of legit-commit
-  fluctuation around its own pole. Expected initial loss ~`13–16` per
-  layer. Should stay near initial value throughout training; a rise means λ
-  is too low or β too high.
+* **`L_forget`.** Each KUQ row is pulled toward `μ⁻_kuq`, each SQuAD row
+  toward `μ⁻_squad`. `V⊤ h_A(x) − V⊤ μ⁻(d_x)` is now a within-domain
+  distance instead of a partly-cross-domain one — initial loss falls
+  sooner because the target lives in the example's own prompt
+  distribution.
+* **`L_retain[C]`.** Same routing: KUQ legit-commits anchored to
+  `μ⁺_kuq`, SQuAD to `μ⁺_squad`. Expected initial loss is *lower* than
+  the grand-mean version because each pole sits at the centre of its own
+  domain's commit cluster.
 * **`L_retain[E]`.** Reference-anchored, so initial value is 0 by
-  construction. Will grow as LoRA changes the model. Capped by E_proj ≈ 32
-  per layer — any rise above ~8 should trigger an eyebrow.
+  construction. Domain routing does not apply (UltraChat has no
+  answerability domain).
 
 ### Predicted layer roles
 
 * **L24–L26.** Cleanest selectivity (γ_1 = 21–28). Forget gradient comes
   with the least collateral on legit-commits.
-* **L28–L30.** Largest absolute pole gap (`‖V⊤(μ⁻ − μ⁺)‖` = 14.6–17.7).
-  Forget loss has the most signal to drop here.
+* **L28–L30.** Largest absolute pole gaps for both domains. Forget loss
+  has the most signal to drop here.
 * **L31.** Weaker on every metric; useful as a sanity-anchor but not the
   workhorse layer.
 
@@ -303,6 +311,6 @@ python3 step3_build_anchors/build_anchors.py --model qwen_instruct
 Next:
 
 ```bash
-python3 step4_train/train.py --model qwen_instruct --rank 32 --beta 1.0 --epochs 3 --lr 3e-5
+python3 step4_train/train.py --model qwen_instruct --rank 32 --lambda-retain 7 --epochs 3 --lr 3e-5
 python3 step5_evaluate/evaluate.py --run <run_name>
 ```
