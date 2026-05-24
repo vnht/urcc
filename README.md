@@ -178,41 +178,49 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 | 2    | `step2_build_subspace/build_subspace.py`  | `step1_extract_activations/data/activations_<model>.pt`                  | `step2_build_subspace/data/subspace_<model>_r<rank>.pt`             |
 | 3    | `step3_build_anchors/build_anchors.py`    | `step1_extract_activations/data/activations_<model>.pt`                  | `step3_build_anchors/data/anchors_<model>.pt`                       |
 | 4    | `step4_train/train.py`                    | `step0_mine/`, `step2_*/`, `step3_*/` outputs                            | `step4_train/data/runs/<run_name>/`                                 |
-| 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/`, `step4_train/data/runs/<run_name>/`      | `step5_evaluate/data/results/<run_name>/`                           |
+| 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/{kuq,squad,ultrachat}.jsonl`                | `step5_evaluate/data/results/<name>/{answerability_metrics.jsonl,perplexity_ultrachat_summary.json,comparison.json}` |
 
 ## Run end-to-end
 
 ```bash
 # Step 0 — mine the model's over-commitment (fresh judge calls; needs CEREBRAS_TOKEN)
-python step0_mine/mine.py                       --model qwen_instruct
+python3 step0_mine/mine.py                       --model qwen_instruct
 
 # Steps 1–3 — build the subspace and anchors (one-time, per model)
-python step1_extract_activations/extract.py     --model qwen_instruct
-python step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 32
-python step3_build_anchors/build_anchors.py     --model qwen_instruct
+python3 step1_extract_activations/extract.py     --model qwen_instruct
+python3 step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 32
+python3 step3_build_anchors/build_anchors.py     --model qwen_instruct
+
+# Step 5 (baseline first) — zero-shot reference
+# Runs answerability (KUQ + SQuAD) AND UltraChat perplexity in one model load.
+python3 step5_evaluate/evaluate.py               --model qwen_instruct
 
 # Step 4 — train with the two-component UOC loss
-python step4_train/train.py                     --model qwen_instruct \
+python3 step4_train/train.py                     --model qwen_instruct \
     --rank 32 --lambda-retain 1.0 --epochs 3 --lr 3e-5
 
-# Step 5 — evaluate the trained adapter on held-out data
-python step5_evaluate/evaluate.py               --run-dir step4_train/data/runs/<run_name>
+# Step 5 (trained) — evaluate the LoRA adapter and compare against the baseline
+python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs/<run_name> \
+    --baseline step5_evaluate/data/results/baseline_qwen_instruct
 
 # Plot training curves
-python step4_train/plot_training.py             step4_train/data/runs/<run_name>
+python3 step4_train/plot_training.py             step4_train/data/runs/<run_name>
 ```
 
 ## Smoke test
 
 ```bash
-python step0_mine/mine.py                       --model qwen_instruct --max-per-dataset 50
-python step1_extract_activations/extract.py     --model qwen_instruct --max-per-set 200
-python step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 16
-python step3_build_anchors/build_anchors.py     --model qwen_instruct
-python step4_train/train.py                     --model qwen_instruct \
+python3 step0_mine/mine.py                       --model qwen_instruct --max-per-dataset 50
+python3 step1_extract_activations/extract.py     --model qwen_instruct --max-per-set 200
+python3 step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 16
+python3 step3_build_anchors/build_anchors.py     --model qwen_instruct
+python3 step5_evaluate/evaluate.py               --model qwen_instruct \
+    --max-per-dataset 100 --max-ppl-rows 100
+python3 step4_train/train.py                     --model qwen_instruct \
     --rank 16 --max-train-steps 50 --epochs 1
-python step5_evaluate/evaluate.py               --run-dir step4_train/data/runs/<run> \
-    --max-per-dataset 100
+python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs/<run> \
+    --max-per-dataset 100 --max-ppl-rows 100 \
+    --baseline step5_evaluate/data/results/baseline_qwen_instruct
 ```
 
 ## Why this design
