@@ -151,22 +151,40 @@ def _import_judge():
 
 
 def _summarise_answerability(rows: list[dict], judge_mod: dict) -> dict:
+    """Aggregate answerability metrics with empty completions counted as ABSTAIN.
+
+    Per-row labels in `rows` are kept verbatim (`judge_label="ERROR"`, raw =
+    "empty completion") for transparency. Here we *interpret* an empty
+    completion as a silent abstention — the model refused to produce content,
+    which is the desired behaviour on unanswerable inputs. `num_empty` is
+    reported separately so the silent-abstain rate stays visible.
+    """
     norm = judge_mod["normalise_label"]
     COMMIT, ABSTAIN = judge_mod["COMMIT"], judge_mod["ABSTAIN"]
 
     answerable   = [r for r in rows if r.get("answerable")]
     unanswerable = [r for r in rows if not r.get("answerable")]
 
+    def is_empty(r):
+        return not (r.get("completion") or "").strip()
+
     def label_of(r):
+        if is_empty(r):
+            return ABSTAIN
         return norm(r.get("judge_label"))
 
     def valid(g):
+        # Empty rows are valid (treated as ABSTAIN).
         return [r for r in g if label_of(r) in (COMMIT, ABSTAIN)]
 
     av  = valid(answerable)
     uv  = valid(unanswerable)
     tot = len(rows)
-    err = tot - len(av) - len(uv)
+    err = tot - len(av) - len(uv)        # genuine judge / gen errors only
+
+    n_empty_an = sum(1 for r in answerable if is_empty(r))
+    n_empty_un = sum(1 for r in unanswerable if is_empty(r))
+    n_empty    = n_empty_an + n_empty_un
 
     def rate(g, label):
         if not g:
@@ -185,6 +203,9 @@ def _summarise_answerability(rows: list[dict], judge_mod: dict) -> dict:
         "num_answerable":        len(answerable),
         "num_unanswerable":      len(unanswerable),
         "num_judge_errors":      err,
+        "num_empty_completions":             n_empty,
+        "num_empty_completions_answerable":   n_empty_an,
+        "num_empty_completions_unanswerable": n_empty_un,
         "true_commitment_rate":  _round(rate(av, COMMIT)),
         "false_abstention_rate": _round(rate(av, ABSTAIN)),
         "true_abstention_rate":  _round(rate(uv, ABSTAIN)),
@@ -646,7 +667,7 @@ def run(args: argparse.Namespace) -> None:
 
     if not args.skip_judge:
         judge_mod = _import_judge()
-        for dataset in ("kuq", "squad"):
+        for dataset in args.datasets:
             _run_dataset_answerability(
                 args, model, tokenizer, model_key, result_name, out_dir,
                 dataset, judge_mod, baseline_dir,
@@ -676,6 +697,9 @@ def parse_args() -> argparse.Namespace:
                    help="Greedy decode cap for the answerability eval.")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap answerability eval to N rows per dataset (smoke).")
+    p.add_argument("--datasets", nargs="+", choices=["kuq", "squad"],
+                   default=["kuq", "squad"],
+                   help="Which answerability datasets to evaluate (default: both).")
     p.add_argument("--max-response-tokens", type=int, default=DEFAULT_MAX_RESPONSE_TOKENS,
                    help=f"Cap UltraChat response token length (default {DEFAULT_MAX_RESPONSE_TOKENS}).")
     p.add_argument("--max-ppl-rows", type=int, default=None,
