@@ -57,24 +57,23 @@ Thumbs.db
 *.log
 logs/
 
-# LFS-tracked exceptions (overrides the *.pt / *.csv rules above)
-!mining-data/activations/*.pt
-!mining-data/activations/*.csv
+# Step 1 activation bundles (large, regenerable by re-running step 1)
+step1_extract_activations/data/*.pt
+step1_extract_activations/data/_partial_*/
 
-# Specific contrast files to ignore
-mining-data/activations/supported_answer_contrasts_ministral_base.pt
-mining-data/activations/supported_answer_contrasts_ministral_instruct.pt
-mining-data/activations/supported_answer_contrasts_qwen_base.pt
-mining-data/activations/supported_answer_contrasts_qwen_instruct.pt
-mining-data/activations/unsupported_commitment_contrasts_ministral_base.pt
-mining-data/activations/unsupported_commitment_contrasts_ministral_instruct.pt
-mining-data/activations/unsupported_commitment_contrasts_qwen_base.pt
-mining-data/activations/unsupported_commitment_contrasts_qwen_instruct.pt
-mining-data/activations/cleaned_unsupported_contrasts_ministral_base_last25_r8.pt
-mining-data/activations/cleaned_unsupported_contrasts_ministral_instruct_last25_r8.pt
-mining-data/activations/cleaned_unsupported_contrasts_qwen_base_last25_r8.pt
-mining-data/activations/cleaned_unsupported_contrasts_qwen_instruct_last25_r8.pt
-mining-data/activations/retain_activations_ministral_base_last25.pt
-mining-data/activations/retain_activations_ministral_instruct_last25.pt
-mining-data/activations/retain_activations_qwen_base_last25.pt
-mining-data/activations/retain_activations_qwen_instruct_last25.pt
+# Step 4 training runs (LoRA checkpoints, logs, plots)
+step4_train/data/runs/
+
+# Step 5 evaluation outputs
+step5_evaluate/data/results/
+
+# Step 0 raw judged completions (regenerable; only forget/ is needed for training)
+step0_mine/data/mined/
+
+# Backups left behind by the forget-filter script
+*.bak
+*.full.bak
+
+# LFS-tracked exceptions — small distilled artefacts needed for training
+!step2_build_subspace/data/*.pt
+!step3_build_anchors/data/*.pt

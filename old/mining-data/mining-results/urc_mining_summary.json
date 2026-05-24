@@ -1,0 +1,134 @@
+{
+  "num_kuq_instances": 2000,
+  "num_squad_instances": 2000,
+  "generation_models": [
+    "Qwen/Qwen3.5-9B",
+    "Qwen/Qwen3.5-9B-Base",
+    "mistralai/Ministral-3-8B-Instruct-2512",
+    "mistralai/Ministral-3-8B-Base-2512"
+  ],
+  "judge_model": "cerebras/gpt-oss-120b",
+  "decoding": {
+    "do_sample": false,
+    "temperature": 0,
+    "max_new_tokens": 64,
+    "num_samples_per_model": 1
+  },
+  "total_generations": 250,
+  "total_committed": 84,
+  "total_abstained": 166,
+  "total_rejected": 170,
+  "total_retained": 80,
+  "counts_by_dataset": {
+    "kuq": {
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
+    },
+    "squad": {
+      "generated": 250,
+      "committed": 84,
+      "abstained": 166,
+      "judge_errors": 0,
+      "retained": 80,
+      "rejected": 170
+    }
+  },
+  "counts_by_generator_model": {
+    "Qwen/Qwen3.5-9B": {
+      "generated": 250,
+      "committed": 84,
+      "abstained": 166,
+      "judge_errors": 0,
+      "retained": 80,
+      "rejected": 170
+    },
+    "Qwen/Qwen3.5-9B-Base": {
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
+    },
+    "mistralai/Ministral-3-8B-Instruct-2512": {
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
+    },
+    "mistralai/Ministral-3-8B-Base-2512": {
+      "generated": 0,
+      "committed": 0,
+      "abstained": 0,
+      "judge_errors": 0,
+      "retained": 0,
+      "rejected": 0
+    }
+  },
+  "counts_by_dataset_and_model": {
+    "kuq": {
+      "Qwen/Qwen3.5-9B": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      },
+      "Qwen/Qwen3.5-9B-Base": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      },
+      "mistralai/Ministral-3-8B-Instruct-2512": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      },
+      "mistralai/Ministral-3-8B-Base-2512": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      }
+    },
+    "squad": {
+      "Qwen/Qwen3.5-9B": {
+        "committed": 84,
+        "abstained": 166,
+        "retained": 80
+      },
+      "Qwen/Qwen3.5-9B-Base": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      },
+      "mistralai/Ministral-3-8B-Instruct-2512": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      },
+      "mistralai/Ministral-3-8B-Base-2512": {
+        "committed": 0,
+        "abstained": 0,
+        "retained": 0
+      }
+    }
+  },
+  "judge_error_count": 0,
+  "valid_prefix_k4_count": 80,
+  "valid_prefix_k8_count": 80,
+  "valid_prefix_k16_count": 66,
+  "rejection_reasons": {
+    "abstained": 166,
+    "empty_completion": 0,
+    "malformed_completion": 0,
+    "invalid_json_from_judge": 0,
+    "invalid_prefix_k8": 0,
+    "prompt_echo_only": 4,
+    "duplicate_completion": 0
+  },
+  "generated_at": "2026-05-22T12:10:02.321437"
+}

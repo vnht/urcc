@@ -1,4 +1,0 @@
-{"model": "qwen-9b", "num_examples": 1000, "num_tokens": 197157, "mean_nll": 1.4632, "ppl": 4.32}
-{"model": "qwen-9b-base", "num_examples": 1000, "num_tokens": 197157, "mean_nll": 1.4042, "ppl": 4.072}
-{"model": "ministral-8b", "num_examples": 1000, "num_tokens": 197581, "mean_nll": 1.4681, "ppl": 4.341}
-{"model": "ministral-8b-base", "num_examples": 1000, "num_tokens": 197581, "mean_nll": 1.3978, "ppl": 4.046}
