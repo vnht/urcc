@@ -65,7 +65,6 @@ step1_extract_activations/data/_partial_*/
 step4_train/data/runs/
 
 # Step 5 evaluation outputs
-step5_evaluate/data/results/
 
 # Step 0 raw judged completions (regenerable; only forget/ is needed for training)
 step0_mine/data/mined/
