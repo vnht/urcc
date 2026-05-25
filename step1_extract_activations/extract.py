@@ -18,6 +18,23 @@ The contrast (A − B) isolates the over-commit direction; the contrast (C − D
 isolates the legitimate-commit direction. Both subtract a shared "abstain
 mode" baseline so the eigenproblem in step 2 sees only the commit-mode signal.
 
+Answer-token window (K positions, indexing convention)
+-----------------------------------------------------
+For each row we take the mean late-layer hidden state over a window of K
+positions starting one token *before* the first answer token:
+
+    window = [p_len - 1, p_len, p_len + 1, …, p_len + K - 2]
+
+Position ``p_len - 1`` is the prompt-final residual stream — the state from
+which the LM head decides the *first* generated token. Including it inside
+the window is what lets the retain loss intrinsically discourage degenerate
+solutions where the first-token logit collapses to a chat-end token; the
+remaining K-1 positions cover the body of the answer (or the start of the
+abstention text, for sets B and D).
+
+For set E (UltraChat) the same shift applies: the window starts at
+``resp_start - 1`` rather than ``resp_start``.
+
 Output
 ------
 step1_extract_activations/data/activations_<model>.pt  with keys:
@@ -209,7 +226,14 @@ def _extract_means_for(
             progress.tick(extras={"kept": len(means), "skip": skipped})
             continue
 
-        m = mean_answer_activation(hiddens, prompt_len=p_len, n_answer_tokens=n_ans)
+        # Window starts at p_len - 1 so it includes the prompt-final hidden
+        # state (the residual stream that decides the first generated token).
+        # The window has K positions: [p_len - 1, …, p_len + K - 2].
+        if p_len < 1:
+            skipped += 1
+            progress.tick(extras={"kept": len(means), "skip": skipped})
+            continue
+        m = mean_answer_activation(hiddens, prompt_len=p_len - 1, n_answer_tokens=n_ans)
         means.append(m)
         meta.append({
             "dataset":     row.get("dataset", "?"),
@@ -275,7 +299,13 @@ def _extract_retain_general_means(
             progress.tick(extras={"kept": len(means), "skip": skipped})
             continue
 
-        m = mean_answer_activation(hiddens, prompt_len=resp_start, n_answer_tokens=n_ans)
+        # Window starts at resp_start - 1 to include the prompt-to-response
+        # transition state (mirrors sets A–D).
+        if resp_start < 1:
+            skipped += 1
+            progress.tick(extras={"kept": len(means), "skip": skipped})
+            continue
+        m = mean_answer_activation(hiddens, prompt_len=resp_start - 1, n_answer_tokens=n_ans)
         means.append(m)
         progress.tick(extras={"kept": len(means), "skip": skipped})
 

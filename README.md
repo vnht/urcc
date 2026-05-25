@@ -31,8 +31,22 @@ avoid creating **D**.
 
 ## Activation sets (step 1)
 
-For each example, take the mean late-layer hidden state over the first `K=8`
-answer-token positions. Five sets:
+For each example, take the mean late-layer hidden state over a window of
+`K=8` token positions starting **one token before** the first answer token:
+
+```
+window T(x) = { p_len − 1, p_len, p_len + 1, …, p_len + K − 2 }
+```
+
+Position `p_len − 1` is the prompt-final residual stream — the state from
+which the LM head decides the *first* generated token. Including it inside
+the window is what lets the retain loss intrinsically discourage degenerate
+solutions where the LoRA satisfies the geometric loss by collapsing the
+first-token logit to a chat-end token. The remaining `K − 1` positions
+cover the body of the answer (or the start of the abstention text, for sets
+B and D).
+
+Five sets:
 
 | Set | Source | Forward signal |
 |-----|--------|----------------|
@@ -89,8 +103,8 @@ magnitude.
 ## Loss (step 4)
 
 LoRA adapter `δθ` on `f_θ`. Two components, both of the form
-`‖V_lᵀ(h_l − target)‖²`, averaged over late layers `{l}` and the first
-`K=8` answer-token positions `{t}`:
+`‖V_lᵀ(h_l − target)‖²`, averaged over late layers `{l}` and the
+`K=8`-position window `T(x) = {p_len − 1, …, p_len + K − 2}` defined above:
 
 ```
 L = L_forget + λ · L_retain

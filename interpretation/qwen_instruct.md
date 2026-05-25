@@ -14,7 +14,7 @@ from the saved bundles and what they imply for the training step that follows.
 | Model id             | `Qwen/Qwen3.5-9B` |
 | Hidden dim `D`       | 4096 |
 | Layer slice (last 25%) | `[24, 25, 26, 27, 28, 29, 30, 31]`  → `L = 8` |
-| Answer-token window `K` | 8 |
+| Answer-token window `K` | 8 (transition-shifted: `[p_len − 1, p_len + K − 2]`) |
 | Subspace rank `r`    | 32 |
 | Subspace ridge       | `1e-3` |
 | Retain basis rank    | 512 |
@@ -61,6 +61,21 @@ attempting to resolve the question, with no leftover ABSTAIN-shaped behaviour.
 
 Per-set tensors of shape `(N, L, D)` where the answer-token window of size
 `K=8` has already been mean-collapsed inside extraction.
+
+The window is shifted one position earlier than naive answer-token indexing:
+
+```
+T(x) = { p_len − 1, p_len, p_len + 1, …, p_len + K − 2 }
+```
+
+`p_len − 1` is the prompt-final residual stream — the state that determines
+the *first* generated token via the LM head. Including it inside the
+averaging window gives the retain loss a direct grip on first-token
+generation, which is what intrinsically prevents the LoRA from satisfying
+the geometric loss by collapsing first-token logits to a chat-end token
+(the failure mode that produced empty completions on SQuAD with the
+unshifted window). The remaining `K − 1` positions still cover the body of
+the answer (or abstention) so the per-pole geometry is barely perturbed.
 
 | Set | Description                          | `N`  | Shape           | Mean per-row `‖h‖` | Std |
 |-----|--------------------------------------|-----:|-----------------|-------------------:|----:|

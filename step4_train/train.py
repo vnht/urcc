@@ -11,13 +11,20 @@ utility (E) at its frozen reference. Each pole is **per answerability
 domain** d ∈ {kuq, squad} so that targets live in the same prompt
 distribution as the example being trained.
 
-    L_forget = E_{(x,y) ∈ D_F}                    ⟨ ‖ V_lᵀ (h_l       − μ_l⁻(d_x)     ) ‖² ⟩_{l, t}
-    L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}          ⟨ ‖ V_lᵀ (h_l^θ     − τ_l(x, y)     ) ‖² ⟩_{l, t}
+    L_forget = E_{(x,y) ∈ D_F}                    ⟨ ‖ V_lᵀ (h_l       − μ_l⁻(d_x)     ) ‖² ⟩_{l, t ∈ T(x)}
+    L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}          ⟨ ‖ V_lᵀ (h_l^θ     − τ_l(x, y)     ) ‖² ⟩_{l, t ∈ T(x)}
 
     τ_l(x, y) = μ_l⁺(d_x)          if (x, y) ∈ D_R_A   (legitimate commitment)
               = h_l^ref(x, y, t)   if (x, y) ∈ D_R_G   (general utility)
 
     L = L_forget + λ · L_retain
+
+The answer-token window T(x) starts one position *before* the first answer
+token: T(x) = {p_len-1, p_len, …, p_len+K-2}. Position p_len-1 is the
+prompt-final residual stream from which the LM head decides the first
+generated token. Anchoring it at μ⁺(d_x) (for D_R_A) or μ⁻(d_x) (for D_F)
+intrinsically opposes the degenerate solution where the LoRA satisfies the
+geometric loss by collapsing first-token logits to a chat-end token.
 
 The discriminative subspace V is **shared across domains** (it captures the
 abstain-vs-commit axis); only the poles are per-domain (they localise the
@@ -244,10 +251,15 @@ def _compute_forget_loss(
         ids = torch.tensor([full_ids], dtype=torch.long)
         _, hiddens = forward_hidden_states(model, ids, layer_indices)
 
+        # Window starts at p_len - 1 (prompt-final state) so the loss anchors
+        # the first-token-decision residual stream.
+        if p_len < 1:
+            continue
+        span = (p_len - 1, p_len - 1 + n_ans)
         per_ex = torch.tensor(0.0, requires_grad=True)
         for li, h in enumerate(hiddens):
             l_loss = _project_to_pole(
-                h, (p_len, p_len + n_ans), V_layers[li], mu_minus[li],
+                h, span, V_layers[li], mu_minus[li],
             )
             per_ex = per_ex + l_loss
             layer_norms.append(float(l_loss.detach().sqrt()))
@@ -298,10 +310,14 @@ def _compute_retain_loss(
             ids = torch.tensor([full_ids], dtype=torch.long)
             _, hiddens = forward_hidden_states(model, ids, layer_indices)
 
+            # Window starts at p_len - 1 to mirror the forget side.
+            if p_len < 1:
+                continue
+            span = (p_len - 1, p_len - 1 + n_ans)
             per_ex = torch.tensor(0.0, requires_grad=True)
             for li, h in enumerate(hiddens):
                 per_ex = per_ex + _project_to_pole(
-                    h, (p_len, p_len + n_ans), V_layers[li], mu_plus[li],
+                    h, span, V_layers[li], mu_plus[li],
                 )
             per_ex = per_ex / len(hiddens)
             total = total + per_ex
@@ -336,11 +352,16 @@ def _compute_retain_loss(
             # Trainable forward
             _, hiddens = forward_hidden_states(model, ids, layer_indices)
 
+            # Window starts at resp_start - 1 (prompt-final state) to mirror
+            # the forget / retain-answerable indexing.
+            if resp_start < 1:
+                continue
+            span = (resp_start - 1, resp_start - 1 + n_ans)
             per_ex = torch.tensor(0.0, requires_grad=True)
             for li, h in enumerate(hiddens):
-                ref_h = ref_hiddens[li][0, resp_start: resp_start + n_ans, :]
+                ref_h = ref_hiddens[li][0, span[0]: span[1], :]
                 per_ex = per_ex + _project_to_pole(
-                    h, (resp_start, resp_start + n_ans), V_layers[li], ref_h,
+                    h, span, V_layers[li], ref_h,
                 )
             per_ex = per_ex / len(hiddens)
             total = total + per_ex
@@ -649,9 +670,10 @@ def train(args: argparse.Namespace) -> None:
     (out_dir / "training_config.json").write_text(json.dumps({
         "model_key":        model_key,
         "model_id":         cfg.MODEL_REGISTRY[model_key],
-        "method":           "UOC two-component (subspace-anchored, per-domain poles)",
+        "method":           "UOC two-component (subspace-anchored, per-domain poles, transition-window)",
         "per_domain_poles": True,
         "pole_domains":     list(mu_minus_per.keys()),
+        "answer_window":    "transition-shifted: [p_len-1, p_len+K-2]",
         "subspace_rank":    args.rank,
         "lambda_retain":    args.lambda_retain,
         "epochs":           args.epochs,
