@@ -373,8 +373,8 @@ def run(model_key: str, max_per_set: int | None, rebuild: bool = False) -> Path:
             model=m, tokenizer=t, model_key=model_key,
             layer_indices=layer_indices, k_answer_tokens=K,
             prompt_fn=lambda r: build_unanswerable_prompt(r["dataset"], r),
-            answer_fn=lambda _: cfg.ABSTAIN_TEMPLATE,
-            desc="B. legit_abstain (templated)",
+            answer_fn=lambda r: cfg.abstain_template_for(r.get("dataset")),
+            desc="B. legit_abstain (per-domain templated)",
         )
 
     def extract_C():
@@ -395,8 +395,8 @@ def run(model_key: str, max_per_set: int | None, rebuild: bool = False) -> Path:
             model=m, tokenizer=t, model_key=model_key,
             layer_indices=layer_indices, k_answer_tokens=K,
             prompt_fn=lambda r: build_answerable_prompt(r["dataset"], r),
-            answer_fn=lambda _: cfg.ABSTAIN_TEMPLATE,
-            desc="D. over_abstain (templated)",
+            answer_fn=lambda r: cfg.abstain_template_for(r.get("dataset")),
+            desc="D. over_abstain (per-domain templated)",
         )
 
     def extract_E():

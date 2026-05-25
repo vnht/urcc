@@ -94,7 +94,30 @@ SQUAD_PROMPT_TEMPLATE = (
 )
 
 # Templated abstention used to build μ⁻ contrasts.
-ABSTAIN_TEMPLATE = "I do not have enough information to answer that."
+#
+# Per-domain templates: each was chosen by analysing the base model's natural
+# abstain phrasings on the held-out unanswerable set (see baseline_qwen_instruct
+# evals). KUQ abstentions are semantically diverse (no single dominant template),
+# so a generic refusal is used. SQuAD abstentions are dominated by the
+# "the provided context does not [contain|state|mention] X" family — so a
+# context-grounded template lives much closer to the base model's natural abstain
+# region in late-layer hidden-state space, which makes μ⁻_squad a target the
+# forget loss can actually reach without dragging unrelated activations along.
+ABSTAIN_TEMPLATE_PER_DATASET = {
+    "kuq":   "I do not have enough information to answer that.",
+    "squad": "The provided context does not contain information about that.",
+}
+
+# Backward-compat: keep a single fallback string for any caller that doesn't
+# know the row's dataset (none in the current pipeline).
+ABSTAIN_TEMPLATE = ABSTAIN_TEMPLATE_PER_DATASET["kuq"]
+
+
+def abstain_template_for(dataset: str | None) -> str:
+    """Return the abstention template aligned to the row's dataset.
+    Falls back to the KUQ generic template if the dataset is unknown.
+    """
+    return ABSTAIN_TEMPLATE_PER_DATASET.get(str(dataset or "").lower(), ABSTAIN_TEMPLATE)
 
 
 # ── Method defaults ───────────────────────────────────────────────────────────
@@ -104,8 +127,8 @@ SUBSPACE_RANK      = 32
 SUBSPACE_RIDGE     = 1e-3
 RETAIN_BASIS_RANK  = 512
 
-LORA_R              = 32
-LORA_ALPHA          = 64
+LORA_R              = 16
+LORA_ALPHA          = 32
 LORA_DROPOUT        = 0.05
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
                        "up_proj", "down_proj", "gate_proj"]
