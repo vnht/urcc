@@ -4,31 +4,37 @@
 Method
 ------
 Two losses, both of the form  ‖ V_lᵀ (h_l - target) ‖²   averaged over
-late layers and answer-token positions. The forget loss pulls
-over-commitment (category A) toward the legitimate-abstention pole μ⁻; the
-retain loss anchors legitimate commitment (C) at its pole μ⁺ and general
-utility (E) at its frozen reference. Each pole is **per answerability
-domain** d ∈ {kuq, squad} so that targets live in the same prompt
-distribution as the example being trained.
+late layers and answer-token positions. The forget loss *changes* the
+representation of over-commitment (category A) by pulling it toward the
+legitimate-abstention pole μ⁻(d). The retain loss *preserves* the
+representation of legitimate commitment (C) and general utility (E) by
+anchoring each example, per token, to its frozen-base activation. The
+two operations have clearly opposite roles — change vs. preserve — and
+both are per-example specific (not pulled toward an averaged anchor).
 
-    L_forget = E_{(x,y) ∈ D_F}                    ⟨ ‖ V_lᵀ (h_l       − μ_l⁻(d_x)     ) ‖² ⟩_{l, t ∈ T(x)}
-    L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}          ⟨ ‖ V_lᵀ (h_l^θ     − τ_l(x, y)     ) ‖² ⟩_{l, t ∈ T(x)}
-
-    τ_l(x, y) = μ_l⁺(d_x)          if (x, y) ∈ D_R_A   (legitimate commitment)
-              = h_l^ref(x, y, t)   if (x, y) ∈ D_R_G   (general utility)
+    L_forget = E_{(x,y) ∈ D_F}             ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)         ) ‖² ⟩_{l, t ∈ T(x)}
+    L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}   ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t ∈ T(x)}
 
     L = L_forget + λ · L_retain
+
+μ⁻(d) is per answerability domain d ∈ {kuq, squad} so the forget target
+lives in the same prompt distribution (KUQ no-context vs SQuAD with-
+context) as the example being trained. The discriminative subspace V is
+shared across domains.
 
 The answer-token window T(x) starts one position *before* the first answer
 token: T(x) = {p_len-1, p_len, …, p_len+K-2}. Position p_len-1 is the
 prompt-final residual stream from which the LM head decides the first
-generated token. Anchoring it at μ⁺(d_x) (for D_R_A) or μ⁻(d_x) (for D_F)
-intrinsically opposes the degenerate solution where the LoRA satisfies the
-geometric loss by collapsing first-token logits to a chat-end token.
+generated token. Including it in the retain side means the frozen-base
+reference protects each individual answerable / general-utility input's
+first-token decision, per-example — which is what prevents the LoRA from
+finding degenerate solutions that collapse first-token logits to a
+chat-end token on retain inputs.
 
-The discriminative subspace V is **shared across domains** (it captures the
-abstain-vs-commit axis); only the poles are per-domain (they localise the
-target within that axis).
+μ⁺(d) is computed in step 3 and saved in the anchors bundle but is no
+longer a training target — it is kept as a geometric *diagnostic*
+confirming V meaningfully separates the legit-commit cluster from the
+legit-abstain cluster.
 
 LoRA on `{q,k,v,o,up,down,gate}` projections of the late-layer set; base
 weights frozen.
@@ -137,7 +143,12 @@ def _layer_split(t: torch.Tensor) -> list[torch.Tensor]:
 def _load_subspace_and_anchors(model_key: str, rank: int):
     """Returns (V_layers, layer_indices, mu_minus_per, mu_plus_per, scale).
 
-    mu_minus_per / mu_plus_per are dicts keyed by dataset:
+    mu_minus_per is the per-domain forget pole, used by L_forget.
+    mu_plus_per  is loaded for backward-compat / diagnostic but is **no longer
+                 a training target** — L_retain uses the frozen-base forward as
+                 its per-example, per-token reference (see _compute_retain_loss).
+
+    Both are dicts keyed by dataset:
         {"kuq": [tensor(D), …L layers…], "squad": [tensor(D), …L layers…]}
 
     For backwards-compat with old anchor bundles (no per-domain poles), the
@@ -276,55 +287,42 @@ def _compute_forget_loss(
 
 def _compute_retain_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
-    V_layers, layer_indices, mu_plus_per: dict,
+    V_layers, layer_indices,
     k_answer_tokens: int,
 ) -> tuple[torch.Tensor, dict]:
-    """L_retain — anchor each retain example to its legitimate target along V.
+    """L_retain — preserve each retain example at its frozen-base location along V.
 
-      D_R_A (category C — legitimate commitment): target = μ⁺(d_x)  (per-domain)
-      D_R_G (category E — general utility):       target = h_l^frozen (per-token)
+      D_R_A (category C — legitimate commitment): target = h_l(x, y_gold; θ_frozen)  (per-token)
+      D_R_G (category E — general utility):       target = h_l(x, y_resp; θ_frozen)  (per-token)
+
+    Both branches now use the same operation: pull the trainable forward back to
+    the frozen-base forward at every (layer, token) position in the K-token window
+    starting at the prompt-final position. This is per-example and per-token, so
+    the LoRA pays a sharp price for any drift on a specific retain input — unlike
+    a shared scalar pole anchor where many retain examples can collectively move
+    together while the loss only measures the cluster's variance.
+
+    μ⁺(d) is no longer used in training; it is kept in the anchors bundle as a
+    geometric diagnostic confirming V separates legit-commit from legit-abstain.
     """
     total = torch.tensor(0.0, requires_grad=True)
     n_used = 0
     breakdown = {"answerable": 0, "general": 0}
 
     for r in batch:
-        if r["__type__"] == "answerable":
-            ds = r["__dataset__"]
-            mu_plus = mu_plus_per.get(ds)
-            if mu_plus is None:
-                continue
-            prompt = build_answerable_prompt(ds, r)
+        kind = r["__type__"]
+        if kind == "answerable":
+            prompt = build_answerable_prompt(r["__dataset__"], r)
             answer = r.get("correct_answer") or ""
             if not prompt.strip() or not answer.strip():
                 continue
             try:
-                full_ids, p_len, n_ans = tokenise_prompt_plus_answer(
+                full_ids, resp_start, n_ans = tokenise_prompt_plus_answer(
                     tokenizer, prompt, answer, k_answer_tokens=k_answer_tokens,
                 )
             except Exception:
                 continue
-            if n_ans == 0:
-                continue
-
-            ids = torch.tensor([full_ids], dtype=torch.long)
-            _, hiddens = forward_hidden_states(model, ids, layer_indices)
-
-            # Window starts at p_len - 1 to mirror the forget side.
-            if p_len < 1:
-                continue
-            span = (p_len - 1, p_len - 1 + n_ans)
-            per_ex = torch.tensor(0.0, requires_grad=True)
-            for li, h in enumerate(hiddens):
-                per_ex = per_ex + _project_to_pole(
-                    h, span, V_layers[li], mu_plus[li],
-                )
-            per_ex = per_ex / len(hiddens)
-            total = total + per_ex
-            breakdown["answerable"] += 1
-            n_used += 1
-
-        elif r["__type__"] == "general":
+        elif kind == "general":
             prompt   = r.get("prompt") or ""
             response = r.get("response") or ""
             if not prompt.strip() or not response.strip():
@@ -336,37 +334,38 @@ def _compute_retain_loss(
             except Exception:
                 continue
             n_ans = min(k_answer_tokens, max(0, len(full_ids) - resp_start))
-            if n_ans == 0:
-                continue
+        else:
+            continue
 
-            ids = torch.tensor([full_ids], dtype=torch.long)
+        if n_ans == 0 or resp_start < 1:
+            continue
 
-            # Frozen reference (adapters disabled, no_grad)
-            model.eval()
-            model.disable_adapter_layers()
-            with torch.no_grad():
-                _, ref_hiddens = forward_hidden_states(model, ids, layer_indices)
-            model.enable_adapter_layers()
-            model.train()
+        ids = torch.tensor([full_ids], dtype=torch.long)
 
-            # Trainable forward
-            _, hiddens = forward_hidden_states(model, ids, layer_indices)
+        # Frozen reference (adapters disabled, no_grad)
+        model.eval()
+        model.disable_adapter_layers()
+        with torch.no_grad():
+            _, ref_hiddens = forward_hidden_states(model, ids, layer_indices)
+        model.enable_adapter_layers()
+        model.train()
 
-            # Window starts at resp_start - 1 (prompt-final state) to mirror
-            # the forget / retain-answerable indexing.
-            if resp_start < 1:
-                continue
-            span = (resp_start - 1, resp_start - 1 + n_ans)
-            per_ex = torch.tensor(0.0, requires_grad=True)
-            for li, h in enumerate(hiddens):
-                ref_h = ref_hiddens[li][0, span[0]: span[1], :]
-                per_ex = per_ex + _project_to_pole(
-                    h, span, V_layers[li], ref_h,
-                )
-            per_ex = per_ex / len(hiddens)
-            total = total + per_ex
-            breakdown["general"] += 1
-            n_used += 1
+        # Trainable forward
+        _, hiddens = forward_hidden_states(model, ids, layer_indices)
+
+        # Window includes resp_start - 1 (prompt-final state) so the loss
+        # protects first-token-decision residual stream per-example.
+        span = (resp_start - 1, resp_start - 1 + n_ans)
+        per_ex = torch.tensor(0.0, requires_grad=True)
+        for li, h in enumerate(hiddens):
+            ref_h = ref_hiddens[li][0, span[0]: span[1], :]
+            per_ex = per_ex + _project_to_pole(
+                h, span, V_layers[li], ref_h,
+            )
+        per_ex = per_ex / len(hiddens)
+        total = total + per_ex
+        breakdown[kind if kind == "general" else "answerable"] += 1
+        n_used += 1
 
     if n_used > 0:
         total = total / n_used
@@ -443,8 +442,9 @@ def train(args: argparse.Namespace) -> None:
         _load_subspace_and_anchors(model_key, rank=args.rank)
     log.info("  V layers=%s  rank=%d  init_scale=%.4f",
              layer_indices, args.rank, init_scale)
-    log.info("  per-domain poles: μ⁻ keys=%s  μ⁺ keys=%s",
-             list(mu_minus_per.keys()), list(mu_plus_per.keys()))
+    log.info("  forget pole μ⁻ keys=%s   (μ⁺ kept as diagnostic only; retain uses frozen-base reference)",
+             list(mu_minus_per.keys()))
+    _ = mu_plus_per  # diagnostic; not used by L_retain (frozen-ref preservation instead)
 
     if args.dry_run:
         forget_data = forget_data[:8]
@@ -566,7 +566,7 @@ def train(args: argparse.Namespace) -> None:
             l_retain_raw, _rinfo = _compute_retain_loss(
                 model=model, batch=retain_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
-                layer_indices=layer_indices, mu_plus_per=mu_plus_per,
+                layer_indices=layer_indices,
                 k_answer_tokens=cfg.K_ANSWER_TOKENS,
             )
 
@@ -670,9 +670,10 @@ def train(args: argparse.Namespace) -> None:
     (out_dir / "training_config.json").write_text(json.dumps({
         "model_key":        model_key,
         "model_id":         cfg.MODEL_REGISTRY[model_key],
-        "method":           "UOC two-component (subspace-anchored, per-domain poles, transition-window)",
+        "method":           "UOC two-component (per-domain μ⁻ forget pole, frozen-base retain preservation, transition-window)",
         "per_domain_poles": True,
         "pole_domains":     list(mu_minus_per.keys()),
+        "retain_target":    "frozen-base h(x, y; θ_frozen)  (per-token, per-example) for both C and E",
         "answer_window":    "transition-shifted: [p_len-1, p_len+K-2]",
         "subspace_rank":    args.rank,
         "lambda_retain":    args.lambda_retain,
