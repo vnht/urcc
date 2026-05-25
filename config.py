@@ -104,8 +104,8 @@ SUBSPACE_RANK      = 32
 SUBSPACE_RIDGE     = 1e-3
 RETAIN_BASIS_RANK  = 512
 
-LORA_R              = 16
-LORA_ALPHA          = 32
+LORA_R              = 32
+LORA_ALPHA          = 64
 LORA_DROPOUT        = 0.05
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
                        "up_proj", "down_proj", "gate_proj"]
