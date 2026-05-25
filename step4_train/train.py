@@ -135,20 +135,13 @@ def _layer_split(t: torch.Tensor) -> list[torch.Tensor]:
 
 
 def _load_subspace_and_anchors(model_key: str, rank: int):
-    """Returns (V_layers, layer_indices, mu_minus_per, mu_plus_per, margin_sq_per, scale).
+    """Returns (V_layers, layer_indices, mu_minus_per, mu_plus_per, scale).
 
     mu_minus_per / mu_plus_per are dicts keyed by dataset:
         {"kuq": [tensor(D), …L layers…], "squad": [tensor(D), …L layers…]}
 
-    margin_sq_per is a dict keyed by dataset of per-layer floats:
-        {"kuq": [m²_l, …L layers…], "squad": […]}
-    Used as a hinge threshold on the forget loss only — once an example's
-    V-projected squared distance falls below m²(l, d), no further forget
-    gradient is produced for that example at that layer.
-
-    For backwards-compat with old anchor bundles (no per-domain poles or
-    margin), the grand mean replaces missing per-domain poles and margin_sq
-    defaults to 0 (margin disabled).
+    For backwards-compat with old anchor bundles (no per-domain poles), the
+    grand mean is replicated under both keys.
     """
     sp = cfg.subspace_path(model_key, rank=rank)
     ap = cfg.anchors_path(model_key)
@@ -173,16 +166,6 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
     mu_minus_per = {d: _layer_split(t) for d, t in minus_per_t.items()}
     mu_plus_per  = {d: _layer_split(t) for d, t in plus_per_t.items()}
 
-    margin_per_t = ab.get("margin_sq_per")
-    if margin_per_t is None:
-        log.warning("  anchors bundle has no margin_sq_per; forget hinge disabled. "
-                    "Re-run step 3 to compute per-domain margins.")
-        n_layers = len(V_layers)
-        margin_sq_per = {d: [0.0] * n_layers for d in mu_minus_per.keys()}
-    else:
-        margin_sq_per = {d: [float(t[i]) for i in range(t.shape[0])]
-                         for d, t in margin_per_t.items()}
-
     if "mu_minus_per" not in ab:
         log.warning("  anchors bundle has no per-domain poles; falling back to grand mean. "
                     "Re-run step 3 to build per-domain anchors.")
@@ -196,7 +179,7 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
         oc_means = [d["OC_proj"] for d in sb["diag"]]
         init_scale = max(sum(oc_means) / len(oc_means), 1e-6)
 
-    return V_layers, sb["layers"], mu_minus_per, mu_plus_per, margin_sq_per, float(init_scale)
+    return V_layers, sb["layers"], mu_minus_per, mu_plus_per, float(init_scale)
 
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
@@ -216,50 +199,32 @@ def _apply_lora(model):
     return model
 
 
-# ── Loss components ──────────────────────────────────────────────────────────
-#
-# Forget side (with margin):
-#   contributes  relu(||V_l⊤(h_t − μ_l⁻)||² − m²(l, d))   per token, mean over span
-#   → zero gradient once an example is within m² of its domain's abstain pole.
-#
-# Retain side (no margin):
-#   contributes  ||V_l⊤(h_t − target_t)||²                per token, mean over span
-#   → exact anchoring at μ⁺(d) for category C, frozen ref for category E.
+# ── Loss components (always the same operation: ‖ Vᵀ(h - target) ‖²) ───────────
 
 def _project_to_pole(
     h_seq: torch.Tensor,                      # (1, seq_len, D)
     span: tuple[int, int],                    # (start, end) in seq dim
     V_l: torch.Tensor,                        # (D, r)
     target: torch.Tensor,                     # (D,) constant pole or (n_ans, D) per-token
-    margin_sq: float = 0.0,                   # hinge threshold (squared distance)
 ) -> torch.Tensor:
-    """Returns mean over span of ``relu(||V⊤(h - target)||² − margin_sq)``.
-
-    margin_sq=0 recovers the plain squared-distance loss used by the retain
-    side. The forget side passes a positive margin_sq so that examples already
-    inside the abstain region contribute zero gradient.
-    """
+    """Returns mean over span of ||Vᵀ(h_t - target_t)||²."""
     s, e = span
-    h = h_seq[0, s:e, :] - target.to(h_seq.device).to(h_seq.dtype)
+    h = h_seq[0, s:e, :]                      # (n_ans, D)
+    if target.dim() == 1:
+        h = h - target.to(h.device).to(h.dtype)
+    else:
+        h = h - target.to(h.device).to(h.dtype)
     proj = h @ V_l.to(h.device).to(h.dtype)   # (n_ans, r)
-    sq_dist = (proj ** 2).sum(dim=-1)         # (n_ans,)
-    if margin_sq > 0.0:
-        sq_dist = torch.relu(sq_dist - margin_sq)
-    return sq_dist.mean()
+    return (proj ** 2).sum(dim=-1).mean()
 
 
 def _compute_forget_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
-    V_layers, layer_indices, mu_minus_per: dict, margin_sq_per: dict,
+    V_layers, layer_indices, mu_minus_per: dict,
     k_answer_tokens: int,
 ) -> tuple[torch.Tensor, dict]:
-    """L_forget — hinged pull of category-A activations toward the legitimate-
-    abstention pole μ⁻(d) along V, with hinge threshold m²(l, d):
-
-        L_forget(x) = mean_l mean_t  relu(||V_l⊤(h_l(x_t) − μ_l⁻(d))||² − m²_l(d))
-
-    Once a token's V-projected squared distance falls inside m²(l, d) it
-    contributes zero gradient at that layer. d = r["__dataset__"].
+    """L_forget — pull category-A activations toward the legitimate-abstention
+    pole μ⁻(d) along V, where d is the example's source dataset (kuq | squad).
     """
     total = torch.tensor(0.0, requires_grad=True)
     layer_norms: list[float] = []
@@ -268,8 +233,7 @@ def _compute_forget_loss(
     for r in batch:
         ds = r["__dataset__"]
         mu_minus = mu_minus_per.get(ds)
-        margin   = margin_sq_per.get(ds)
-        if mu_minus is None or margin is None:
+        if mu_minus is None:
             continue
         prompt = build_unanswerable_prompt(ds, r)
         answer = r.get("y_com_prefix_k8") or r.get("full_completion_clean") or ""
@@ -296,7 +260,6 @@ def _compute_forget_loss(
         for li, h in enumerate(hiddens):
             l_loss = _project_to_pole(
                 h, span, V_layers[li], mu_minus[li],
-                margin_sq=margin[li],
             )
             per_ex = per_ex + l_loss
             layer_norms.append(float(l_loss.detach().sqrt()))
@@ -476,14 +439,12 @@ def train(args: argparse.Namespace) -> None:
     if not retain_data:
         raise RuntimeError("Retain pool is empty.")
 
-    V_layers, layer_indices, mu_minus_per, mu_plus_per, margin_sq_per, init_scale = \
+    V_layers, layer_indices, mu_minus_per, mu_plus_per, init_scale = \
         _load_subspace_and_anchors(model_key, rank=args.rank)
     log.info("  V layers=%s  rank=%d  init_scale=%.4f",
              layer_indices, args.rank, init_scale)
     log.info("  per-domain poles: μ⁻ keys=%s  μ⁺ keys=%s",
              list(mu_minus_per.keys()), list(mu_plus_per.keys()))
-    log.info("  forget margin² per-domain (mean over layers): %s",
-             {d: round(sum(m) / max(len(m), 1), 3) for d, m in margin_sq_per.items()})
 
     if args.dry_run:
         forget_data = forget_data[:8]
@@ -600,7 +561,6 @@ def train(args: argparse.Namespace) -> None:
                 model=model, batch=forget_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
                 layer_indices=layer_indices, mu_minus_per=mu_minus_per,
-                margin_sq_per=margin_sq_per,
                 k_answer_tokens=cfg.K_ANSWER_TOKENS,
             )
             l_retain_raw, _rinfo = _compute_retain_loss(
@@ -710,13 +670,9 @@ def train(args: argparse.Namespace) -> None:
     (out_dir / "training_config.json").write_text(json.dumps({
         "model_key":        model_key,
         "model_id":         cfg.MODEL_REGISTRY[model_key],
-        "method":           "UOC two-component (subspace-anchored, per-domain poles, hinge-margin forget, transition-window)",
+        "method":           "UOC two-component (subspace-anchored, per-domain poles, transition-window)",
         "per_domain_poles": True,
         "pole_domains":     list(mu_minus_per.keys()),
-        "forget_margin":    True,
-        "forget_margin_sq_per_domain_mean": {
-            d: float(sum(m) / max(len(m), 1)) for d, m in margin_sq_per.items()
-        },
         "answer_window":    "transition-shifted: [p_len-1, p_len+K-2]",
         "subspace_rank":    args.rank,
         "lambda_retain":    args.lambda_retain,
