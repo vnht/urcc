@@ -180,17 +180,23 @@ set carries inside V.
 
 ---
 
-## 4. Step 3 — pole anchors μ⁻(d), μ⁺(d)   [per answerability domain]
+## 4. Step 3 — pole anchors μ⁻(d), μ⁺(d), forget margin m²(d)   [per answerability domain]
 
-`step3_build_anchors/data/anchors_qwen_instruct.pt`. Each pole is now
-**per answerability domain** d ∈ {kuq, squad}, shape `[8, 4096]` per
-domain. The shared subspace V from step 2 is unchanged — V captures the
+`step3_build_anchors/data/anchors_qwen_instruct.pt`. Each pole is **per
+answerability domain** d ∈ {kuq, squad}, shape `[8, 4096]` per domain.
+A new per-(layer, domain) constant `m²_l(d)` is also stored — the
+V-projected variance of legitimate-abstention examples around their own
+pole, used as a hinge threshold by step 4's forget loss.
+
+The shared subspace V from step 2 is unchanged — V captures the
 abstain-vs-commit *axis*, the poles localise the *target on that axis*
-inside each domain's prompt distribution.
+inside each domain's prompt distribution, and `m²(d)` defines the natural
+"done" boundary around each pole.
 
 ```
-μ_l⁻(d) = mean over rows of  h_B  whose dataset == d   (templated abstention on D_F[d] prompts)
-μ_l⁺(d) = mean over rows of  h_C  whose dataset == d   (gold answer on D_R_A[d] prompts)
+μ_l⁻(d) = mean over rows of  h_B  whose dataset == d                (templated abstention on D_F[d] prompts)
+μ_l⁺(d) = mean over rows of  h_C  whose dataset == d                (gold answer on D_R_A[d] prompts)
+m²_l(d) = mean over rows of  h_B(d)  of  ||V_l⊤(h_B(d) − μ_l⁻(d))||²   (V-projected abstain spread, layer l, domain d)
 ```
 
 `n_minus_per = {kuq: 500, squad: 500}`, `n_plus_per = {kuq: 500, squad: 500}`. Wall-clock: < 1 s.
@@ -199,14 +205,27 @@ inside each domain's prompt distribution.
 
 | Layer | `‖μ⁻_kuq‖` | `‖μ⁻_squad‖` | `‖μ⁻_kuq − μ⁻_squad‖` | `‖μ⁺_kuq‖` | `‖μ⁺_squad‖` | `‖μ⁺_kuq − μ⁺_squad‖` |
 |------:|-----------:|-------------:|----------------------:|-----------:|-------------:|----------------------:|
-| 24    |    79.18   |    75.48     |        31.63          |    53.04   |    73.38     |        38.06          |
-| 25    |    88.66   |    83.52     |        34.89          |    57.81   |    81.57     |        41.14          |
-| 26    |   103.74   |    94.93     |        38.69          |    81.26   |    80.76     |        32.46          |
-| 27    |   108.92   |   102.45     |        40.31          |    71.35   |    97.69     |        45.47          |
-| 28    |   125.28   |   115.67     |        45.50          |    93.41   |   122.27     |        49.87          |
-| 29    |   138.47   |   129.84     |        48.50          |   107.35   |   135.96     |        53.69          |
-| 30    |   155.18   |   147.90     |        52.90          |   122.24   |   135.53     |        53.43          |
-| 31    |   105.31   |   100.77     |        33.85          |    84.97   |    80.83     |        39.26          |
+| 24    |    74.52   |    73.04     |        30.69          |    47.13   |    70.96     |        38.83          |
+| 25    |    83.43   |    80.81     |        33.62          |    49.65   |    78.28     |        43.71          |
+| 26    |   102.01   |    93.66     |        37.95          |    74.19   |    88.03     |        32.78          |
+| 27    |   103.97   |    99.31     |        39.41          |    63.44   |    97.06     |        48.94          |
+| 28    |   120.08   |   113.23     |        44.08          |    79.17   |   118.32     |        55.62          |
+| 29    |   134.02   |   127.27     |        47.38          |    96.40   |   132.69     |        55.96          |
+| 30    |   149.51   |   144.41     |        51.75          |   112.71   |   134.23     |        52.45          |
+| 31    |   100.39   |    96.85     |        32.40          |    77.70   |    80.33     |        32.30          |
+
+### Per-layer forget margin `m²_l(d)`  (V-projected abstain spread, used as a hinge by step 4)
+
+| Layer | `m²_kuq` | `m²_squad` | `OC_proj` (init L_forget proxy) | margin / init  KUQ | margin / init  SQuAD |
+|------:|---------:|-----------:|--------------------------------:|-------------------:|---------------------:|
+| 24    |   13.26  |    3.87    |        112.69                   |        12%         |          3%          |
+| 25    |   15.51  |    4.38    |        105.12                   |        15%         |          4%          |
+| 26    |   18.34  |    4.82    |         99.71                   |        18%         |          5%          |
+| 27    |   21.52  |    6.60    |         93.70                   |        23%         |          7%          |
+| 28    |   28.56  |    9.00    |         93.40                   |        31%         |         10%          |
+| 29    |   35.91  |   11.41    |         93.02                   |        39%         |         12%          |
+| 30    |   46.02  |   15.55    |         92.20                   |        50%         |         17%          |
+| 31    |   20.73  |    9.38    |         71.97                   |        29%         |         13%          |
 
 ### Reading
 
@@ -233,6 +252,26 @@ inside each domain's prompt distribution.
   direction common to both domains. Per-domain poles are the *positions on
   that axis* that differ.
 
+### Reading the forget margin
+
+* **`m²_squad ≈ ⅓ × m²_kuq` at every layer.** SQuAD's natural abstain
+  region is ~3× tighter in V than KUQ's. Long-context prompts force the
+  late-layer state into a narrow band when the model knows it cannot
+  answer; KUQ's open-ended unanswerable prompts allow more spread. The
+  hinge therefore stops SQuAD's forget pull much earlier — exactly where
+  empirically it was overshooting and producing empty completions.
+* **margin / init ≈ 12–50 % (KUQ), 3–17 % (SQuAD).** The hinge sits well
+  below the initial forget loss everywhere. Training will get full
+  gradient at step 0 and the hinge will progressively kick in only as
+  examples actually reach their domain's abstain region.
+* **Layer 30 has the largest absolute margin (46 / 16) but also the
+  largest absolute pole gap (52 / 52).** The cap there is generous,
+  consistent with this layer carrying a lot of behavioural geometry that
+  we don't want to over-pull through.
+* **Layer 24 has the tightest cap (margin ≈ 12 % / 3 % of init).** The
+  earliest of the eight late layers — selective `γ_1 = 27.8` but the
+  abstain region itself is small. The hinge will saturate fastest here.
+
 ---
 
 ## 5. Synthesis — what the geometry says about the method
@@ -244,15 +283,16 @@ model.
 |-------------|----------|---------|
 | A unique low-rank direction where over-commit dominates | `OC/LC = 7×` in `V`, every `γ_k > 0` for `k ≤ 32` | ✓ strong |
 | A target point inside that direction to pull A toward    | per-domain `‖V⊤(μ⁻(d) − μ⁺(d))‖` order-of `10–18` per layer; KUQ and SQuAD targets sit `30–50` units apart in full hidden space | ✓ strong |
+| A geometric "done" signal that stops over-pulling once an example reaches the abstain region | per-(layer, domain) margin `m²_l(d)` with margin/init = 3–50 % depending on layer & domain | ✓ strong |
 | Headroom so the pull doesn't damage C and E              | `OC/LC = 7×`, `OC/E = 3×`; `LC_proj ≈ 14`, `E_proj ≡ 32` | ✓ moderate (E is the watch) |
 
 ### Consequence for the loss
 
 ```
 L = L_forget + λ · L_retain
-L_forget        = mean_x∈D_F   ‖V⊤(h_A(x) − μ⁻(d_x))‖²        # d_x = dataset(x)
-L_retain[C]     = mean_x∈D_R_A ‖V⊤(h_C(x) − μ⁺(d_x))‖²
-L_retain[E]     = mean_x∈D_R_G ‖V⊤(h_E(x) − h_E_frozen(x))‖²
+L_forget        = mean_x∈D_F   relu( ‖V⊤(h_A(x) − μ⁻(d_x))‖² − m²(d_x) )    # d_x = dataset(x)
+L_retain[C]     = mean_x∈D_R_A      ‖V⊤(h_C(x) − μ⁺(d_x))‖²
+L_retain[E]     = mean_x∈D_R_G      ‖V⊤(h_E(x) − h_E_frozen(x))‖²
 ```
 
 Initial-step expectations:
@@ -261,11 +301,14 @@ Initial-step expectations:
   toward `μ⁻_squad`. `V⊤ h_A(x) − V⊤ μ⁻(d_x)` is now a within-domain
   distance instead of a partly-cross-domain one — initial loss falls
   sooner because the target lives in the example's own prompt
-  distribution.
+  distribution. The hinge is inactive at step 0 (margin ≪ init L_forget)
+  and progressively saturates per-token as activations enter the natural
+  abstain region.
 * **`L_retain[C]`.** Same routing: KUQ legit-commits anchored to
   `μ⁺_kuq`, SQuAD to `μ⁺_squad`. Expected initial loss is *lower* than
   the grand-mean version because each pole sits at the centre of its own
-  domain's commit cluster.
+  domain's commit cluster. **No margin is applied on the retain side** —
+  the goal there is exact anchoring, not "close enough".
 * **`L_retain[E]`.** Reference-anchored, so initial value is 0 by
   construction. Domain routing does not apply (UltraChat has no
   answerability domain).
@@ -283,23 +326,35 @@ Initial-step expectations:
 
 * **FCR (false-commit rate, unanswerable held-out).** This is what V is
   built to suppress; substantial drop expected.
+* **Empty completions on SQuAD.** Previously the dominant failure mode
+  with grand-mean poles and a plain squared `L_forget`. The hinge `m²` is
+  expected to remove most of them: by the time activations enter the
+  domain's natural abstain region, the forget term is zero and stops
+  perturbing the prompt-final residual stream.
 * **Decision accuracy (answerable held-out).** Should hold within a few
   points of the base model — `LC_proj` is small in V (only ~14 worth of
-  variance budget for the model to disturb).
+  variance budget for the model to disturb), and the hinge does not
+  affect retain.
 * **UltraChat preservation.** The hardest call from geometry alone.
   `OC/E = 3×` is a modest margin; if UltraChat outputs visibly degrade
-  before FCR drops, β is too high.
+  before FCR drops, λ is too high.
 
 ### Risks the data flags
 
 * **E-set margin is the bottleneck.** OC/E ≈ 3× vs OC/LC ≈ 7×. Don't push
-  β beyond ~1.5 on the first run; UltraChat will be the first thing to
-  show damage.
+  λ beyond ~7 on the first run; UltraChat will be the first thing to
+  show damage if anything does.
 * **Stylistic over-commit ≠ all over-commit.** Σ_OC has lower trace than
   Σ_LC because over-commits are stereotyped. The forget set captures the
   most obvious cases (KUQ + SQuAD). Real-world over-commit on out-of-domain
   unanswerable prompts may vary in shapes V doesn't index. Step 5 results
   on the held-out dataset are the test.
+* **Margin generalisation is an empirical claim.** `m²(d)` is calibrated
+  on `h_B(d)` — templated abstention activations. The hinge therefore
+  encodes "indistinguishable from real abstain in V". If A activations
+  reach a *different* corner of V that happens to be ≤ m² from μ⁻ but
+  isn't actually abstain-shaped, the hinge will mistakenly deactivate.
+  Step 5 generations are the check.
 
 ---
 
@@ -326,6 +381,7 @@ python3 step3_build_anchors/build_anchors.py --model qwen_instruct
 Next:
 
 ```bash
-python3 step4_train/train.py --model qwen_instruct --rank 32 --lambda-retain 7 --epochs 3 --lr 3e-5
-python3 step5_evaluate/evaluate.py --run <run_name>
+python3 step4_train/train.py --model qwen_instruct --rank 32 --lambda-retain 1 --epochs 3 --lr 3e-5
+python3 step5_evaluate/evaluate.py --run-dir step4_train/data/runs/<run_name> \
+    --baseline step5_evaluate/data/results/baseline_qwen_instruct
 ```
