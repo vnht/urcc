@@ -56,32 +56,52 @@ Five sets:
 | **D** activations | `D_R_A` prompts, **templated** abstention text          | `h_l(x, y_⊥)` |
 | **E** activations | `D_R_G` (prompt, response) pairs                        | `h_l(x, y_E)` |
 
-`y_⊥ = "I do not have enough information to answer that."` is the same
-templated string in B and D — it acts as the "abstain mode" baseline that
-gets subtracted out of the contrasts below.
+`y_⊥(d)` is a **per-domain** templated abstention string used in B and D.
+KUQ and SQuAD have very different natural abstention phrasings (no-context
+vs. context-grounded), so each domain gets its own template:
+
+```
+y_⊥(kuq)   = "I do not have enough information to answer that."
+y_⊥(squad) = "The provided context does not contain information about that."
+```
+
+Both templates were chosen by inspecting the base model's natural abstentions
+on held-out unanswerable inputs. Using the right template per domain is what
+makes `μ⁻(d)` (the abstain pole, step 3) sit in a region the model can
+actually reach with small LoRA updates, rather than dragging unrelated
+activations along.
 
 ## Subspace V (step 2)
 
-For each late layer `l`, form the over-commit contrast and the
-legitimate-commit contrast:
+For each domain `d ∈ {kuq, squad}` and each late layer `l`, form the
+domain-restricted over-commit and legitimate-commit contrasts:
 
 ```
-c_OC(x) = h_l(A) − h_l(B)        for x ∈ D_F        (over-commit minus its abstain baseline)
-c_LC(x) = h_l(C) − h_l(D)        for x ∈ D_R_A      (legit-commit minus its abstain baseline)
+c_OC(x; d) = h_l(A) − h_l(B)     for x ∈ D_F[d]      (over-commit minus its abstain baseline, dom d)
+c_LC(x; d) = h_l(C) − h_l(D)     for x ∈ D_R_A[d]    (legit-commit minus its abstain baseline, dom d)
 ```
 
-Form covariances `Σ_OC, Σ_LC` of those contrasts plus the general-utility
-covariance `Σ_E = cov(h_l(E))`, and solve the generalised eigenproblem in
-the retain span:
+Form covariances `Σ_OC(d), Σ_LC(d)` of those contrasts plus the
+domain-shared general-utility covariance `Σ_E = cov(h_l(E))`, and solve
+the generalised eigenproblem in the retain span:
 
 ```
-(Σ_OC − Σ_LC) v = γ Σ_E v
+(Σ_OC(d) − Σ_LC(d)) v = γ Σ_E v
 ```
 
-`V_l ∈ ℝ^{D × r}` are the top-`r` generalised eigenvectors. Large positive
-`γ` ⇒ direction along which over-commit varies *more* than legitimate-commit
-(after subtracting the shared abstain baseline), normalised against general
-utility. `V_l` is computed once and frozen.
+`V_l(d) ∈ ℝ^{D × r}` are the top-`r` generalised eigenvectors for domain
+`d`. Large positive `γ` ⇒ direction along which over-commit varies *more*
+than legitimate-commit (after subtracting the shared abstain baseline),
+normalised against general utility. `V_l(d)` is computed once and frozen.
+
+**Why per-domain V.** KUQ and SQuAD have genuinely different commitment-vs-
+abstention decision directions in late-layer space. A shared V mixes the two
+contrasts and is dominated by whichever has the stronger signal (KUQ).
+Empirically, V_kuq and V_squad share zero highly-aligned dimensions
+(cos > 0.9) and roughly half their basis is near-orthogonal (cos < 0.3) — so
+the shared V was forcing both domains through a compromise basis that missed
+half of each domain's decision-relevant directions. Per-domain V is the same
+fix, one level up, that we already apply to the poles.
 
 ## Anchors (step 3)
 
@@ -89,70 +109,77 @@ Per answerability domain `d ∈ {kuq, squad}`:
 
 ```
 μ_l⁻(d) = mean over D_F[d]   of  h_l(B[d])         (legitimate-abstention pole, domain d)
-μ_l⁺(d) = mean over D_R_A[d] of  h_l(C[d])         (legitimate-commitment pole, domain d)
-m²_l(d) = mean over D_F[d]   of  ||V_l⊤(h_l(B[d]) − μ_l⁻(d))||²
-                                                    (forget margin: V-projected variance
-                                                     of legitimate abstention around its
-                                                     own pole — the "natural spread" of
-                                                     domain d's abstain region in V)
+μ_l⁺(d) = mean over D_R_A[d] of  h_l(C[d])         (legitimate-commitment pole, domain d, diagnostic only)
 ```
 
-All three quantities are fixed; nothing in step 3 is a hyperparameter.
-The shared subspace V (step 2) captures the *axis* between abstain and
-commit; per-domain poles localise the *target on that axis* inside each
-domain's prompt distribution; the per-(layer, domain) margin `m²_l(d)`
-defines a "done" boundary around the pole equal to the natural spread of
-real abstain examples in that domain. KUQ (no context) and SQuAD (long
-context) sit in genuinely different regions of late-layer hidden space —
-`||μ⁻_kuq − μ⁻_squad||` ≈ 30–50 across layers — so a single grand-mean
-pole would miss each domain's true location by ~20% of pole magnitude.
+The poles are points in 4096-D activation space — they don't depend on V.
+`μ⁻(d)` is the forget target in step 4. `μ⁺(d)` is *no longer used in
+training*; it's kept as a geometric diagnostic confirming `V(d)` separates
+the legit-commit cluster from the legit-abstain cluster (retain on category
+C uses a per-example frozen-base reference instead, see below).
+
+KUQ (no context) and SQuAD (long context) sit in genuinely different regions
+of late-layer hidden space — `||μ⁻_kuq − μ⁻_squad||` ≈ 50–85 across layers —
+so a single grand-mean pole would miss each domain's true location.
 
 ## Loss (step 4)
 
-LoRA adapter `δθ` on `f_θ`. Two components, both projection-distance
-terms along the same subspace `V`, averaged over late layers `{l}` and
-the `K=8`-position window `T(x) = {p_len − 1, …, p_len + K − 2}` defined
-above. The forget side uses a **hinge** at the data-derived margin
-`m²_l(d)` so that once an example is inside its domain's natural abstain
-region, no further pull is applied:
+LoRA adapter `δθ` on `f_θ`. Two components, both projection-distance terms
+along the **per-domain** subspace `V(d_x)`, averaged over late layers `{l}`
+and the `K=8`-position window `T(x) = {p_len − 1, …, p_len + K − 2}` defined
+above:
 
 ```
 L = L_forget + λ · L_retain
 
-L_forget = E_{(x, y) ∈ D_F}            ⟨ relu( ‖ V_lᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)) ‖² − m²_l(d_x) ) ⟩_{l, t}
+L_forget   = E_{(x,y) ∈ D_F}     ⟨ ‖ V_l(d_x)ᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)         ) ‖² ⟩_{l, t}  / s(d_x)
 
-L_retain = E_{(x, y) ∈ D_R_A ∪ D_R_G}  ⟨        ‖ V_lᵀ (h_l(x, y; θ+δθ) − τ_l(x, y)) ‖²                 ⟩_{l, t}
+L_retain^C = E_{(x,y) ∈ D_R_A}   ⟨ ‖ V_l(d_x)ᵀ (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t}  / s(d_x)
 
-τ_l(x, y) = μ_l⁺(d_x)             if (x, y) ∈ D_R_A     (legitimate commitment, per-domain)
-          = h_l(x, y; θ_frozen)   if (x, y) ∈ D_R_G     (general utility, per-token frozen reference)
+L_retain^E = E_{(x,y) ∈ D_R_G}   ½ Σ_{d ∈ {kuq, squad}}
+                                    ⟨ ‖ V_l(d)ᵀ   (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t} / s(d)
 
-d_x ∈ {kuq, squad} is the source dataset of example x. V is shared across
-domains; the poles μ⁻(d), μ⁺(d) and the forget margin m²(d) are per-domain.
+L_retain   = ½ ( L_retain^C + L_retain^E )
+
+s(d) = mean_l OC_proj(V_l(d))     (per-domain init scale; "domain-equalised pressure")
+
+d_x ∈ {kuq, squad} is the source dataset of example x. V(d), μ⁻(d), s(d)
+are all per-domain. UltraChat (D_R_G) has no domain so retain-general
+preservation is averaged across both V_kuq and V_squad — any direction
+the forget pull acts on must be preserved on retain-general inputs.
 ```
 
-**Why the hinge.** Without it the forget term keeps producing positive
-gradient even after an example has reached the abstain region — and those
-continued LoRA updates spill over to non-targeted residual streams
-(notably `p_len − 1`, which controls first-token generation), producing
-degenerate / empty completions at inference. The hinge caps the pull at
-the natural variance of real abstain examples (`m²_l(d)`); no new
-hyperparameter, no new loss term.
+**Why `s(d)`.** Each domain's V is built independently in step 2 and
+captures its own discriminative signal. Domains with weaker intrinsic
+signal (here SQuAD: `OC/LC ≈ 5.4×` vs KUQ: `13.7×`) have correspondingly
+smaller `OC_proj(V(d))`, so without normalisation their forget loss
+starts at a smaller value and contributes less optimisation pressure.
+Dividing by `s(d) = mean_l OC_proj(V_l(d))` makes both domains start at
+`L_forget(d) ≈ 1.0`, equalising forget pressure across domains. This is
+mathematically equivalent to rescaling each `V(d)` to unit
+`OC_proj`-norm; it preserves the projection direction and only changes
+how the squared distance is *weighted* in the batch average.
 
-**Why retain has no margin.** Retain is *anchor-preserving* — its goal is
-to keep C / E examples *exactly* where they already sit (μ⁺(d) for C, the
-frozen reference for E). A non-zero margin there would let the LoRA
-slowly drift legitimate behaviour off-pole within m². Retain stays a
-plain squared distance.
+**Why retain uses a frozen-base reference, not μ⁺(d).** A pole-style anchor
+(`μ⁺(d)`) is a *cluster-mean* target: many retain examples can collectively
+drift, and the loss only measures the cluster's variance. The frozen-base
+reference is a *per-example, per-token* target: each retain example pays a
+sharp price for any drift on its own activation. This is a strict "do not
+move from where you started" force per example, which is the symmetric
+counterpart to the strong per-example "change behaviour" force in
+`L_forget`. Empirically this asymmetry (per-example forget vs. per-cluster
+retain) was what produced empty / degenerate completions in earlier runs;
+making both sides per-example fixes it.
 
 Effect, by category:
 
 | Category | Forward inputs | Anchor target | Effect |
 |---|---|---|---|
-| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻(d_x)` with hinge `m²_l(d_x)` | pulled toward legitimate abstention in own domain, until inside the natural abstain region |
-| B (legit-abstain)       | not trained on directly           | —                              | preserved (anchor is fixed)                       |
-| C (legit-commit)        | answerable + gold answer          | `μ⁺(d_x)` (per-domain C-pole)  | held in place at own-domain commit pole           |
-| D (over-abstain)        | not trained on directly           | —                              | not encouraged (no path to D)                     |
-| E (general utility)     | UltraChat (prompt, response)      | `h_l^ref` per token            | held at frozen-base reference                     |
+| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻(d_x)` along `V(d_x)`        | pulled toward legitimate abstention in own domain, measured along own-domain decision direction |
+| B (legit-abstain)       | not trained on directly           | —                                | preserved (anchor is fixed)                       |
+| C (legit-commit)        | answerable + gold answer          | `h_l^frozen(x, y)` along `V(d_x)`| held at own frozen-base activation, per-token   |
+| D (over-abstain)        | not trained on directly           | —                                | not encouraged (no path to D)                     |
+| E (general utility)     | UltraChat (prompt, response)      | `h_l^frozen(x, y)` along avg V(d)| held at own frozen-base activation, per-token, in both V_kuq and V_squad |
 
 LoRA on `{q,k,v,o,up,down,gate}_proj`; base weights frozen.
 
@@ -195,7 +222,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 ├── step3_build_anchors/
 │   ├── build_anchors.py
 │   └── data/
-│       └── anchors_<model>.pt              μ⁻(d), μ⁺(d), m²(d) for d ∈ {kuq, squad}
+│       └── anchors_<model>.pt              μ⁻(d), μ⁺(d) for d ∈ {kuq, squad} (μ⁺ kept as diagnostic)
 │
 ├── step4_train/
 │   ├── train.py
@@ -275,20 +302,30 @@ python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs
 ## Why this design
 
 - **Two components, one geometry.** Forget and retain are both
-  projection-distance terms along the same subspace `V`, just with different
-  targets. One coefficient `λ` controls the trade-off; nothing else.
-- **Margin without a hyperparameter.** The forget hinge `m²_l(d)` is the
-  V-projected variance of legitimate abstention around its own pole — a
-  geometric constant computed once in step 3. It encodes "you are inside
-  the abstain region as defined by *real* abstain data" and prevents the
-  forget term from over-pulling activations past their natural target,
-  which is the failure mode that produced empty completions.
+  projection-distance terms along the same per-domain subspace `V(d)`, just
+  with different targets. One coefficient `λ` controls the trade-off;
+  nothing else.
+- **Per-domain everything.** The two answerability conditions (no-context
+  KUQ vs. with-context SQuAD) live in genuinely different regions of
+  late-layer hidden space and have different decision directions. The
+  abstention template (`y_⊥(d)`), the abstain pole (`μ⁻(d)`), the
+  discriminative subspace (`V(d)`), and the per-domain init scale `s(d)`
+  are all built per-domain so the forget pull is *natural* in each domain
+  — short, behaviorally-aligned, measured along that domain's own decision
+  axis, and equally weighted regardless of intrinsic signal magnitude.
+- **Per-example retain, not per-cluster retain.** The retain loss anchors
+  each legit-commit (C) and general-utility (E) example to its **own
+  frozen-base activation** at every (layer, token) position. Unlike a
+  pole-style mean target, this gives a strong, specific gradient against
+  drift on each example. This per-example symmetry between forget (change)
+  and retain (preserve) is what prevents the LoRA from finding degenerate
+  solutions that collapse first-token logits to a chat-end token.
 - **Categories drive ablations.** Each piece of the loss is named by which
-  behaviour it is moving (A, C, E) and which anchor it is moving toward
-  (B-pole + margin, C-pole, frozen ref). Drop μ⁻ → "no abstain pole".
-  Set m² = 0 → "plain squared forget loss" (the over-pulling baseline).
-  Drop μ⁺ → "no commit pole". Set rank `r=0` → "no subspace". Each
-  ablation removes exactly one geometric component.
+  behaviour it is moving (A) or holding (C, E) and which anchor it uses
+  (μ⁻(d), frozen-base reference). Drop μ⁻ → "no abstain pole". Drop
+  per-domain V → "shared compromise direction". Set rank `r=0` → "no
+  subspace". Replace frozen-base retain with μ⁺(d) → "cluster-anchor
+  retain". Each ablation removes exactly one geometric component.
 - **Per-step folders, per-step data.** Every script's inputs and outputs
   are located in predictable paths; outputs of step `k` live under
   `step_k/data/` and downstream steps reach back through `config.py`
