@@ -73,6 +73,7 @@ from config import (
     MODEL_REGISTRY,
     REPO_ROOT,
     SQUAD_PROMPT_TEMPLATE,
+    domain_of,
 )
 
 load_dotenv(REPO_ROOT / ".env")
@@ -235,9 +236,10 @@ def build_unanswerable_prompt(dataset: str, row: dict) -> str:
     """Reconstruct the prompt used at mining time for forget rows."""
     if "generation_prompt" in row and row["generation_prompt"]:
         return row["generation_prompt"]
-    if dataset == "kuq":
+    domain = domain_of(dataset)
+    if domain == "kuq":
         return KUQ_PROMPT_TEMPLATE.format(question=row["question"])
-    if dataset == "squad":
+    if domain == "squad":
         return SQUAD_PROMPT_TEMPLATE.format(
             question=row["question"], context=row.get("context", ""),
         )
@@ -246,9 +248,10 @@ def build_unanswerable_prompt(dataset: str, row: dict) -> str:
 
 def build_answerable_prompt(dataset: str, row: dict) -> str:
     """Build the prompt for retain-answerable QA rows."""
-    if dataset == "kuq":
+    domain = domain_of(dataset)
+    if domain == "kuq":
         return KUQ_PROMPT_TEMPLATE.format(question=row["question"])
-    if dataset == "squad":
+    if domain == "squad":
         return SQUAD_PROMPT_TEMPLATE.format(
             question=row["question"], context=row.get("context", ""),
         )

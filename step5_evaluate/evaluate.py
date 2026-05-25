@@ -697,9 +697,13 @@ def parse_args() -> argparse.Namespace:
                    help="Greedy decode cap for the answerability eval.")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap answerability eval to N rows per dataset (smoke).")
-    p.add_argument("--datasets", nargs="+", choices=["kuq", "squad"],
+    p.add_argument("--datasets", nargs="+",
+                   choices=list(cfg.DOMAIN_OF.keys()),
                    default=["kuq", "squad"],
-                   help="Which answerability datasets to evaluate (default: both).")
+                   help="Which answerability datasets to evaluate "
+                        "(default: kuq + squad — the two trained domains). "
+                        "Other held-out sets registered in config.DOMAIN_OF: "
+                        "selfaware, falseqa, qaqa, faitheval, musique.")
     p.add_argument("--max-response-tokens", type=int, default=DEFAULT_MAX_RESPONSE_TOKENS,
                    help=f"Cap UltraChat response token length (default {DEFAULT_MAX_RESPONSE_TOKENS}).")
     p.add_argument("--max-ppl-rows", type=int, default=None,

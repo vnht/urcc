@@ -113,11 +113,39 @@ ABSTAIN_TEMPLATE_PER_DATASET = {
 ABSTAIN_TEMPLATE = ABSTAIN_TEMPLATE_PER_DATASET["kuq"]
 
 
+# Map every dataset name to one of the two trained domains so prompt builders,
+# abstain templates, and per-domain V/μ⁻ can all be looked up generically.
+# "kuq"   = no-context (KUQ_PROMPT_TEMPLATE)
+# "squad" = with-context (SQUAD_PROMPT_TEMPLATE)
+#
+# The two trained domains map to themselves. Held-out / unseen datasets added
+# in step 5 are registered here so evaluate.py can route them without changes
+# to its prompt-building code path.
+DOMAIN_OF: dict[str, str] = {
+    # Trained domains
+    "kuq":       "kuq",
+    "squad":     "squad",
+    # New held-out, no-context
+    "selfaware": "kuq",
+    "falseqa":   "kuq",
+    "qaqa":      "kuq",
+    # New held-out, with-context
+    "faitheval": "squad",
+    "musique":   "squad",
+}
+
+
+def domain_of(dataset: str | None) -> str:
+    """Return the trained domain ('kuq' | 'squad') for a dataset name."""
+    key = str(dataset or "").lower()
+    return DOMAIN_OF.get(key, key)
+
+
 def abstain_template_for(dataset: str | None) -> str:
-    """Return the abstention template aligned to the row's dataset.
-    Falls back to the KUQ generic template if the dataset is unknown.
+    """Return the abstention template aligned to the row's dataset domain.
+    Falls back to the KUQ generic template if the domain is unknown.
     """
-    return ABSTAIN_TEMPLATE_PER_DATASET.get(str(dataset or "").lower(), ABSTAIN_TEMPLATE)
+    return ABSTAIN_TEMPLATE_PER_DATASET.get(domain_of(dataset), ABSTAIN_TEMPLATE)
 
 
 # ── Method defaults ───────────────────────────────────────────────────────────
