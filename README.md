@@ -2,7 +2,7 @@
 
 Self-contained pipeline that unlearns **over-commitment** (confidently
 answering inputs that should be abstained from) by anchoring late-layer
-hidden states along a behaviorally-discriminative subspace `V`.
+hidden states along a behaviorally-discriminative subspace `V`..
 
 ## Vocabulary
 
