@@ -262,101 +262,101 @@ model.
 
 | Requirement | Observed | Verdict |
 |-------------|----------|---------|
-| A low-rank discriminative direction *per domain* where over-commit dominates legit-commit | `OC/LC = 13.7×` in V_kuq, `5.4×` in V_squad; every `γ_k > 0` for `k ≤ 32` | ✓ strong |
-| The two domains' decision directions are genuinely different | 0/32 highly-aligned dims, 14–16/32 near-orthogonal between V_kuq and V_squad | ✓ strong |
-| A target inside each direction to pull A toward          | per-domain `μ⁻(d)`; KUQ and SQuAD μ⁻ poles `52–86` units apart in full hidden space | ✓ strong |
+| A low-rank discriminative direction where over-commit dominates legit-commit | `OC/LC ≈ 4.1–4.3×` per layer; every `γ_k > 0` for `k ≤ 32` | ✓ strong |
+| Per-domain abstain target inside that direction to pull A toward | `μ⁻(d)` for `d ∈ {kuq, squad}`; KUQ and SQuAD μ⁻ poles `52–86` units apart in full hidden space | ✓ strong |
+| The per-domain abstention text matches the model's natural abstention region | KUQ: `"I do not have enough information…"`; SQuAD: `"The provided context does not contain…"` (chosen from base abstentions); per-domain template widened μ⁻ separation by ~+60% over a shared template | ✓ explicit |
 | Per-example preservation reference for retain (no cluster-mean drift) | frozen-base activation `h_l(x, y; θ_frozen)` for every retain example, per-token | ✓ strong |
-| Headroom so the pull doesn't damage E (UltraChat)        | `OC_proj / E_proj ≈ 1.5–4×` per domain (V is whitened against Σ_E so E_proj ≡ 32) | ✓ moderate (E is the watch) |
-| Equal optimisation pressure across domains              | per-domain init scale `s(kuq)=104`, `s(squad)=58`; loss divided by `s(d)` so both domains start at `L_forget ≈ 1.0` | ✓ explicit |
+| Headroom so the pull doesn't damage E (UltraChat) | `OC_proj / E_proj ≈ 2.5–4.3×` (V is whitened against Σ_E so `E_proj ≡ 32`) | ✓ moderate (E is the watch) |
 
 ### Consequence for the loss
 
 ```
 L = L_forget + λ · L_retain
 
-L_forget   = mean_x∈D_F      ⟨ ‖V_l(d_x)⊤ (h_A(x) − μ⁻(d_x)         )‖² ⟩_{l, t∈T(x)} / s(d_x)
-L_retain^C = mean_x∈D_R_A    ⟨ ‖V_l(d_x)⊤ (h_C(x) − h_C^frozen(x)   )‖² ⟩_{l, t∈T(x)} / s(d_x)
-L_retain^E = mean_x∈D_R_G    ½ Σ_d  ⟨ ‖V_l(d)⊤ (h_E(x) − h_E^frozen(x))‖² ⟩_{l, t∈T(x)} / s(d)
+L_forget = mean_x∈D_F             ⟨ ‖V_l⊤ (h_A(x) − μ⁻(d_x)         )‖² ⟩_{l, t∈T(x)} / init_scale
+L_retain = mean_x∈D_R_A ∪ D_R_G   ⟨ ‖V_l⊤ (h(x)   − h^frozen(x)     )‖² ⟩_{l, t∈T(x)} / init_scale
 
-L_retain   = ½ ( L_retain^C + L_retain^E )                  d ∈ {kuq, squad}, d_x = dataset(x)
-s(d)       = mean_l OC_proj(V_l(d))                         (per-domain init scale)
+init_scale = mean_l OC_proj(V_l)              (constant; equalises starting magnitudes only)
+d_x ∈ {kuq, squad}                             (forget pole is per-domain)
 ```
 
-For this model: `s(kuq) ≈ 104`, `s(squad) ≈ 58`. The asymmetry directly
-reflects KUQ's stronger intrinsic discriminative signal (`OC/LC = 13.7×`
-vs SQuAD's `5.4×`). Without per-domain normalisation, KUQ would
-contribute ~1.8× the forget pressure of SQuAD per batch — so SQuAD
-would be under-budgeted purely because its underlying geometry has less
-variance. Dividing by `s(d)` equalises this so both domains start at
-`L_forget(d) ≈ 1.0` and contribute equal optimisation pressure.
+For this model `init_scale ≈ 115.4`. The constant divisor only equalises
+the initial scale of `L_forget` and `L_retain` so they enter the optimiser
+at `O(1)`; it does not change the optimum or the relative weight `λ`.
+Domain structure enters the loss through (a) the per-domain abstention
+template that shaped the contrasts going into V in step 2, and (b) the
+per-domain forget pole `μ⁻(d_x)` selected per example.
 
 Initial-step expectations:
 
-* **`L_forget`.** Each KUQ row is projected through `V_kuq` and pulled toward
-  `μ⁻_kuq`, each SQuAD row through `V_squad` toward `μ⁻_squad`. With per-domain
-  V the projection axis is itself domain-specialised (15/32 dims unique to
-  each domain), so initial loss is a *within-domain* distance along a
-  *within-domain* direction. Initial L_forget magnitude depends on
-  `OC_proj`: ~110 KUQ / ~60 SQuAD per layer.
-* **`L_retain^C`.** Each legit-commit example is anchored to its own frozen-
-  base activation, projected through its domain's `V(d)`. This is a
-  per-example, per-token target — sharp counter-gradient against any drift
-  on a specific retain input. Initial loss = 0 by construction (trainable
-  forward = frozen forward at step 0).
-* **`L_retain^E`.** UltraChat has no domain, so preservation is averaged
-  across both `V_kuq` and `V_squad`: any direction either domain's forget
-  pull acts on must be preserved on retain-general inputs. Initial loss = 0
-  by construction.
+* **`L_forget`.** Each forget example is projected through the shared `V`
+  and pulled toward its own domain's `μ⁻(d_x)`. Initial magnitude is
+  dominated by `OC_proj` per layer (109–137 across L24–L30, 81 at L31),
+  so before normalisation the loss starts at ~the per-layer mean, ≈ 115.
+  After dividing by `init_scale`, `L_forget ≈ 1.0` at step 0.
+* **`L_retain^C` and `L_retain^E`.** Each retain example is anchored to its
+  own frozen-base activation, projected through `V`. Initial loss = 0 by
+  construction (trainable forward = frozen forward at step 0); the loss
+  grows only once the LoRA starts to drift it.
 
 ### Predicted layer roles
 
-* **L24–L26.** Cleanest selectivity for both domains (`OC/LC ≈ 13×` KUQ, `5×`
-  SQuAD). Forget gradient comes with the least collateral on legit-commit
-  drift.
-* **L28–L30.** Largest absolute pole gaps for both domains
-  (`‖μ⁻_kuq − μ⁻_squad‖ ≈ 70–86`). Forget loss has the most signal to drop
-  here.
-* **L31.** Weaker on every metric; useful as a sanity-anchor but not the
-  workhorse layer.
+* **L24–L26.** Highest `OC_proj` (≥ 125) — most forget signal per unit
+  weight update. Lowest `LC_proj` ratio doesn't strictly matter since
+  the retain loss handles legit-commit per-example, but high `OC_proj`
+  here means the forget gradient is well-conditioned.
+* **L28–L30.** Largest absolute pole gaps `‖μ⁻_kuq − μ⁻_squad‖ ≈ 70–86`.
+  Forget loss has the most domain-specific signal here, so the per-domain
+  `μ⁻(d)` switching is most consequential at these layers.
+* **L31.** Lower `OC_proj` (~80) and tighter pole gap (~54). Useful as a
+  sanity-anchor but not the workhorse layer.
 
 ### Predicted step 5 metrics (qualitative)
 
-* **FCR (false-commit rate, unanswerable held-out).** This is what V(d) is
+* **FCR (false-commit rate, unanswerable held-out).** This is what `V` is
   built to suppress. Substantial drop expected on both domains; SQuAD
-  should benefit most relative to the shared-V baseline because V_squad
-  finally captures SQuAD-specific decision directions that the shared V
-  missed.
+  benefits from the per-domain template + per-domain pole because the
+  abstention region the loss now points at (`μ⁻_squad`) is the same
+  region the model naturally enters when given context-grounded
+  unanswerable prompts.
 * **TCR (true-commit rate, answerable held-out).** Should hold within a
   few points of the base model — per-example frozen-base retain anchors
-  provide strong, specific preservation pressure; per-domain V keeps
-  forget pull from leaking into legit-commit territory.
+  provide strong, specific preservation pressure, and the forget pull is
+  measured along a single direction (V) that already had `OC/LC ≈ 4×`
+  selectivity, so legit-commit drift is small.
 * **Empty completions.** Should remain at 0 (a property of the per-example
   frozen-base retain — first-token decisions on every retain example are
-  pinned per-token).
-* **UltraChat preservation.** Should be near-baseline. Retain^E projects
-  through both V(d) and uses frozen-base targets; the LoRA's only path to
-  drift is through directions outside both subspaces, which the loss
-  doesn't constrain — but those directions also don't carry the
-  forget-pull signal, so there's no incentive to drift there.
+  pinned per-token, including the prompt-final position `p_len − 1`).
+* **UltraChat preservation.** Should be near-baseline. Retain^E uses the
+  same shared `V` and frozen-base targets, so any LoRA drift along V on a
+  general prompt is penalised; drift orthogonal to V is unconstrained but
+  also doesn't carry forget-pull pressure, so there's no incentive to
+  drift there.
 
 ### Risks the data flags
 
-* **SQuAD's intrinsic decision direction is weaker than KUQ's** (`OC/LC = 5×`
-  vs `13×`). This is a property of the task, not the method: in-context
-  unanswerability is harder for the model because parametric memory and
-  retrieval prompts pull in opposite directions. Per-domain V gives SQuAD
-  its own axis, but the axis itself has lower selectivity.
+* **SQuAD's contrast is partly entangled with the in-context
+  evidence-vs-memory conflict.** When the gold answer is in the context,
+  the model's parametric memory and retrieval prompts can pull in opposite
+  directions. The per-domain abstention template `"The provided context
+  does not contain information about that."` aligns the abstain pole with
+  the model's natural in-context abstention region, but the underlying
+  contrast still has ~5× rather than ~14× selectivity in domain-restricted
+  diagnostics — i.e., SQuAD is intrinsically harder to unlearn cleanly
+  than KUQ.
 * **Stylistic over-commit ≠ all over-commit.** Σ_OC has lower trace than
   Σ_LC because over-commits are stereotyped. The forget set captures the
-  most obvious cases (KUQ + SQuAD). Real-world over-commit on out-of-domain
-  unanswerable prompts may vary in shapes neither V indexes. Step 5
-  results on the held-out dataset are the test.
-* **Per-domain V doubles the geometry to specify but not the model.** One
-  shared LoRA adapter still has to satisfy two projection objectives
-  simultaneously. This is fine when the two directions don't conflict
-  (15/32 dims orthogonal — they don't compete for the adapter's capacity)
-  but worth verifying that L_forget on both domains drops together during
-  training.
+  most obvious cases (KUQ + SQuAD top-500). Real-world over-commit on
+  out-of-domain unanswerable prompts may vary in shapes V doesn't index.
+  Step 5 results on held-out / OOD evaluations are the test.
+* **One V, two pole regions.** A single `V` has to be useful for both
+  KUQ-style and SQuAD-style commit-vs-abstain decisions. The cross-domain
+  cosine of mean contrasts (+0.805) confirms most of the abstain mode is
+  shared, so a single V is reasonable; the per-domain pole `μ⁻(d)` then
+  picks up the remaining domain-specific localisation. This is the
+  defensible minimal design — additional per-domain machinery (per-domain
+  V, per-domain init scale) was tried in development and did not improve
+  end-to-end metrics beyond this.
 
 ---
 
