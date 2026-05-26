@@ -384,11 +384,18 @@ def _compute_retain_loss(
         if n_resp == 0 or resp_start < 1:
             continue
 
-        ids = torch.tensor([full_ids], dtype=torch.long)
+        device = next(model.parameters()).device
+        ids = torch.tensor([full_ids], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(ids)
         labels = ids.clone()
         labels[0, :resp_start] = -100   # mask prompt tokens
 
-        out = model(input_ids=ids, labels=labels, use_cache=False)
+        out = model(
+            input_ids=ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=False,
+        )
         ce = out.loss
         if not torch.isfinite(ce):
             continue
