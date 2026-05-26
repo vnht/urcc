@@ -1,8 +1,11 @@
 # UOC: Unlearning Over-Commitment
 
 Self-contained pipeline that unlearns **over-commitment** (confidently
-answering inputs that should be abstained from) by anchoring late-layer
-hidden states along a behaviorally-discriminative subspace `V`..
+answering inputs that should be abstained from) with a two-component LoRA
+loss: a geometric forget term that pulls late-layer hidden states along a
+behaviorally-discriminative subspace `V` toward a per-domain abstain pole
+`μ⁻(d)`, and a supervised CE retain term that preserves the model's output
+distribution on legitimate-commit and general-utility inputs..
 
 ## Vocabulary
 
@@ -107,54 +110,71 @@ Per answerability domain `d ∈ {kuq, squad}`:
 ```
 
 The poles are points in 4096-D activation space — they don't depend on V.
-`μ⁻(d)` is the forget target in step 4. `μ⁺(d)` is *no longer used in
-training*; it's kept as a geometric diagnostic confirming `V` separates
-the legit-commit cluster from the legit-abstain cluster (retain on category
-C uses a per-example frozen-base reference instead, see below).
+`μ⁻(d)` is the forget target in step 4. `μ⁺(d)` is *not used in training*;
+it's kept as a geometric diagnostic confirming `V` separates the legit-
+commit cluster from the legit-abstain cluster.
 
 KUQ (no context) and SQuAD (long context) sit in genuinely different regions
 of late-layer hidden space — `||μ⁻_kuq − μ⁻_squad||` ≈ 50–85 across layers —
 so a single grand-mean pole would miss each domain's true location.
 
+Step 3 also computes the **per-domain initial L_forget magnitude**
+
+```
+s(d) = E_{x ∈ D_F[d]} ⟨ ‖ V_lᵀ (h_A(x) − μ_l⁻(d)) ‖² ⟩_l
+```
+
+and saves it alongside the poles. Step 4 divides each forget example by
+its own domain's `s(d)` so KUQ and SQuAD enter the optimiser with equal
+per-example pressure regardless of intrinsic contrast magnitude.
+
 ## Loss (step 4)
 
-LoRA adapter `δθ` on `f_θ`. Two components, both projection-distance terms
-along the shared subspace `V`, averaged over late layers `{l}` and the
-`K=8`-position window `T(x) = {p_len − 1, …, p_len + K − 2}` defined above:
+LoRA adapter `δθ` on `f_θ`. Two components with **role-appropriate signals**:
+
+- `L_forget` is **geometric** — it changes the representation of category A
+  in the discriminative subspace `V` by pulling it toward the per-domain
+  abstain pole `μ⁻(d)`.
+- `L_retain` is **supervised next-token cross-entropy** — it preserves the
+  model's output distribution on retain examples (the gold answer for
+  category C, the natural response for category E). It directly protects
+  the LM head's decisions, which is what determines whether the model
+  abstains or commits at inference time.
 
 ```
 L = L_forget + λ · L_retain
 
-L_forget = E_{(x,y) ∈ D_F}             ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)         ) ‖² ⟩_{l, t}
-L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}   ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t}
+L_forget = E_{(x,y) ∈ D_F}             ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)) ‖² ⟩_{l, t ∈ T(x)} / s(d_x)
+L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}   − ⟨ log p_{θ+δθ}(y_t | x, y_<t) ⟩_{t ∈ y_resp}
 ```
 
 `d_x ∈ {kuq, squad}` is the source dataset of example `x`. The forget pole
-`μ⁻(d_x)` is per-domain so the target lives in the same prompt distribution
-as the example; `V` is shared. Both losses are divided by a constant
-`init_scale = mean_l OC_proj(V_l)` so they start at `O(1)` (it does not
-change the optimum or `λ`, only the effective learning rate).
+`μ⁻(d_x)` is per-domain; `V` is shared; `s(d_x)` is the per-domain initial
+forget magnitude (a constant from data, not a hyperparameter). `T(x)` is
+the K-token transition window from above. `y_resp` is the response span:
+the gold answer for D_R_A, the natural UltraChat response for D_R_G,
+capped at `MAX_RETAIN_RESPONSE_TOKENS`. Prompt tokens are masked from CE
+(`label = −100`) so the loss only fires on response positions.
 
-**Why retain uses a frozen-base reference, not μ⁺(d).** A pole-style anchor
-(`μ⁺(d)`) is a *cluster-mean* target: many retain examples can collectively
-drift, and the loss only measures the cluster's variance. The frozen-base
-reference is a *per-example, per-token* target: each retain example pays a
-sharp price for any drift on its own activation. This is a strict "do not
-move from where you started" force per example, which is the symmetric
-counterpart to the strong per-example "change behaviour" force in
-`L_forget`. Empirically this asymmetry (per-example forget vs. per-cluster
-retain) was what produced empty / degenerate completions in earlier runs;
-making both sides per-example fixes it.
+**Why CE for retain.** A geometric retain term can preserve where activations
+sit in `V`-space, but the final decision (commit vs. abstain) is made by
+the LM head's output distribution. Geometric retain is invariant to drifts
+in that distribution — the head can shift the next-token probability mass
+toward EOS / abstention text while satisfying any geometric anchor. CE
+constrains `p(y_t | x, y_<t)` directly, which is the right preservation
+signal for *behavioural* unlearning. (V is whitened against `Σ_E` in step 2,
+so the forget pull along `V` already does not push general-utility
+directions; CE on D_R_G is the second line of defence.)
 
 Effect, by category:
 
-| Category | Forward inputs | Anchor target | Effect |
+| Category | Training inputs | Loss target | Effect |
 |---|---|---|---|
-| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻(d_x)` along `V`         | pulled toward legitimate abstention in its own domain |
-| B (legit-abstain)       | not trained on directly           | —                            | preserved (anchor is fixed)                          |
-| C (legit-commit)        | answerable + gold answer          | `h_l^frozen(x, y)` along `V` | held at own frozen-base activation, per-token       |
-| D (over-abstain)        | not trained on directly           | —                            | not encouraged (no path to D)                        |
-| E (general utility)     | UltraChat (prompt, response)      | `h_l^frozen(x, y)` along `V` | held at own frozen-base activation, per-token       |
+| A (over-commit)        | unanswerable + over-commit prefix | `μ⁻(d_x)` along `V`     | pulled toward legitimate abstention in its own domain |
+| B (legit-abstain)      | not trained on directly           | —                        | preserved (μ⁻(d) is a fixed target)                  |
+| C (legit-commit)       | answerable + gold answer          | gold-answer tokens (CE) | answer distribution held at the gold |
+| D (over-abstain)       | not trained on directly           | —                        | not encouraged (no path to D)                        |
+| E (general utility)    | UltraChat (prompt, response)      | response tokens (CE)    | next-token distribution held at the natural response |
 
 LoRA on `{q,k,v,o,up,down,gate}_proj`; base weights frozen.
 
@@ -197,7 +217,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 ├── step3_build_anchors/
 │   ├── build_anchors.py
 │   └── data/
-│       └── anchors_<model>.pt              μ⁻(d), μ⁺(d) for d ∈ {kuq, squad} (μ⁺ kept as diagnostic)
+│       └── anchors_<model>.pt              μ⁻(d), μ⁺(d), s(d) for d ∈ {kuq, squad} (μ⁺ diagnostic)
 │
 ├── step4_train/
 │   ├── train.py
@@ -227,7 +247,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 | 0    | `step0_mine/mine.py`                      | `step0_mine/data/sampled/{kuq,squad}_unanswerable.jsonl`                 | `step0_mine/data/{mined,forget}/<model>_<dataset>.jsonl`            |
 | 1    | `step1_extract_activations/extract.py`    | `step0_mine/data/{forget,sampled}/`                                      | `step1_extract_activations/data/activations_<model>.pt`             |
 | 2    | `step2_build_subspace/build_subspace.py`  | `step1_extract_activations/data/activations_<model>.pt`                  | `step2_build_subspace/data/subspace_<model>_r<rank>.pt`             |
-| 3    | `step3_build_anchors/build_anchors.py`    | `step1_extract_activations/data/activations_<model>.pt`                  | `step3_build_anchors/data/anchors_<model>.pt`                       |
+| 3    | `step3_build_anchors/build_anchors.py`    | `step1_extract_activations/`, `step2_build_subspace/` outputs            | `step3_build_anchors/data/anchors_<model>.pt`                       |
 | 4    | `step4_train/train.py`                    | `step0_mine/`, `step2_*/`, `step3_*/` outputs                            | `step4_train/data/runs/<run_name>/`                                 |
 | 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/{kuq,squad,ultrachat}.jsonl`                | `step5_evaluate/data/results/<name>/{kuq,squad,ultrachat}.json` (one JSON per dataset, metrics + per-row + baseline deltas) |
 
@@ -240,7 +260,7 @@ python3 step0_mine/mine.py                       --model qwen_instruct
 # Steps 1–3 — build the subspace and anchors (one-time, per model)
 python3 step1_extract_activations/extract.py     --model qwen_instruct
 python3 step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 32
-python3 step3_build_anchors/build_anchors.py     --model qwen_instruct
+python3 step3_build_anchors/build_anchors.py     --model qwen_instruct --rank 32
 
 # Step 5 (baseline first) — zero-shot reference
 # Runs answerability (KUQ + SQuAD) AND UltraChat perplexity in one model load.
@@ -264,7 +284,7 @@ python3 step4_train/plot_training.py             step4_train/data/runs/<run_name
 python3 step0_mine/mine.py                       --model qwen_instruct --max-per-dataset 50
 python3 step1_extract_activations/extract.py     --model qwen_instruct --max-per-set 200
 python3 step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 16
-python3 step3_build_anchors/build_anchors.py     --model qwen_instruct
+python3 step3_build_anchors/build_anchors.py     --model qwen_instruct --rank 16
 python3 step5_evaluate/evaluate.py               --model qwen_instruct \
     --max-per-dataset 100 --max-ppl-rows 100
 python3 step4_train/train.py                     --model qwen_instruct \
@@ -276,28 +296,34 @@ python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs
 
 ## Why this design
 
-- **Two components, one geometry.** Forget and retain are both
-  projection-distance terms along the same shared subspace `V`, just with
-  different targets. One coefficient `λ` controls the trade-off; nothing else.
-- **Per-domain abstention template and pole.** The two answerability
-  conditions (no-context KUQ vs. with-context SQuAD) live in genuinely
-  different regions of late-layer hidden space and abstain in genuinely
-  different ways. The abstention template `y_⊥(d)` and the abstain pole
-  `μ⁻(d)` are per-domain so the forget pull is *natural* in each domain —
-  short, behaviorally-aligned, and the model's path to abstain at inference
-  matches the path the loss trained it on.
-- **Per-example retain, not per-cluster retain.** The retain loss anchors
-  each legit-commit (C) and general-utility (E) example to its **own
-  frozen-base activation** at every (layer, token) position. Unlike a
-  pole-style mean target, this gives a strong, specific gradient against
-  drift on each example. This per-example symmetry between forget (change)
-  and retain (preserve) is what prevents the LoRA from finding degenerate
-  solutions that collapse first-token logits to a chat-end token.
+- **Role-appropriate losses.** Forget is geometric because *changing*
+  behaviour is naturally formulated as moving the representation along a
+  discriminative direction (`V` toward `μ⁻(d)`). Retain is supervised CE
+  because *preserving* behaviour is naturally formulated as keeping the
+  output token distribution unchanged — the LM head's decisions are what
+  matters at inference. Two terms, one λ, each in the right space for its
+  job.
+- **Per-domain abstention template, pole, and init scale.** The two
+  answerability conditions (no-context KUQ vs. with-context SQuAD) live in
+  genuinely different regions of late-layer hidden space and abstain in
+  genuinely different ways. The abstention template `y_⊥(d)`, the abstain
+  pole `μ⁻(d)`, and the per-domain initial forget magnitude `s(d)` are all
+  per-domain so the forget pull is natural in each domain — short,
+  behaviorally-aligned, and equally weighted regardless of intrinsic
+  contrast magnitude.
+- **CE retain as the right preservation signal.** Geometric retain anchors
+  hidden states; CE retain anchors output distributions. The diagnosed
+  failure mode of pure-geometric retain is that the LoRA can shift LM-head
+  logits toward EOS / abstention while still satisfying any geometric
+  anchor, producing empty completions and false abstentions on retain
+  inputs. CE on response tokens fixes that directly; geometric retain
+  cannot, at any λ.
 - **Categories drive ablations.** Each piece of the loss is named by which
-  behaviour it is moving (A) or holding (C, E) and which anchor it uses
-  (μ⁻(d), frozen-base reference). Drop μ⁻(d) → "no abstain pole". Set rank
-  `r=0` → "no subspace". Replace frozen-base retain with μ⁺(d) → "cluster-
-  anchor retain". Each ablation removes exactly one geometric component.
+  behaviour it is moving (A) or holding (C, E) and which anchor it uses.
+  Drop `μ⁻(d)` → "no abstain pole". Set rank `r=0` → "no subspace". Drop
+  `s(d)` → "shared init scale". Replace CE retain with geometric retain →
+  "geometric-only retain". Drop CE on D_R_G → "no general-utility
+  preservation". Each ablation removes exactly one component.
 - **Per-step folders, per-step data.** Every script's inputs and outputs
   are located in predictable paths; outputs of step `k` live under
   `step_k/data/` and downstream steps reach back through `config.py`
