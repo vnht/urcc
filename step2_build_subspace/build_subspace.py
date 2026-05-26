@@ -1,29 +1,44 @@
 #!/usr/bin/env python3
-"""Step 2 — Build the discriminative commitment subspace V.
+"""Step 2 — Build the per-domain discriminative commitment subspaces V(d).
 
-For each late layer l, solve the generalised eigenproblem in the
-general-utility span:
+For each domain d ∈ {kuq, squad} and each late layer l, solve the generalised
+eigenproblem in the general-utility span using only domain-d contrasts:
 
-    (Σ_OC - Σ_LC) v = γ · Σ_E v
+    (Σ_OC(d) - Σ_LC(d)) v = γ · Σ_E v
 
 where
-    Σ_OC = cov(c_OC)   c_OC = h_A − h_B   (over-commit minus its abstain baseline)
-    Σ_LC = cov(c_LC)   c_LC = h_C − h_D   (legit-commit minus its abstain baseline)
-    Σ_E  = cov(h_E)                       (general utility)
+    Σ_OC(d) = cov(c_OC | dataset==d)   c_OC = h_A − h_B
+    Σ_LC(d) = cov(c_LC | dataset==d)   c_LC = h_C − h_D
+    Σ_E     = cov(h_E)                 (general utility — domain-shared)
 
-V_l ∈ ℝ^{D × r} are the top-r generalised eigenvectors. Large positive γ ⇒
-direction along which over-commit varies more than legitimate-commit (after
-subtracting the shared abstain-mode baseline), normalised against general
-utility. V is shared across answerability domains; the per-domain
-specialisation lives in step 3 (per-domain abstain pole μ⁻(d)) and in the
-per-domain abstain templates used to build h_B and h_D in step 1.
+V_l(d) ∈ ℝ^{D × r} are the top-r generalised eigenvectors for domain d. Large
+positive γ ⇒ direction along which over-commit varies more than legitimate-
+commit (after subtracting the shared abstain-mode baseline), normalised
+against general utility.
+
+Why per-domain V (with CE retain)
+---------------------------------
+KUQ (no-context) and SQuAD (with-context) prompts sit in different regions of
+late-layer hidden-state space and have different commitment-vs-abstention
+decision directions. A shared V is a compromise basis dominated by whichever
+domain has the stronger contrast (KUQ at OC/LC≈14× vs SQuAD at OC/LC≈5×).
+Empirically V_kuq and V_squad share zero highly-aligned dimensions and
+≈half their basis is near-orthogonal — they are genuinely different bases.
+
+V is used only by L_forget in step 4 (retain is CE on response tokens, no V).
+There is no V/retain interaction, so per-domain V here is a pure isolation
+of the two forget regions.
 
 Reads:  step1_extract_activations/data/activations_<model>.pt
 Writes: step2_build_subspace/data/subspace_<model>_r<rank>.pt with keys:
     "model_key", "layers", "rank", "ridge", "retain_basis_rank",
-    "V":           tensor[L, D, r]
-    "gamma":       tensor[L, r]
-    "diag":        list per-layer projection diagnostics
+    "datasets":    ["kuq", "squad"]
+    "V_per":       dict[str, tensor[L, D, r]]   per-domain subspaces (training target)
+    "gamma_per":   dict[str, tensor[L, r]]      per-domain eigenvalues
+    "diag_per":    dict[str, list]              per-domain layer diagnostics
+    "V":           tensor[L, D, r]              grand-mixed (legacy / ablation)
+    "gamma":       tensor[L, r]                 grand-mixed (legacy)
+    "diag":        list                          grand-mixed (legacy)
 
 Run
 ---
@@ -118,6 +133,67 @@ def _solve_layer(
 
 # ── Driver ────────────────────────────────────────────────────────────────────
 
+DOMAINS = ("kuq", "squad")
+
+
+def _datasets_for(bundle: dict, hidden_key: str) -> list[str]:
+    """Per-row dataset labels aligned to bundle[hidden_key]; falls back to
+    the sibling meta when set was extracted from the same row pool (B↔A, D↔C).
+    """
+    n = bundle[hidden_key].shape[0]
+    set_letter = hidden_key.split("_")[-1]   # "h_B" -> "B"
+    meta_key   = f"meta_{set_letter}"
+    fallback   = {"B": "meta_A", "D": "meta_C"}.get(set_letter)
+    meta = bundle.get(meta_key) or (bundle.get(fallback) if fallback else None)
+    if not meta or len(meta) != n:
+        raise RuntimeError(
+            f"Cannot align dataset labels for {hidden_key}: "
+            f"len(meta)={len(meta) if meta else 0} != n_rows={n}. "
+            f"Re-run step 1 with the latest extract.py."
+        )
+    return [str(m.get("dataset") or "?") for m in meta]
+
+
+def _build_one_subspace(
+    *, c_OC: torch.Tensor, c_LC: torch.Tensor, h_E: torch.Tensor,
+    layers: list[int], rank: int, ridge: float, retain_basis_rank: int,
+    label: str,
+) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
+    """Solve the per-layer eigenproblem for one (filtered) contrast set."""
+    log.info("")
+    log.info("  [%s]  N_OC=%d  N_LC=%d  N_E=%d", label,
+             c_OC.shape[0], c_LC.shape[0], h_E.shape[0])
+    log.info("  %-8s %10s %10s %10s %10s %10s %8s",
+             "layer", "γ_1", f"γ_{rank}", "OC_proj", "LC_proj", "E_proj", "secs")
+    log.info("  " + "-" * 78)
+
+    V_layers, gamma_layers, diag_per_layer = [], [], []
+    for li, layer_idx in enumerate(layers):
+        layer_t0 = time.time()
+        OC = c_OC[:, li, :].numpy().astype(np.float64)
+        LC = c_LC[:, li, :].numpy().astype(np.float64)
+        E  = h_E [:, li, :].numpy().astype(np.float64)
+        out = _solve_layer(OC, LC, E, rank=rank, ridge=ridge,
+                           retain_basis_rank=retain_basis_rank)
+        V_layers.append(torch.tensor(out["V"], dtype=torch.float32))
+        gamma_layers.append(torch.tensor(out["gamma"], dtype=torch.float32))
+        diag_per_layer.append({"layer": layer_idx, **out["diag"]})
+
+        log.info("  L%-7d %10.4f %10.4f %10.4f %10.4f %10.4f %8.2f",
+                 layer_idx,
+                 float(out["gamma"][0]),
+                 float(out["gamma"][min(rank - 1, len(out["gamma"]) - 1)]),
+                 out["diag"]["OC_proj"],
+                 out["diag"]["LC_proj"],
+                 out["diag"]["E_proj"],
+                 time.time() - layer_t0)
+    return (
+        torch.stack(V_layers, dim=0),       # (L, D, rank)
+        torch.stack(gamma_layers, dim=0),   # (L, rank)
+        diag_per_layer,
+    )
+
+
 def run(model_key: str, rank: int, ridge: float, retain_basis_rank: int,
         overwrite: bool = False) -> Path:
     pipeline_t0 = time.time()
@@ -145,42 +221,45 @@ def run(model_key: str, rank: int, ridge: float, retain_basis_rank: int,
     if min(h_A.shape[0], h_C.shape[0], h_E.shape[0]) == 0:
         raise RuntimeError("Empty activation set(s). Check step 1 output.")
 
-    c_OC = h_A - h_B          # (N_F, L, D)   over-commit contrast
-    c_LC = h_C - h_D          # (N_A, L, D)   legit-commit contrast
+    c_OC = h_A - h_B
+    c_LC = h_C - h_D
+
+    ds_OC = _datasets_for(bundle, "h_A")
+    ds_LC = _datasets_for(bundle, "h_C")
 
     log.info("STEP 2 — BUILD SUBSPACE  model=%s  rank=%d  ridge=%.0e  retain_basis_rank=%d",
              model_key, rank, ridge, retain_basis_rank)
-    log.info("  N_OC=%d  N_LC=%d  N_E=%d  L=%d  D=%d",
+    log.info("  total: N_OC=%d  N_LC=%d  N_E=%d  L=%d  D=%d",
              c_OC.shape[0], c_LC.shape[0], h_E.shape[0],
              c_OC.shape[1], c_OC.shape[2])
-    log.info("")
-    log.info("  %-8s %10s %10s %10s %10s %10s %8s",
-             "layer", "γ_1", f"γ_{rank}", "OC_proj", "LC_proj", "E_proj", "secs")
-    log.info("  " + "-" * 78)
+    log.info("  domains: OC=%s   LC=%s",
+             {d: sum(1 for x in ds_OC if x == d) for d in DOMAINS},
+             {d: sum(1 for x in ds_LC if x == d) for d in DOMAINS})
 
-    V_layers, gamma_layers, diag_per_layer = [], [], []
-    for li, layer_idx in enumerate(layers):
-        layer_t0 = time.time()
-        OC = c_OC[:, li, :].numpy().astype(np.float64)
-        LC = c_LC[:, li, :].numpy().astype(np.float64)
-        E  = h_E [:, li, :].numpy().astype(np.float64)
-        out = _solve_layer(OC, LC, E, rank=rank, ridge=ridge,
-                           retain_basis_rank=retain_basis_rank)
-        V_layers.append(torch.tensor(out["V"], dtype=torch.float32))
-        gamma_layers.append(torch.tensor(out["gamma"], dtype=torch.float32))
-        diag_per_layer.append({"layer": layer_idx, **out["diag"]})
+    # Per-domain subspaces (the training targets used by L_forget)
+    V_per: dict[str, torch.Tensor] = {}
+    gamma_per: dict[str, torch.Tensor] = {}
+    diag_per: dict[str, list[dict]] = {}
+    for d in DOMAINS:
+        oc_idx = [i for i, x in enumerate(ds_OC) if x == d]
+        lc_idx = [i for i, x in enumerate(ds_LC) if x == d]
+        if not oc_idx or not lc_idx:
+            raise RuntimeError(f"No rows for dataset '{d}'. Check step 1 output.")
+        V_d, gamma_d, diag_d = _build_one_subspace(
+            c_OC=c_OC[oc_idx], c_LC=c_LC[lc_idx], h_E=h_E,
+            layers=layers, rank=rank, ridge=ridge,
+            retain_basis_rank=retain_basis_rank, label=f"V_{d}",
+        )
+        V_per[d] = V_d
+        gamma_per[d] = gamma_d
+        diag_per[d] = diag_d
 
-        log.info("  L%-7d %10.4f %10.4f %10.4f %10.4f %10.4f %8.2f",
-                 layer_idx,
-                 float(out["gamma"][0]),
-                 float(out["gamma"][min(rank - 1, len(out["gamma"]) - 1)]),
-                 out["diag"]["OC_proj"],
-                 out["diag"]["LC_proj"],
-                 out["diag"]["E_proj"],
-                 time.time() - layer_t0)
-
-    V_tensor = torch.stack(V_layers, dim=0)        # (L, D, rank)
-    gamma_tensor = torch.stack(gamma_layers, dim=0)
+    # Grand V (legacy / ablation only)
+    V_grand, gamma_grand, diag_grand = _build_one_subspace(
+        c_OC=c_OC, c_LC=c_LC, h_E=h_E, layers=layers,
+        rank=rank, ridge=ridge, retain_basis_rank=retain_basis_rank,
+        label="V_grand (legacy / ablation)",
+    )
 
     out_bundle = {
         "model_key":           model_key,
@@ -189,13 +268,19 @@ def run(model_key: str, rank: int, ridge: float, retain_basis_rank: int,
         "rank":                rank,
         "ridge":               ridge,
         "retain_basis_rank":   retain_basis_rank,
-        "V":                   V_tensor,
-        "gamma":               gamma_tensor,
-        "diag":                diag_per_layer,
+        "datasets":            list(DOMAINS),
+        "V_per":               V_per,
+        "gamma_per":           gamma_per,
+        "diag_per":            diag_per,
+        "V":                   V_grand,
+        "gamma":               gamma_grand,
+        "diag":                diag_grand,
     }
     torch.save(out_bundle, out_path)
     log.info("")
-    log.info("  Saved -> %s   V shape=%s", out_path, list(V_tensor.shape))
+    log.info("  Saved -> %s", out_path)
+    for d in DOMAINS:
+        log.info("    V_%s shape=%s", d, list(V_per[d].shape))
     log.info("STEP 2 done in %s", format_duration(time.time() - pipeline_t0))
     return out_path
 
