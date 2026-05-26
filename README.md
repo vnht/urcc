@@ -73,35 +73,29 @@ activations along.
 
 ## Subspace V (step 2)
 
-For each domain `d ∈ {kuq, squad}` and each late layer `l`, form the
-domain-restricted over-commit and legitimate-commit contrasts:
+For each late layer `l`, form the over-commit and legitimate-commit
+contrasts:
 
 ```
-c_OC(x; d) = h_l(A) − h_l(B)     for x ∈ D_F[d]      (over-commit minus its abstain baseline, dom d)
-c_LC(x; d) = h_l(C) − h_l(D)     for x ∈ D_R_A[d]    (legit-commit minus its abstain baseline, dom d)
+c_OC(x) = h_l(A) − h_l(B)     for x ∈ D_F      (over-commit minus its abstain baseline)
+c_LC(x) = h_l(C) − h_l(D)     for x ∈ D_R_A    (legit-commit minus its abstain baseline)
 ```
 
-Form covariances `Σ_OC(d), Σ_LC(d)` of those contrasts plus the
-domain-shared general-utility covariance `Σ_E = cov(h_l(E))`, and solve
-the generalised eigenproblem in the retain span:
+Form covariances `Σ_OC, Σ_LC` of those contrasts plus the general-utility
+covariance `Σ_E = cov(h_l(E))`, and solve the generalised eigenproblem in
+the retain span:
 
 ```
-(Σ_OC(d) − Σ_LC(d)) v = γ Σ_E v
+(Σ_OC − Σ_LC) v = γ Σ_E v
 ```
 
-`V_l(d) ∈ ℝ^{D × r}` are the top-`r` generalised eigenvectors for domain
-`d`. Large positive `γ` ⇒ direction along which over-commit varies *more*
-than legitimate-commit (after subtracting the shared abstain baseline),
-normalised against general utility. `V_l(d)` is computed once and frozen.
-
-**Why per-domain V.** KUQ and SQuAD have genuinely different commitment-vs-
-abstention decision directions in late-layer space. A shared V mixes the two
-contrasts and is dominated by whichever has the stronger signal (KUQ).
-Empirically, V_kuq and V_squad share zero highly-aligned dimensions
-(cos > 0.9) and roughly half their basis is near-orthogonal (cos < 0.3) — so
-the shared V was forcing both domains through a compromise basis that missed
-half of each domain's decision-relevant directions. Per-domain V is the same
-fix, one level up, that we already apply to the poles.
+`V_l ∈ ℝ^{D × r}` are the top-`r` generalised eigenvectors. Large positive
+`γ` ⇒ direction along which over-commit varies *more* than legitimate-commit
+(after subtracting the shared abstain baseline), normalised against general
+utility. `V_l` is computed once and frozen, and is shared across both
+answerability domains. Domain specialisation lives in the abstention
+template `y_⊥(d)` (which shapes the contrasts going into V) and in the
+per-domain abstain pole `μ⁻(d)` (step 3).
 
 ## Anchors (step 3)
 
@@ -114,7 +108,7 @@ Per answerability domain `d ∈ {kuq, squad}`:
 
 The poles are points in 4096-D activation space — they don't depend on V.
 `μ⁻(d)` is the forget target in step 4. `μ⁺(d)` is *no longer used in
-training*; it's kept as a geometric diagnostic confirming `V(d)` separates
+training*; it's kept as a geometric diagnostic confirming `V` separates
 the legit-commit cluster from the legit-abstain cluster (retain on category
 C uses a per-example frozen-base reference instead, see below).
 
@@ -125,40 +119,21 @@ so a single grand-mean pole would miss each domain's true location.
 ## Loss (step 4)
 
 LoRA adapter `δθ` on `f_θ`. Two components, both projection-distance terms
-along the **per-domain** subspace `V(d_x)`, averaged over late layers `{l}`
-and the `K=8`-position window `T(x) = {p_len − 1, …, p_len + K − 2}` defined
-above:
+along the shared subspace `V`, averaged over late layers `{l}` and the
+`K=8`-position window `T(x) = {p_len − 1, …, p_len + K − 2}` defined above:
 
 ```
 L = L_forget + λ · L_retain
 
-L_forget   = E_{(x,y) ∈ D_F}     ⟨ ‖ V_l(d_x)ᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)         ) ‖² ⟩_{l, t}  / s(d_x)
-
-L_retain^C = E_{(x,y) ∈ D_R_A}   ⟨ ‖ V_l(d_x)ᵀ (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t}  / s(d_x)
-
-L_retain^E = E_{(x,y) ∈ D_R_G}   ½ Σ_{d ∈ {kuq, squad}}
-                                    ⟨ ‖ V_l(d)ᵀ   (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t} / s(d)
-
-L_retain   = ½ ( L_retain^C + L_retain^E )
-
-s(d) = mean_l OC_proj(V_l(d))     (per-domain init scale; "domain-equalised pressure")
-
-d_x ∈ {kuq, squad} is the source dataset of example x. V(d), μ⁻(d), s(d)
-are all per-domain. UltraChat (D_R_G) has no domain so retain-general
-preservation is averaged across both V_kuq and V_squad — any direction
-the forget pull acts on must be preserved on retain-general inputs.
+L_forget = E_{(x,y) ∈ D_F}             ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − μ_l⁻(d_x)         ) ‖² ⟩_{l, t}
+L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}   ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) − h_l(x, y; θ_frozen)) ‖² ⟩_{l, t}
 ```
 
-**Why `s(d)`.** Each domain's V is built independently in step 2 and
-captures its own discriminative signal. Domains with weaker intrinsic
-signal (here SQuAD: `OC/LC ≈ 5.4×` vs KUQ: `13.7×`) have correspondingly
-smaller `OC_proj(V(d))`, so without normalisation their forget loss
-starts at a smaller value and contributes less optimisation pressure.
-Dividing by `s(d) = mean_l OC_proj(V_l(d))` makes both domains start at
-`L_forget(d) ≈ 1.0`, equalising forget pressure across domains. This is
-mathematically equivalent to rescaling each `V(d)` to unit
-`OC_proj`-norm; it preserves the projection direction and only changes
-how the squared distance is *weighted* in the batch average.
+`d_x ∈ {kuq, squad}` is the source dataset of example `x`. The forget pole
+`μ⁻(d_x)` is per-domain so the target lives in the same prompt distribution
+as the example; `V` is shared. Both losses are divided by a constant
+`init_scale = mean_l OC_proj(V_l)` so they start at `O(1)` (it does not
+change the optimum or `λ`, only the effective learning rate).
 
 **Why retain uses a frozen-base reference, not μ⁺(d).** A pole-style anchor
 (`μ⁺(d)`) is a *cluster-mean* target: many retain examples can collectively
@@ -175,11 +150,11 @@ Effect, by category:
 
 | Category | Forward inputs | Anchor target | Effect |
 |---|---|---|---|
-| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻(d_x)` along `V(d_x)`        | pulled toward legitimate abstention in own domain, measured along own-domain decision direction |
-| B (legit-abstain)       | not trained on directly           | —                                | preserved (anchor is fixed)                       |
-| C (legit-commit)        | answerable + gold answer          | `h_l^frozen(x, y)` along `V(d_x)`| held at own frozen-base activation, per-token   |
-| D (over-abstain)        | not trained on directly           | —                                | not encouraged (no path to D)                     |
-| E (general utility)     | UltraChat (prompt, response)      | `h_l^frozen(x, y)` along avg V(d)| held at own frozen-base activation, per-token, in both V_kuq and V_squad |
+| A (over-commit)         | unanswerable + over-commit prefix | `μ⁻(d_x)` along `V`         | pulled toward legitimate abstention in its own domain |
+| B (legit-abstain)       | not trained on directly           | —                            | preserved (anchor is fixed)                          |
+| C (legit-commit)        | answerable + gold answer          | `h_l^frozen(x, y)` along `V` | held at own frozen-base activation, per-token       |
+| D (over-abstain)        | not trained on directly           | —                            | not encouraged (no path to D)                        |
+| E (general utility)     | UltraChat (prompt, response)      | `h_l^frozen(x, y)` along `V` | held at own frozen-base activation, per-token       |
 
 LoRA on `{q,k,v,o,up,down,gate}_proj`; base weights frozen.
 
@@ -302,17 +277,15 @@ python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs
 ## Why this design
 
 - **Two components, one geometry.** Forget and retain are both
-  projection-distance terms along the same per-domain subspace `V(d)`, just
-  with different targets. One coefficient `λ` controls the trade-off;
-  nothing else.
-- **Per-domain everything.** The two answerability conditions (no-context
-  KUQ vs. with-context SQuAD) live in genuinely different regions of
-  late-layer hidden space and have different decision directions. The
-  abstention template (`y_⊥(d)`), the abstain pole (`μ⁻(d)`), the
-  discriminative subspace (`V(d)`), and the per-domain init scale `s(d)`
-  are all built per-domain so the forget pull is *natural* in each domain
-  — short, behaviorally-aligned, measured along that domain's own decision
-  axis, and equally weighted regardless of intrinsic signal magnitude.
+  projection-distance terms along the same shared subspace `V`, just with
+  different targets. One coefficient `λ` controls the trade-off; nothing else.
+- **Per-domain abstention template and pole.** The two answerability
+  conditions (no-context KUQ vs. with-context SQuAD) live in genuinely
+  different regions of late-layer hidden space and abstain in genuinely
+  different ways. The abstention template `y_⊥(d)` and the abstain pole
+  `μ⁻(d)` are per-domain so the forget pull is *natural* in each domain —
+  short, behaviorally-aligned, and the model's path to abstain at inference
+  matches the path the loss trained it on.
 - **Per-example retain, not per-cluster retain.** The retain loss anchors
   each legit-commit (C) and general-utility (E) example to its **own
   frozen-base activation** at every (layer, token) position. Unlike a
@@ -322,10 +295,9 @@ python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs
   solutions that collapse first-token logits to a chat-end token.
 - **Categories drive ablations.** Each piece of the loss is named by which
   behaviour it is moving (A) or holding (C, E) and which anchor it uses
-  (μ⁻(d), frozen-base reference). Drop μ⁻ → "no abstain pole". Drop
-  per-domain V → "shared compromise direction". Set rank `r=0` → "no
-  subspace". Replace frozen-base retain with μ⁺(d) → "cluster-anchor
-  retain". Each ablation removes exactly one geometric component.
+  (μ⁻(d), frozen-base reference). Drop μ⁻(d) → "no abstain pole". Set rank
+  `r=0` → "no subspace". Replace frozen-base retain with μ⁺(d) → "cluster-
+  anchor retain". Each ablation removes exactly one geometric component.
 - **Per-step folders, per-step data.** Every script's inputs and outputs
   are located in predictable paths; outputs of step `k` live under
   `step_k/data/` and downstream steps reach back through `config.py`

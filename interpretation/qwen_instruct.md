@@ -15,7 +15,7 @@ from the saved bundles and what they imply for the training step that follows.
 | Hidden dim `D`       | 4096 |
 | Layer slice (last 25%) | `[24, 25, 26, 27, 28, 29, 30, 31]`  → `L = 8` |
 | Answer-token window `K` | 8 (transition-shifted: `[p_len − 1, p_len + K − 2]`) |
-| Subspace rank `r`    | 32 (per-domain: `V_kuq`, `V_squad`) |
+| Subspace rank `r`    | 32 (shared `V`) |
 | Subspace ridge       | `1e-3` |
 | Retain basis rank    | 512 |
 | Forget templates     | `KUQ_PROMPT_TEMPLATE`, `SQUAD_PROMPT_TEMPLATE` |
@@ -109,8 +109,7 @@ c_LC(x) = h_C(x) − h_D(x)        per-row legit-commit contrast
 between A and B is the same direction that differs between C and D — the
 "commit-vs-abstain mode". The gap below 1.0 is the residual signal that is
 *uniquely about over-committing*. Step 2's eigenproblem
-`(Σ_OC(d) − Σ_LC(d)) v = γ Σ_E v` is built (per-domain) to amplify
-exactly that residual.
+`(Σ_OC − Σ_LC) v = γ Σ_E v` is built to amplify exactly that residual.
 
 ### 2.2 Per-layer covariance traces (proxy for eigen-signal)
 
@@ -137,81 +136,64 @@ L31 contracts sharply (everything drops ~½×). Standard last-layer
 
 ---
 
-## 3. Step 2 — per-domain discriminative subspaces `V(d)`
+## 3. Step 2 — discriminative subspace `V`
 
 `step2_build_subspace/data/subspace_qwen_instruct_r32.pt`,
-`V_per`: `{"kuq": [8, 4096, 32], "squad": [8, 4096, 32]}`.
+`V` shape `[8, 4096, 32]`.
 
-For each domain `d ∈ {kuq, squad}` and each layer, solves the generalized
-eigenproblem on **domain-restricted contrasts** while keeping the
-general-utility covariance shared:
+For each layer, solves the generalized eigenproblem on the cross-domain
+contrasts (KUQ + SQuAD pooled) against the general-utility covariance:
 
 ```
-(Σ_OC(d) − Σ_LC(d)) v = γ (Σ_E + ridge·I) v       picking top r=32 v's
+(Σ_OC − Σ_LC) v = γ (Σ_E + ridge·I) v       picking top r=32 v's
 ```
 
-A legacy grand `V` is also saved (built from KUQ+SQuAD mixed contrasts) for
-backward-compat / ablations, but training uses the per-domain pair.
+`V_l ∈ ℝ^{D × r}` are the top-32 generalised eigenvectors per layer. The
+contrasts that go into Σ_OC and Σ_LC are themselves shaped by the
+**per-domain** abstention template `y_⊥(d)` used to build sets B and D
+in step 1, so domain structure enters V through the data even though V
+itself is shared. Domain specialisation in step 4 lives in the per-domain
+forget pole `μ⁻(d)`, not in the projection axis.
 
-### 3.1 Per-domain spectra
+### 3.1 Per-layer spectrum
 
-| Layer | γ_1(kuq) | γ_1(sq) | OC_proj(kuq) | OC_proj(sq) | LC_proj(kuq) | LC_proj(sq) | OC/LC(kuq) | OC/LC(sq) |
-|------:|---------:|--------:|-------------:|------------:|-------------:|------------:|-----------:|----------:|
-| 24    | 12.42    | 11.32   | 122.34       | 65.50       | 8.92         | 12.25       | **13.72**  | 5.35      |
-| 25    | 12.07    | 11.23   | 118.30       | 62.09       | 8.64         | 11.38       | **13.69**  | 5.45      |
-| 26    | 11.76    | 10.68   | 116.03       | 59.91       | 8.81         | 11.11       | **13.17**  | 5.39      |
-| 27    | 10.42    |  9.81   | 104.55       | 58.63       | 8.03         | 11.02       | **13.01**  | 5.32      |
-| 28    | 10.01    |  9.56   | 102.51       | 57.94       | 7.96         | 10.68       | **12.88**  | 5.43      |
-| 29    |  9.28    |  9.45   |  98.56       | 56.76       | 7.97         | 10.53       | **12.37**  | 5.39      |
-| 30    |  9.49    |  9.23   |  97.57       | 56.98       | 8.07         | 10.60       | **12.09**  | 5.38      |
-| 31    |  6.20    |  7.66   |  68.95       | 46.52       | 6.50         | 10.27       | 10.61      | 4.53      |
+| Layer | γ_1   | γ_32  | OC_proj | LC_proj | E_proj | OC/LC |
+|------:|------:|------:|--------:|--------:|-------:|------:|
+| 24    | 41.02 | 1.04  | 137.25  | 31.88   | 31.91  | 4.30  |
+| 25    | 36.90 | 1.01  | 129.50  | 30.50   | 31.92  | 4.25  |
+| 26    | 36.06 | 0.98  | 125.88  | 29.19   | 31.92  | 4.31  |
+| 27    | 32.41 | 0.91  | 116.18  | 28.64   | 31.93  | 4.06  |
+| 28    | 32.43 | 0.88  | 114.25  | 27.50   | 31.93  | 4.16  |
+| 29    | 31.26 | 0.85  | 109.81  | 26.03   | 31.93  | 4.22  |
+| 30    | 31.78 | 0.85  | 109.60  | 25.88   | 31.93  | 4.24  |
+| 31    | 24.48 | 0.58  |  80.92  | 19.56   | 31.92  | 4.14  |
 
-`E_proj ≈ 31.92` everywhere in both subspaces by construction (V is whitened
-against `Σ_E + ridge·I`, so `tr(V⊤ Σ_E V) ≈ r = 32`). Wall-clock: 5 s.
+`E_proj ≈ 31.92` ≈ `r = 32` everywhere by construction (V is whitened
+against `Σ_E + ridge·I`, so `tr(V⊤ Σ_E V) ≈ r`). Wall-clock: 2 s.
 
-### 3.2 Subspace overlap diagnostic
-
-Principal angles between `V_kuq` and `V_squad` per layer (cosines of the 32
-principal angles between the two rank-32 subspaces):
-
-| Layer | cos_max | cos_min | #cos > 0.9 | #cos < 0.3 |
-|------:|--------:|--------:|-----------:|-----------:|
-| 24    | 0.701   | 0.006   | **0**      | **15**     |
-| 25    | 0.703   | 0.005   | 0          | 15         |
-| 26    | 0.686   | 0.011   | 0          | 16         |
-| 27    | 0.686   | 0.020   | 0          | 16         |
-| 28    | 0.692   | 0.013   | 0          | 15         |
-| 29    | 0.704   | 0.015   | 0          | 14         |
-| 30    | 0.683   | 0.001   | 0          | 14         |
-| 31    | 0.679   | 0.002   | 0          | 15         |
+`init_scale = mean_l OC_proj(V_l) ≈ 115.4` is the constant divisor used
+in step 4 to start both losses at `O(1)`.
 
 ### Reading
 
-* **`OC/LC = 13.7×` for KUQ, `5.4×` for SQuAD.** KUQ has a much sharper
-  decision direction than SQuAD: the "commit vs. abstain" contrast is
-  cleaner without context, while SQuAD's contrast is partly entangled
-  with the in-context evidence-vs-memory conflict (the model's training
-  pulls toward answering even when context says otherwise). This is
-  intrinsic to the two tasks, not a deficiency of the method.
-* **Per-domain V is much more selective than the legacy grand V.** Grand V
-  achieves `OC/LC = 4.3×` (mixed); KUQ alone is **3.2× more selective**
-  inside its own subspace (13.7 vs 4.3) and SQuAD is **1.3× more
-  selective** (5.4 vs 4.3). The shared V was a compromise that under-served
-  both domains, KUQ more so because its stronger contrast was diluted.
-* **`V_kuq` and `V_squad` share zero highly-aligned dimensions** (cos > 0.9)
-  at every layer, and **15–16 of 32 are near-orthogonal** (cos < 0.3). The
-  top shared direction has cosine ≈ 0.70 (a ~45° angle). The two
-  subspaces are genuinely different bases, not minor perturbations of
-  each other.
-* **Roughly half of each subspace is unique to its domain.** The shared V
-  was forcing both domains through a basis that missed ~half of each
-  domain's decision-relevant directions. This is the structural reason
-  per-domain V is needed.
-* **Smooth spectra.** `γ_1 / γ_r=32 ≈ 8 – 14` per domain. No abrupt knee;
-  rank=32 is reasonable for both.
-* **Layer pattern.** L24–L26 lead in selectivity for both domains; L31
-  trails. Same "early late layers carry the behavioural geometry, very
-  last layer is logit-space" pattern.
+* **`OC_proj / LC_proj ≈ 4.1–4.3×` everywhere.** Strong, layer-stable
+  separation. The subspace is built specifically to amplify directions
+  along which over-commit varies more than legit-commit (after subtracting
+  each side's abstain baseline), and the projection diagnostic confirms
+  that on every layer the over-commit cluster spreads ~4× wider in V than
+  the legit-commit cluster.
+* **`OC_proj / E_proj ≈ 2.5–4.3×`.** Headroom against general utility:
+  every direction in V already has `E_proj ≈ 32` by whitening, so the fact
+  that `OC_proj` is 80–137 says the over-commit signal lives in a region
+  of late-layer space that is not just "anywhere general activations vary".
+  This is what the retain loss exploits — moving along V to suppress A is
+  not equivalent to randomly perturbing E.
+* **Smooth spectrum.** `γ_1 / γ_r=32 ≈ 35–42`. No abrupt knee; rank `r=32`
+  is comfortably in the discriminative regime, well clear of the noise
+  floor.
+* **Layer pattern.** L24–L26 lead in `OC_proj` (≥ 125); L31 trails (~80).
+  Standard "early-late layers carry behavioural geometry, last layer
+  collapses into logit space" pattern.
 
 ---
 
@@ -231,7 +213,7 @@ V is just the projection used by the loss in step 4.
 
 `μ⁻(d)` is the forget target in step 4. **`μ⁺(d)` is no longer used in
 training** — it is kept in the anchors bundle as a geometric diagnostic
-confirming that `V(d)` separates the legit-commit cluster from the
+confirming that `V` separates the legit-commit cluster from the
 legit-abstain cluster. The retain side uses a per-example, per-token
 frozen-base reference instead (see §5).
 

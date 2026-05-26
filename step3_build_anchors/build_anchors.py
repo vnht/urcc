@@ -17,9 +17,9 @@ KUQ prompts (no context) and SQuAD prompts (long context) sit in very
 different regions of late-layer hidden-state space. A single mean over both
 yields a blended pole that is well-aligned with neither domain's natural
 abstention or commitment region. Per-domain poles localise the target inside
-the per-domain discriminative subspace V(d) (also built per-domain in step 2)
-so each training example is pulled toward a target that lives in *its own*
-prompt distribution and is measured along *its own* decision direction.
+the shared discriminative subspace V (built once in step 2 from KUQ + SQuAD
+contrasts combined) so each training example is pulled toward a target that
+lives in *its own* prompt distribution.
 
 Note: the poles themselves are points in 4096-D activation space and do not
 depend on V — V is just the projection used by the loss in step 4. So this
