@@ -150,11 +150,10 @@ def abstain_template_for(dataset: str | None) -> str:
 
 # ── Method defaults ───────────────────────────────────────────────────────────
 
-K_ANSWER_TOKENS              = 8     # transition window used by L_forget on D_F
-MAX_RETAIN_RESPONSE_TOKENS   = 128   # CE on retain truncates response at this many tokens
-SUBSPACE_RANK                = 32
-SUBSPACE_RIDGE               = 1e-3
-RETAIN_BASIS_RANK            = 512
+K_ANSWER_TOKENS    = 8
+SUBSPACE_RANK      = 32
+SUBSPACE_RIDGE     = 1e-3
+RETAIN_BASIS_RANK  = 512
 
 LORA_R              = 16
 LORA_ALPHA          = 32
