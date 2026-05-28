@@ -123,15 +123,17 @@ ABSTAIN_TEMPLATE = ABSTAIN_TEMPLATE_PER_DATASET["kuq"]
 # to its prompt-building code path.
 DOMAIN_OF: dict[str, str] = {
     # Trained domains
-    "kuq":       "kuq",
-    "squad":     "squad",
+    "kuq":        "kuq",
+    "squad":      "squad",
     # New held-out, no-context
-    "selfaware": "kuq",
-    "falseqa":   "kuq",
-    "qaqa":      "kuq",
+    "selfaware":  "kuq",
+    "falseqa":    "kuq",
+    "qaqa":       "kuq",
+    "truthfulqa": "kuq",
     # New held-out, with-context
-    "faitheval": "squad",
-    "musique":   "squad",
+    "faitheval":  "squad",
+    "musique":    "squad",
+    "nomiracl":   "squad",
 }
 
 
