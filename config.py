@@ -134,6 +134,7 @@ DOMAIN_OF: dict[str, str] = {
     "faitheval":  "squad",
     "musique":    "squad",
     "nomiracl":   "squad",
+    "alcuna":     "squad",
 }
 
 
