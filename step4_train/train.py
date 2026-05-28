@@ -163,8 +163,9 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
     For backwards-compat with old anchor bundles (no per-domain poles): the
     grand mean is replicated under both keys.
 
-    Per-domain init_scale is computed separately by ``_per_domain_init_scale``
-    (which needs the activations bundle, not the subspace bundle).
+    Per-domain init_scale is read from the subspace bundle (baked in by step 2).
+    For old subspace bundles that don't carry ``init_scales``, this falls back
+    to recomputing from the activations bundle via ``_per_domain_init_scale``.
     """
     sp = cfg.subspace_path(model_key, rank=rank)
     ap = cfg.anchors_path(model_key)
@@ -193,14 +194,20 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
         log.warning("  anchors bundle has no per-domain poles; falling back to grand mean. "
                     "Re-run step 3 to build per-domain anchors.")
 
-    return V_layers, sb["layers"], mu_minus_per, mu_plus_per
+    init_scales = sb.get("init_scales")
+    return V_layers, sb["layers"], mu_minus_per, mu_plus_per, init_scales
 
 
 def _per_domain_init_scale(
     model_key: str,
     V_layers: list[torch.Tensor],
 ) -> dict[str, float]:
-    """Compute the expected step-0 value of L_forget **per dataset domain**.
+    """LEGACY FALLBACK: compute init_scale from the activations bundle.
+
+    Step 2 now bakes ``init_scales`` directly into the subspace bundle, so
+    in normal use ``train()`` reads it from there and this function is not
+    called. It is kept as a fallback for old subspace bundles that pre-date
+    that change and do not carry ``init_scales``.
 
     Matches the actual loss formula
         L_forget_per_ex(x) = ‖V_l⊤ (h_A(x) − μ⁻(d_x))‖²
@@ -556,10 +563,13 @@ def train(args: argparse.Namespace) -> None:
     if not retain_data:
         raise RuntimeError("Retain pool is empty.")
 
-    V_layers, layer_indices, mu_minus_per, mu_plus_per = \
+    V_layers, layer_indices, mu_minus_per, mu_plus_per, init_scales = \
         _load_subspace_and_anchors(model_key, rank=args.rank)
-    init_scales = _per_domain_init_scale(model_key, V_layers)
     log.info("  V layers=%s  rank=%d", layer_indices, args.rank)
+    if init_scales is None:
+        log.warning("  subspace bundle has no baked init_scales; "
+                    "recomputing from activations bundle (re-run step 2 to bake it in)")
+        init_scales = _per_domain_init_scale(model_key, V_layers)
     log.info("  init_scales (per-domain): %s",
              {k: round(v, 2) for k, v in init_scales.items()})
     log.info("  forget pole μ⁻ keys=%s   "

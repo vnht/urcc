@@ -116,6 +116,55 @@ def _solve_layer(
     return {"V": V, "gamma": vals[:rank], "diag": diag}
 
 
+# ── Per-domain init_scale (baked into the subspace bundle) ───────────────────
+
+def _per_domain_init_scale(
+    *,
+    h_A: torch.Tensor,           # (N_F, L, D) — over-commit activations
+    h_B: torch.Tensor,           # (N_F, L, D) — legit-abstain activations
+    meta_A: list[dict],
+    meta_B: list[dict],
+    V_layers: list[torch.Tensor],  # list of L tensors (D, r)
+) -> dict[str, float]:
+    """Per-domain expected step-0 L_forget per example.
+
+    Matches the actual loss formula
+        L_forget_per_ex(x) = ‖V_l⊤ (h_A(x) − μ⁻(d_x))‖²
+    where μ⁻(d) = mean over rows of h_B restricted to domain d.
+
+    Returns ``{"kuq": float, "squad": float, "general": float}`` where
+    ``general`` is the arithmetic mean of the two domain scales (used to
+    normalise category-E loss in step 4, which has no source domain).
+
+    Step 4 reads these values directly from the subspace bundle so it does
+    not need to load the (1+ GB) activations bundle at training time.
+    """
+    if len(meta_A) != h_A.shape[0] or len(meta_B) != h_B.shape[0]:
+        log.warning("  init_scales: meta_A/meta_B misaligned with h_A/h_B; "
+                    "falling back to {kuq:1, squad:1, general:1}")
+        return {"kuq": 1.0, "squad": 1.0, "general": 1.0}
+
+    scales: dict[str, float] = {}
+    for domain in ("kuq", "squad"):
+        idx_A = [i for i, m in enumerate(meta_A) if m.get("dataset") == domain]
+        idx_B = [i for i, m in enumerate(meta_B) if m.get("dataset") == domain]
+        if not idx_A or not idx_B:
+            log.warning("  init_scales: no examples for domain '%s'; defaulting to 1.0",
+                        domain)
+            scales[domain] = 1.0
+            continue
+        mu_minus_d = h_B[idx_B].mean(dim=0)        # (L, D)
+        c = h_A[idx_A] - mu_minus_d.unsqueeze(0)   # (n_d, L, D)
+        per_layer: list[float] = []
+        for li, V_l in enumerate(V_layers):
+            proj = c[:, li, :] @ V_l               # (n_d, r)
+            per_layer.append(float((proj ** 2).sum(dim=-1).mean()))
+        scales[domain] = max(sum(per_layer) / len(per_layer), 1e-6)
+
+    scales["general"] = (scales["kuq"] + scales["squad"]) / 2.0
+    return scales
+
+
 # ── Driver ────────────────────────────────────────────────────────────────────
 
 def run(model_key: str, rank: int, ridge: float, retain_basis_rank: int,
@@ -182,6 +231,20 @@ def run(model_key: str, rank: int, ridge: float, retain_basis_rank: int,
     V_tensor = torch.stack(V_layers, dim=0)        # (L, D, rank)
     gamma_tensor = torch.stack(gamma_layers, dim=0)
 
+    # Per-domain init_scale = expected step-0 value of L_forget per example, i.e.
+    #     mean_l E_{x ∈ A[d]} ‖V_l⊤ (h_A(x) − μ⁻(d))‖²
+    # baked into the subspace bundle so step 4 does not need to re-load the
+    # activations bundle just to compute it. μ⁻(d) is the per-domain mean of
+    # h_B (legitimate-abstention activations) — matches step 3's per-domain
+    # pole definition.
+    init_scales = _per_domain_init_scale(
+        h_A=h_A.float(),
+        h_B=h_B.float(),
+        meta_A=bundle.get("meta_A") or [],
+        meta_B=bundle.get("meta_B") or [],
+        V_layers=V_layers,
+    )
+
     out_bundle = {
         "model_key":           model_key,
         "model_id":            bundle["model_id"],
@@ -192,9 +255,12 @@ def run(model_key: str, rank: int, ridge: float, retain_basis_rank: int,
         "V":                   V_tensor,
         "gamma":               gamma_tensor,
         "diag":                diag_per_layer,
+        "init_scales":         init_scales,
     }
     torch.save(out_bundle, out_path)
     log.info("")
+    log.info("  init_scales (per-domain, baked into bundle): %s",
+             {k: round(float(v), 2) for k, v in init_scales.items()})
     log.info("  Saved -> %s   V shape=%s", out_path, list(V_tensor.shape))
     log.info("STEP 2 done in %s", format_duration(time.time() - pipeline_t0))
     return out_path
