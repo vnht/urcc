@@ -1,0 +1,17 @@
+{
+  "initial_L_total": 1.30956,
+  "initial_L_forget": 1.30956,
+  "initial_L_retain": 0.0,
+  "initial_mean_proj_norm": 29.838657,
+  "final_L_total": 0.06574,
+  "final_L_forget": 0.014147,
+  "final_L_retain": 0.025796,
+  "final_mean_proj_norm": 2.680624,
+  "num_steps": 375,
+  "best_step": 351,
+  "best_smoothed_L_total": 0.043036,
+  "primary_adapter_source": "best",
+  "elapsed_s": 2616.1,
+  "elapsed_human": "43m36s",
+  "step_avg_s": 6.976
+}

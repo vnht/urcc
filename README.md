@@ -2,7 +2,7 @@
 
 Self-contained pipeline that unlearns **over-commitment** (confidently
 answering inputs that should be abstained from) by anchoring late-layer
-hidden states along a behaviorally-discriminative subspace `V`..
+hidden states along a behaviorally-discriminative subspace `V`.
 
 ## Vocabulary
 
@@ -131,9 +131,13 @@ L_retain = E_{(x,y) ∈ D_R_A ∪ D_R_G}   ⟨ ‖ V_lᵀ (h_l(x, y; θ+δθ) �
 
 `d_x ∈ {kuq, squad}` is the source dataset of example `x`. The forget pole
 `μ⁻(d_x)` is per-domain so the target lives in the same prompt distribution
-as the example; `V` is shared. Both losses are divided by a constant
-`init_scale = mean_l OC_proj(V_l)` so they start at `O(1)` (it does not
-change the optimum or `λ`, only the effective learning rate).
+as the example; `V` is shared. Each example is divided by a per-domain
+`init_scale[d]` (the expected step-0 value of `L_forget` for examples in
+domain `d`, baked into the subspace bundle at step 2). Category-E retain
+examples (UltraChat, no source domain) use the mean of the two domain
+scales. This per-example rescaling makes KUQ and SQuAD contribute on the
+same `O(1)` magnitude regardless of their domain-specific contrast size;
+it does not change the optimum or `λ`, only the effective learning rate.
 
 **Why retain uses a frozen-base reference, not μ⁺(d).** A pole-style anchor
 (`μ⁺(d)`) is a *cluster-mean* target: many retain examples can collectively
@@ -172,6 +176,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 │
 ├── step0_mine/
 │   ├── mine.py
+│   ├── rejudge.py                  re-judge cached completions without regenerating
 │   └── data/
 │       ├── sampled/                raw inputs (questions, retain pairs)
 │       │   ├── kuq_unanswerable.jsonl
@@ -213,11 +218,21 @@ Each step lives in its own folder and owns its `data/` subdirectory.
     ├── evaluate.py
     └── data/
         ├── heldout/
-        │   ├── kuq.jsonl
-        │   └── squad.jsonl
+        │   ├── kuq.jsonl              trained domain — no-context
+        │   ├── squad.jsonl            trained domain — with-context
+        │   ├── selfaware.jsonl        held-out — no-context
+        │   ├── falseqa.jsonl          held-out — no-context (false-premise)
+        │   ├── qaqa.jsonl             held-out — no-context (false-premise)
+        │   ├── truthfulqa.jsonl       held-out — no-context
+        │   ├── faitheval.jsonl        held-out — with-context
+        │   ├── musique.jsonl          held-out — with-context (multi-hop)
+        │   ├── nomiracl.jsonl         held-out — with-context (no-answer retrieval)
+        │   └── ultrachat.jsonl        utility — (prompt, response) for perplexity
         └── results/<run_name>/
-            ├── generations.jsonl
-            └── answerability_metrics.jsonl
+            ├── kuq.json               answerability metrics + per-row (+ baseline deltas)
+            ├── squad.json             (same shape, one JSON per dataset evaluated)
+            ├── …                      one file per held-out set passed to --datasets
+            └── ultrachat.json         perplexity metrics + per-row (+ baseline ratios)
 ```
 
 ## Pipeline
@@ -229,7 +244,7 @@ Each step lives in its own folder and owns its `data/` subdirectory.
 | 2    | `step2_build_subspace/build_subspace.py`  | `step1_extract_activations/data/activations_<model>.pt`                  | `step2_build_subspace/data/subspace_<model>_r<rank>.pt`             |
 | 3    | `step3_build_anchors/build_anchors.py`    | `step1_extract_activations/data/activations_<model>.pt`                  | `step3_build_anchors/data/anchors_<model>.pt`                       |
 | 4    | `step4_train/train.py`                    | `step0_mine/`, `step2_*/`, `step3_*/` outputs                            | `step4_train/data/runs/<run_name>/`                                 |
-| 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/{kuq,squad,ultrachat}.jsonl`                | `step5_evaluate/data/results/<name>/{kuq,squad,ultrachat}.json` (one JSON per dataset, metrics + per-row + baseline deltas) |
+| 5    | `step5_evaluate/evaluate.py`              | `step5_evaluate/data/heldout/<dataset>.jsonl` (`--datasets` selection, default `kuq squad`) + `ultrachat.jsonl` | `step5_evaluate/data/results/<name>/<dataset>.json` (one JSON per dataset, metrics + per-row + baseline deltas) + `ultrachat.json` (perplexity + ratios) |
 
 ## Run end-to-end
 
@@ -243,8 +258,10 @@ python3 step2_build_subspace/build_subspace.py   --model qwen_instruct --rank 32
 python3 step3_build_anchors/build_anchors.py     --model qwen_instruct
 
 # Step 5 (baseline first) — zero-shot reference
-# Runs answerability (KUQ + SQuAD) AND UltraChat perplexity in one model load.
-python3 step5_evaluate/evaluate.py               --model qwen_instruct
+# Runs answerability (KUQ + SQuAD by default) AND UltraChat perplexity in one model load.
+# Pass --datasets to also run the held-out generalisation sets.
+python3 step5_evaluate/evaluate.py               --model qwen_instruct \
+    --datasets kuq squad selfaware falseqa qaqa truthfulqa faitheval musique nomiracl
 
 # Step 4 — train with the two-component UOC loss
 python3 step4_train/train.py                     --model qwen_instruct \
@@ -252,11 +269,16 @@ python3 step4_train/train.py                     --model qwen_instruct \
 
 # Step 5 (trained) — evaluate the LoRA adapter and compare against the baseline
 python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs/<run_name> \
+    --datasets kuq squad selfaware falseqa qaqa truthfulqa faitheval musique nomiracl \
     --baseline step5_evaluate/data/results/baseline_qwen_instruct
 
 # Plot training curves
 python3 step4_train/plot_training.py             step4_train/data/runs/<run_name>
 ```
+
+> Re-judging cached mining outputs (e.g. after tweaking the judge prompt)
+> without paying GPU cost to re-generate:
+> `python3 step0_mine/rejudge.py --model qwen_instruct`
 
 ## Smoke test
 
@@ -314,3 +336,15 @@ To target a different model:
 1. Add the HF id to `MODEL_REGISTRY`.
 2. Add its late-layer indices to `LAYER_SLICE`.
 3. Re-run from step 0 (mining is per-model).
+
+To add a new held-out evaluation dataset (step 5 only — no retraining):
+
+1. Drop `step5_evaluate/data/heldout/<name>.jsonl` with rows shaped like
+   the existing held-out sets (`{id, answerable, question, [context],
+   correct_answer, ...}`).
+2. Register it in `DOMAIN_OF` (`config.py`) mapping the dataset name to
+   one of the two trained domains, `"kuq"` (no-context) or `"squad"`
+   (with-context). This routes the dataset through the right prompt
+   template and the right per-domain abstention template / pole at
+   evaluation time, without any retraining.
+3. Pass `--datasets ... <name>` to `step5_evaluate/evaluate.py`.

@@ -1,0 +1,46 @@
+{
+  "model_key": "qwen_instruct",
+  "model_id": "Qwen/Qwen3.5-9B",
+  "method": "UOC two-component (shared V, per-domain \u03bc\u207b forget pole, per-domain init_scale, frozen-base retain preservation, transition-window, best-step early-stop)",
+  "per_domain_poles": true,
+  "pole_domains": [
+    "kuq",
+    "squad"
+  ],
+  "retain_target": "frozen-base h(x, y; \u03b8_frozen)  (per-token, per-example) for both C and E",
+  "answer_window": "transition-shifted: [p_len-1, p_len+K-2]",
+  "subspace_rank": 32,
+  "lambda_retain": 2.0,
+  "epochs": 3,
+  "lr": 3e-05,
+  "forget_batch": 4,
+  "retain_batch": 4,
+  "grad_accum": 4,
+  "checkpoint_every": 50,
+  "warmup_ratio": 0.03,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "lora_target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "up_proj",
+    "down_proj",
+    "gate_proj"
+  ],
+  "k_answer_tokens": 8,
+  "init_scales": {
+    "kuq": 968.0405,
+    "squad": 533.0191,
+    "general": 750.5298
+  },
+  "early_stop": true,
+  "early_stop_window": 5,
+  "early_stop_min_improvement": 0.0,
+  "primary_adapter_source": "best",
+  "forget_examples": 2000,
+  "retain_examples": 3000,
+  "total_optim_steps": 375
+}

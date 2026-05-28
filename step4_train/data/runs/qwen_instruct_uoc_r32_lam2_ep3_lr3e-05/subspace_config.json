@@ -1,0 +1,15 @@
+{
+  "subspace_file": "subspace_qwen_instruct_r32.pt",
+  "anchors_file": "anchors_qwen_instruct.pt",
+  "layers": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "rank": 32
+}

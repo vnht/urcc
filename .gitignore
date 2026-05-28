@@ -41,7 +41,7 @@ datasets/
 *.pt
 *.pth
 *.ckpt
-*.safetensors
+
 
 # OS
 .DS_Store
@@ -62,7 +62,8 @@ step1_extract_activations/data/*.pt
 step1_extract_activations/data/_partial_*/
 
 # Step 4 training runs (LoRA checkpoints, logs, plots)
-step4_train/data/runs/
+step4_train/data/runs/qwen_instruct_uoc_r32_lam1_ep3_lr3e-05
+step4_train/data/runs/qwen_instruct_uoc_r32_lam2_ep3_lr3e-05/_*
 
 # Step 5 evaluation outputs
 
