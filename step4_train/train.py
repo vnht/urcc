@@ -63,8 +63,10 @@ import csv
 import json
 import math
 import random
+import shutil
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -145,7 +147,7 @@ def _layer_split(t: torch.Tensor) -> list[torch.Tensor]:
 
 
 def _load_subspace_and_anchors(model_key: str, rank: int):
-    """Returns (V_layers, layer_indices, mu_minus_per, mu_plus_per, init_scale).
+    """Returns (V_layers, layer_indices, mu_minus_per, mu_plus_per).
 
     V_layers is the shared discriminative subspace from step 2 (one V for
     both domains): list of L float tensors of shape (D, r).
@@ -160,6 +162,9 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
 
     For backwards-compat with old anchor bundles (no per-domain poles): the
     grand mean is replicated under both keys.
+
+    Per-domain init_scale is computed separately by ``_per_domain_init_scale``
+    (which needs the activations bundle, not the subspace bundle).
     """
     sp = cfg.subspace_path(model_key, rank=rank)
     ap = cfg.anchors_path(model_key)
@@ -188,16 +193,70 @@ def _load_subspace_and_anchors(model_key: str, rank: int):
         log.warning("  anchors bundle has no per-domain poles; falling back to grand mean. "
                     "Re-run step 3 to build per-domain anchors.")
 
-    # diag.OC_proj averages roughly the initial value of L_forget per layer ⇒
-    # use it to scale both losses so they start at O(1). Constant scaling does
-    # not change the optimum or the relative weight λ; it only affects the
-    # effective learning rate.
-    init_scale = 1.0
-    if sb.get("diag"):
-        oc_means = [d["OC_proj"] for d in sb["diag"]]
-        init_scale = max(sum(oc_means) / len(oc_means), 1e-6)
+    return V_layers, sb["layers"], mu_minus_per, mu_plus_per
 
-    return V_layers, sb["layers"], mu_minus_per, mu_plus_per, float(init_scale)
+
+def _per_domain_init_scale(
+    model_key: str,
+    V_layers: list[torch.Tensor],
+) -> dict[str, float]:
+    """Compute the expected step-0 value of L_forget **per dataset domain**.
+
+    Matches the actual loss formula
+        L_forget_per_ex(x) = ‖V_l⊤ (h_A(x) − μ⁻(d_x))‖²
+    by using μ⁻(d) = mean over rows of h_B restricted to domain d as the
+    baseline (not per-row h_B), then averaging over rows and layers.
+
+    Returns ``{"kuq": float, "squad": float, "general": float}`` where
+    ``general`` is the arithmetic mean of the two domain scales — used to
+    normalise the retain-general (UltraChat) loss, which has no source
+    domain.
+
+    Each forget / retain example is divided per-example by its domain's
+    init_scale inside the loss so that L_forget starts at ≈ 1.0 for both
+    KUQ and SQuAD regardless of how much larger one domain's contrast
+    magnitude is in late-layer hidden space. This is a constant per-example
+    rescaling — it does not change the optimum or the relative weight λ,
+    only the relative contribution of each domain to the gradient. Without
+    it the larger-magnitude domain dominates the update.
+    """
+    act_path = cfg.activations_path(model_key)
+    if not act_path.exists():
+        raise FileNotFoundError(
+            f"Activations bundle not found: {act_path}. Run step 1 first."
+        )
+    bundle = torch.load(act_path, map_location="cpu", weights_only=False)
+    h_A = bundle["h_A"].float()           # (N_F, L, D)
+    h_B = bundle["h_B"].float()
+    meta_A = bundle.get("meta_A") or []
+    meta_B = bundle.get("meta_B") or meta_A
+    if len(meta_A) != h_A.shape[0] or len(meta_B) != h_B.shape[0]:
+        raise RuntimeError(
+            f"meta_A/meta_B misaligned with h_A/h_B "
+            f"(len_meta_A={len(meta_A)} vs N_A={h_A.shape[0]}, "
+            f"len_meta_B={len(meta_B)} vs N_B={h_B.shape[0]}). "
+            f"Re-run step 1 with the latest extract.py."
+        )
+
+    scales: dict[str, float] = {}
+    for domain in ("kuq", "squad"):
+        idx_A = [i for i, m in enumerate(meta_A) if m.get("dataset") == domain]
+        idx_B = [i for i, m in enumerate(meta_B) if m.get("dataset") == domain]
+        if not idx_A or not idx_B:
+            log.warning("  no examples for domain '%s' in activations; "
+                        "init_scale defaulting to 1.0", domain)
+            scales[domain] = 1.0
+            continue
+        mu_minus_d = h_B[idx_B].mean(dim=0)        # (L, D)  per-domain abstain pole
+        c = h_A[idx_A] - mu_minus_d.unsqueeze(0)   # (n_d, L, D)
+        per_layer: list[float] = []
+        for li, V_l in enumerate(V_layers):
+            proj = c[:, li, :] @ V_l               # (n_d, r)
+            per_layer.append(float((proj ** 2).sum(dim=-1).mean()))
+        scales[domain] = max(sum(per_layer) / len(per_layer), 1e-6)
+
+    scales["general"] = (scales["kuq"] + scales["squad"]) / 2.0
+    return scales
 
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
@@ -238,10 +297,13 @@ def _project_to_pole(
 
 def _compute_forget_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
-    V_layers, layer_indices, mu_minus_per: dict, k_answer_tokens: int,
+    V_layers, layer_indices, mu_minus_per: dict,
+    init_scales: dict[str, float], k_answer_tokens: int,
 ) -> tuple[torch.Tensor, dict]:
     """L_forget — pull category-A activations toward μ⁻(d) along V, where d is
-    the example's source dataset (kuq | squad)."""
+    the example's source dataset (kuq | squad). Each example is divided by
+    ``init_scales[d]`` so KUQ and SQuAD contribute on the same O(1) scale at
+    step 0 regardless of their domain-specific contrast magnitude."""
     total = torch.tensor(0.0, requires_grad=True)
     layer_norms: list[float] = []
     n_used = 0
@@ -249,7 +311,8 @@ def _compute_forget_loss(
     for r in batch:
         ds = r["__dataset__"]
         mu_minus = mu_minus_per.get(ds)
-        if mu_minus is None:
+        scale = init_scales.get(ds)
+        if mu_minus is None or scale is None:
             continue
         prompt = build_unanswerable_prompt(ds, r)
         answer = r.get("y_com_prefix_k8") or r.get("full_completion_clean") or ""
@@ -280,6 +343,7 @@ def _compute_forget_loss(
             per_ex = per_ex + l_loss
             layer_norms.append(float(l_loss.detach().sqrt()))
         per_ex = per_ex / len(hiddens)
+        per_ex = per_ex / scale
         total = total + per_ex
         n_used += 1
         by_dataset[ds] = by_dataset.get(ds, 0) + 1
@@ -292,7 +356,7 @@ def _compute_forget_loss(
 
 def _compute_retain_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
-    V_layers, layer_indices, k_answer_tokens: int,
+    V_layers, layer_indices, init_scales: dict[str, float], k_answer_tokens: int,
 ) -> tuple[torch.Tensor, dict]:
     """L_retain — preserve each retain example at its frozen-base location along V.
 
@@ -305,6 +369,15 @@ def _compute_retain_loss(
     examples can collectively move together while the loss only measures
     the cluster's variance.
 
+    Per-example normalisation uses ``init_scales[d_x]`` for category C
+    (answerable, has a source domain) and ``init_scales["general"]`` for
+    category E (UltraChat, no source domain). The retain loss starts at 0
+    by construction, so the per-example division mostly affects the
+    relative gradient magnitude between the two branches across domains —
+    matching the forget side's per-domain scaling so the loss landscape
+    is consistently scaled across the (forget, retain) × (kuq, squad,
+    general) grid.
+
     μ⁺(d) is no longer used in training; it is kept in the anchors bundle as a
     geometric diagnostic confirming V separates legit-commit from legit-abstain.
     """
@@ -316,6 +389,7 @@ def _compute_retain_loss(
         kind = r["__type__"]
         if kind == "answerable":
             ds = r["__dataset__"]
+            scale = init_scales.get(ds, init_scales.get("general", 1.0))
             prompt = build_answerable_prompt(ds, r)
             answer = r.get("correct_answer") or ""
             if not prompt.strip() or not answer.strip():
@@ -327,6 +401,7 @@ def _compute_retain_loss(
             except Exception:
                 continue
         elif kind == "general":
+            scale = init_scales.get("general", 1.0)
             prompt   = r.get("prompt") or ""
             response = r.get("response") or ""
             if not prompt.strip() or not response.strip():
@@ -367,6 +442,7 @@ def _compute_retain_loss(
                 h, span, V_layers[li], ref_h,
             )
         per_ex = per_ex / len(hiddens)
+        per_ex = per_ex / scale
         total = total + per_ex
         breakdown[kind if kind == "general" else "answerable"] += 1
         n_used += 1
@@ -388,39 +464,77 @@ def _linear_warmup_decay(optimizer, warmup_steps: int, total_steps: int):
     return LambdaLR(optimizer, lr_lambda)
 
 
-# ── Checkpoint helpers ────────────────────────────────────────────────────────
+# ── Checkpoint + early-stop adapter helpers ──────────────────────────────────
 
-CKPT_SUBDIR = "checkpoint"
+CKPT_SUBDIR        = "checkpoint"
+BEST_SUBDIR        = "_best"           # best-step adapter snapshot (early stop)
+FINAL_SUBDIR       = "_final"          # last-step adapter snapshot (always written)
 TRAINER_STATE_FILE = "trainer_state.pt"
+
+# Adapter files PEFT writes via save_pretrained that we promote to the run dir
+# (tokenizer files are written once and stay at the root regardless of which
+# snapshot is the primary).
+_ADAPTER_PROMOTE_FILES = (
+    "adapter_model.safetensors",
+    "adapter_config.json",
+    "README.md",
+)
+
+
+def _save_adapter_snapshot(dest: Path, model) -> None:
+    """Atomic PEFT adapter save to ``dest``: write into ``dest.tmp`` and rename.
+
+    Tokenizer files are NOT written here; they're saved once at the run-dir
+    root by the main loop and don't change across snapshots.
+    """
+    tmp = dest.with_name(dest.name + ".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(tmp)
+    if dest.exists():
+        shutil.rmtree(dest)
+    tmp.rename(dest)
+
+
+def _promote_adapter(src: Path, out_dir: Path) -> None:
+    """Copy adapter files from a snapshot dir (``_best`` / ``_final``) to the
+    run-dir root, which is what ``step5_evaluate`` loads via
+    ``PeftModel.from_pretrained(model, str(run_dir))``."""
+    for fname in _ADAPTER_PROMOTE_FILES:
+        sp = src / fname
+        if sp.exists():
+            shutil.copy2(sp, out_dir / fname)
 
 
 def _save_checkpoint(out_dir: Path, model, optimizer, scheduler,
-                     step: int, summary_initial: dict) -> None:
-    """Save adapter + optim/scheduler state to <run_dir>/checkpoint/.
-
-    Atomic w.r.t. interrupts: writes to a sibling .tmp dir then renames.
-    """
+                     step: int, summary_initial: dict,
+                     loss_window: deque, best_smoothed_loss: float,
+                     best_step_recorded: int) -> None:
+    """Save adapter + optim/scheduler state + early-stop tracking state to
+    ``<run_dir>/checkpoint/``. Atomic w.r.t. interrupts."""
     final = out_dir / CKPT_SUBDIR
     tmp   = out_dir / (CKPT_SUBDIR + ".tmp")
     if tmp.exists():
-        import shutil
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(tmp)
     torch.save({
-        "step":             step,
-        "optimizer":        optimizer.state_dict(),
-        "scheduler":        scheduler.state_dict(),
-        "summary_initial":  summary_initial,
+        "step":                step,
+        "optimizer":           optimizer.state_dict(),
+        "scheduler":           scheduler.state_dict(),
+        "summary_initial":     summary_initial,
+        "loss_window":         list(loss_window),
+        "best_smoothed_loss":  float(best_smoothed_loss),
+        "best_step_recorded":  int(best_step_recorded),
     }, tmp / TRAINER_STATE_FILE)
     if final.exists():
-        import shutil
         shutil.rmtree(final)
     tmp.rename(final)
 
 
 def _load_checkpoint_if_any(out_dir: Path):
-    """Return (step, optimizer_state, scheduler_state, summary_initial) or None."""
+    """Return saved trainer-state dict (optim/scheduler/step/early-stop) or None."""
     ckpt = out_dir / CKPT_SUBDIR / TRAINER_STATE_FILE
     if not ckpt.exists():
         return None
@@ -442,9 +556,12 @@ def train(args: argparse.Namespace) -> None:
     if not retain_data:
         raise RuntimeError("Retain pool is empty.")
 
-    V_layers, layer_indices, mu_minus_per, mu_plus_per, init_scale = \
+    V_layers, layer_indices, mu_minus_per, mu_plus_per = \
         _load_subspace_and_anchors(model_key, rank=args.rank)
-    log.info("  V layers=%s  rank=%d  init_scale=%.2f", layer_indices, args.rank, init_scale)
+    init_scales = _per_domain_init_scale(model_key, V_layers)
+    log.info("  V layers=%s  rank=%d", layer_indices, args.rank)
+    log.info("  init_scales (per-domain): %s",
+             {k: round(v, 2) for k, v in init_scales.items()})
     log.info("  forget pole μ⁻ keys=%s   "
              "(μ⁺ kept as diagnostic only; retain uses frozen-base reference)",
              list(mu_minus_per.keys()))
@@ -491,16 +608,28 @@ def train(args: argparse.Namespace) -> None:
 
     start_step = 0
     summary_initial: dict = {}
+    # Early-stop / best-step tracking — survives across resume via trainer_state.
+    loss_window: deque = deque(maxlen=max(int(args.early_stop_window), 1))
+    best_smoothed_loss = float("inf")
+    best_step_recorded = -1
     if resume:
         try:
             optimizer.load_state_dict(ckpt_state["optimizer"])
             scheduler.load_state_dict(ckpt_state["scheduler"])
             start_step = int(ckpt_state.get("step", 0))
             summary_initial = ckpt_state.get("summary_initial", {}) or {}
-            log.info("  resumed at optim_step=%d", start_step)
+            for v in ckpt_state.get("loss_window", []) or []:
+                loss_window.append(float(v))
+            best_smoothed_loss = float(ckpt_state.get("best_smoothed_loss", float("inf")))
+            best_step_recorded = int(ckpt_state.get("best_step_recorded", -1))
+            log.info("  resumed at optim_step=%d   best_step=%d  best_smoothed_loss=%.4f",
+                     start_step, best_step_recorded, best_smoothed_loss)
         except Exception as exc:
             log.warning("  failed to load optim/scheduler state (%s); restarting fresh", exc)
             start_step = 0
+            loss_window.clear()
+            best_smoothed_loss = float("inf")
+            best_step_recorded = -1
 
     if start_step >= total_optim_steps:
         log.info("  checkpoint already at final step (%d / %d). Nothing to do.",
@@ -561,20 +690,21 @@ def train(args: argparse.Namespace) -> None:
             retain_batch = next_retain_batch()
             f_pos += args.forget_batch
 
-            l_forget_raw, finfo = _compute_forget_loss(
+            # Per-example scaling by domain-specific init_scale happens inside
+            # the loss helpers, so both terms come out as ≈ O(1) at step 0.
+            l_forget, finfo = _compute_forget_loss(
                 model=model, batch=forget_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
                 layer_indices=layer_indices, mu_minus_per=mu_minus_per,
+                init_scales=init_scales,
                 k_answer_tokens=cfg.K_ANSWER_TOKENS,
             )
-            l_retain_raw, _rinfo = _compute_retain_loss(
+            l_retain, _rinfo = _compute_retain_loss(
                 model=model, batch=retain_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
-                layer_indices=layer_indices,
+                layer_indices=layer_indices, init_scales=init_scales,
                 k_answer_tokens=cfg.K_ANSWER_TOKENS,
             )
-            l_forget = l_forget_raw / init_scale
-            l_retain = l_retain_raw / init_scale
 
             l_total = l_forget + args.lambda_retain * l_retain
             (l_total / args.grad_accum).backward()
@@ -636,6 +766,20 @@ def train(args: argparse.Namespace) -> None:
                                               "grad_norm", "step_time_s",
                                               "elapsed_s")}
 
+                # Early-stop tracking — smoothed L_total minimum, with optional
+                # minimum-improvement threshold so we don't write the adapter
+                # to disk on tiny numerical fluctuations.
+                loss_window.append(avg_total)
+                new_best = False
+                if args.early_stop and len(loss_window) >= loss_window.maxlen:
+                    smoothed = sum(loss_window) / len(loss_window)
+                    threshold = best_smoothed_loss * (1.0 - args.early_stop_min_improvement)
+                    if smoothed < threshold:
+                        best_smoothed_loss = smoothed
+                        best_step_recorded = optim_step
+                        _save_adapter_snapshot(out_dir / BEST_SUBDIR, model)
+                        new_best = True
+
                 progress.tick(extras={
                     "ep":   ep + 1,
                     "step": f"{optim_step}/{total_optim_steps}",
@@ -645,6 +789,9 @@ def train(args: argparse.Namespace) -> None:
                     "lr":   f"{lr_now:.2e}",
                     "gn":   f"{float(grad_norm):.3f}",
                     "dt":   f"{step_dt:.2f}s",
+                    **({"best": f"{best_smoothed_loss:.4f}@{best_step_recorded}"}
+                       if args.early_stop and best_step_recorded > 0 else {}),
+                    **({"*": "new-best"} if new_best else {}),
                 })
 
                 accum_forget = torch.tensor(0.0)
@@ -655,9 +802,14 @@ def train(args: argparse.Namespace) -> None:
                 if args.checkpoint_every > 0 and \
                    optim_step % args.checkpoint_every == 0 and \
                    optim_step != total_optim_steps:
-                    _save_checkpoint(out_dir, model, optimizer, scheduler,
-                                     step=optim_step,
-                                     summary_initial=summary_initial)
+                    _save_checkpoint(
+                        out_dir, model, optimizer, scheduler,
+                        step=optim_step,
+                        summary_initial=summary_initial,
+                        loss_window=loss_window,
+                        best_smoothed_loss=best_smoothed_loss,
+                        best_step_recorded=best_step_recorded,
+                    )
                     log.info("  checkpoint @ step %d  (resume from here on restart)",
                              optim_step)
 
@@ -665,16 +817,31 @@ def train(args: argparse.Namespace) -> None:
     progress.done(extras={"final_step": optim_step,
                           "skipped_resume_steps": skipped_steps})
 
-    # Save final adapter (run-dir level, distinct from checkpoint/)
-    log.info("Saving final adapter to %s", out_dir)
-    model.save_pretrained(out_dir)
+    # Always snapshot the final-step adapter into _final/ for diagnostics, then
+    # decide whether the run-dir root (the primary load location used by
+    # step5_evaluate) should hold the best-step or the final-step adapter.
+    _save_adapter_snapshot(out_dir / FINAL_SUBDIR, model)
     if hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(out_dir)
+
+    promoted_source = "final"
+    if args.early_stop and best_step_recorded > 0 and (out_dir / BEST_SUBDIR).exists():
+        log.info("Promoting BEST adapter (step %d, smoothed L_total=%.4f) "
+                 "to primary at %s", best_step_recorded, best_smoothed_loss, out_dir)
+        _promote_adapter(out_dir / BEST_SUBDIR, out_dir)
+        promoted_source = "best"
+    else:
+        log.info("Promoting FINAL-step adapter to primary at %s "
+                 "(early_stop=%s, best_step=%d)",
+                 out_dir, args.early_stop, best_step_recorded)
+        _promote_adapter(out_dir / FINAL_SUBDIR, out_dir)
 
     (out_dir / "training_config.json").write_text(json.dumps({
         "model_key":        model_key,
         "model_id":         cfg.MODEL_REGISTRY[model_key],
-        "method":           "UOC two-component (shared V, per-domain μ⁻ forget pole, frozen-base retain preservation, transition-window)",
+        "method":           ("UOC two-component (shared V, per-domain μ⁻ forget pole, "
+                             "per-domain init_scale, frozen-base retain preservation, "
+                             "transition-window, best-step early-stop)"),
         "per_domain_poles": True,
         "pole_domains":     list(mu_minus_per.keys()),
         "retain_target":    "frozen-base h(x, y; θ_frozen)  (per-token, per-example) for both C and E",
@@ -693,7 +860,11 @@ def train(args: argparse.Namespace) -> None:
         "lora_dropout":     cfg.LORA_DROPOUT,
         "lora_target_modules": cfg.LORA_TARGET_MODULES,
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
-        "init_scale":       round(float(init_scale), 4),
+        "init_scales":      {k: round(float(v), 4) for k, v in init_scales.items()},
+        "early_stop":                  bool(args.early_stop),
+        "early_stop_window":           int(args.early_stop_window),
+        "early_stop_min_improvement":  float(args.early_stop_min_improvement),
+        "primary_adapter_source":      promoted_source,   # "best" or "final"
         "forget_examples":  len(forget_data),
         "retain_examples":  len(retain_data),
         "total_optim_steps": total_optim_steps,
@@ -706,17 +877,22 @@ def train(args: argparse.Namespace) -> None:
         "rank":          args.rank,
     }, indent=2))
 
+    elapsed = time.time() - train_t0
     (out_dir / "train_summary.json").write_text(json.dumps(
         {**summary_initial, **summary_final,
-         "num_steps":        optim_step,
-         "elapsed_s":        round(time.time() - train_t0, 1),
-         "elapsed_human":    format_duration(time.time() - train_t0),
-         "step_avg_s":       round((time.time() - train_t0) / max(progress.n, 1), 3)},
+         "num_steps":           optim_step,
+         "best_step":           int(best_step_recorded) if best_step_recorded > 0 else None,
+         "best_smoothed_L_total": (round(float(best_smoothed_loss), 6)
+                                   if best_smoothed_loss < float("inf") else None),
+         "primary_adapter_source": promoted_source,
+         "elapsed_s":           round(elapsed, 1),
+         "elapsed_human":       format_duration(elapsed),
+         "step_avg_s":          round(elapsed / max(progress.n, 1), 3)},
         indent=2,
     ))
 
-    # Clean up the rolling checkpoint now that the final adapter is in place
-    import shutil
+    # Clean up the rolling resume checkpoint now that primary + _best/_final
+    # snapshots are in place.
     shutil.rmtree(out_dir / CKPT_SUBDIR, ignore_errors=True)
 
     log.info("STEP 4 done in %s. Outputs in %s",
@@ -736,6 +912,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum",   type=int,   default=cfg.DEFAULT_GRAD_ACCUM)
     p.add_argument("--checkpoint-every", type=int, default=50,
                    help="Save a resumable checkpoint every N optim steps (0 to disable)")
+    p.add_argument("--early-stop", dest="early_stop", action="store_true", default=True,
+                   help="Track smoothed L_total and save the best-step adapter as the "
+                        "primary load target at <run_dir>/. Default: enabled.")
+    p.add_argument("--no-early-stop", dest="early_stop", action="store_false",
+                   help="Disable best-step tracking; primary adapter is the final step.")
+    p.add_argument("--early-stop-window", type=int, default=5,
+                   help="Smoothing window (in optim steps) for the L_total minimum "
+                        "tracked by --early-stop. Default: 5.")
+    p.add_argument("--early-stop-min-improvement", type=float, default=0.0,
+                   help="Minimum relative improvement (e.g. 0.01 = 1%%) for a step to "
+                        "count as a new best and trigger a best-adapter snapshot. "
+                        "Default: 0.0 (any improvement counts).")
     p.add_argument("--dry-run",      action="store_true")
     return p.parse_args()
 
