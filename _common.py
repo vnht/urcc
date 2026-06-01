@@ -307,6 +307,20 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
             model = Mistral3ForConditionalGeneration.from_pretrained(
                 model_id, device_map="auto", **kwargs,
             )
+    elif model_id.startswith("google/"):
+        # Gemma 4 ships as a multimodal Gemma4ForConditionalGeneration
+        # checkpoint. We only need the text tower: AutoModelForCausalLM loads
+        # the language model (the vision/audio encoders are skipped) and exposes
+        # `.logits` + `.hidden_states`, matching forward_hidden_states(). The
+        # chat path routes through the non-"ministral" branch of
+        # tokenise_chat_prompt_response / generate_greedy, which passes
+        # enable_thinking=False (E2B/E4B then answer directly, with no thinking
+        # tokens, so the prompt→answer window stays aligned).
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
+        )
     else:
         raise ValueError(f"Unsupported model: {model_id}")
 
