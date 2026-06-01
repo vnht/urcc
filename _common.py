@@ -312,6 +312,12 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
             model = Mistral3ForConditionalGeneration.from_pretrained(
                 model_id, device_map="auto", **kwargs,
             )
+        # Ministral's generation_config ships max_length=262144, which collides
+        # with our explicit max_new_tokens on every generate() call and floods
+        # the log with a "both max_new_tokens and max_length set" warning. We
+        # always size generations via max_new_tokens, so drop the stale default.
+        if getattr(model, "generation_config", None) is not None:
+            model.generation_config.max_length = None
     elif model_id.startswith("google/"):
         # Gemma 4 ships as a multimodal Gemma4ForConditionalGeneration
         # checkpoint. We only need the text tower: AutoModelForCausalLM loads
