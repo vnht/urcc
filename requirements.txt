@@ -15,7 +15,7 @@ transformers @ git+https://github.com/huggingface/transformers
 torch
 accelerate
 mistral-common>=1.8.6
-kernels
+# kernels  # removed: LayerRepository version bug breaks transformers model loading
 hf_xet
 matplotlib
 scikit-learn
