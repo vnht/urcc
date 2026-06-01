@@ -56,6 +56,13 @@ from _common import (
 )
 
 
+# Hard ceiling on how many COMMIT (over-commitment) rows we keep in the forget
+# pool per dataset. The mined file retains every judged row; only the forget
+# file is truncated to this many COMMITs (deterministically, lowest
+# source_index first) so D_F stays balanced across datasets.
+MAX_FORGET_PER_DATASET = 1000
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def _load_unanswerable(dataset: str, max_n: int | None) -> list[dict]:
@@ -128,10 +135,18 @@ def _write_forget_files(model_key: str, judge_mod: dict) -> None:
             and (r.get("y_com_prefix_k8") or "").strip()
         ]
         forget.sort(key=lambda r: r["source_index"])
+        # Cap the over-commits kept per dataset (lowest source_index first).
+        n_commit = len(forget)
+        if n_commit > MAX_FORGET_PER_DATASET:
+            forget = forget[:MAX_FORGET_PER_DATASET]
         out_path = cfg.forget_path(model_key, ds)
         write_jsonl(out_path, forget)
-        log.info("  forget %s: %d / %d COMMIT rows -> %s",
-                 ds, len(forget), len(rows), out_path)
+        if n_commit > len(forget):
+            log.info("  forget %s: %d / %d COMMIT rows (capped at %d) -> %s",
+                     ds, len(forget), len(rows), MAX_FORGET_PER_DATASET, out_path)
+        else:
+            log.info("  forget %s: %d / %d COMMIT rows -> %s",
+                     ds, len(forget), len(rows), out_path)
 
 
 # ── Main run ──────────────────────────────────────────────────────────────────

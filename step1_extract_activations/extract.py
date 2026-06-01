@@ -142,6 +142,31 @@ def _load_retain_general() -> list[dict]:
     return load_jsonl(cfg.sampled_general_path())
 
 
+def _cap_per_domain(rows: list[dict], n: int) -> list[dict]:
+    """Cap to ~n rows while keeping every dataset/domain represented.
+
+    The answerable/forget pools are stored grouped by dataset (all kuq rows,
+    then all squad), so a plain ``rows[:n]`` drops a whole domain when n is
+    small (smoke testing) — which then breaks step 3's per-domain anchors.
+    Round-robin across domains so each is present when ``n`` >= #domains.
+    Full-scale runs (max_per_set=None) never call this and are unaffected.
+    """
+    by_domain: dict[str, list[dict]] = {}
+    for r in rows:
+        by_domain.setdefault(r.get("dataset", "?"), []).append(r)
+    queues = list(by_domain.values())
+    picked: list[dict] = []
+    while len(picked) < n:
+        progressed = False
+        for q in queues:
+            if q and len(picked) < n:
+                picked.append(q.pop(0))
+                progressed = True
+        if not progressed:
+            break
+    return picked
+
+
 def _partial_dir(model_key: str) -> Path:
     p = cfg.ACTIVATIONS_DIR / f"_partial_{model_key}"
     p.mkdir(parents=True, exist_ok=True)
@@ -339,10 +364,14 @@ def run(model_key: str, max_per_set: int | None, rebuild: bool = False) -> Path:
              len(answer_pool), len(retain_pool))
 
     if max_per_set is not None:
-        forget_committed = forget_committed[:max_per_set]
-        answer_pool      = answer_pool[:max_per_set]
+        # Domain-balanced cap so sets A–D keep both kuq and squad rows (step 3
+        # builds per-domain anchors and fails if a domain is missing). Retain-
+        # general (UltraChat) has no domain split, so a plain head cap is fine.
+        forget_committed = _cap_per_domain(forget_committed, max_per_set)
+        answer_pool      = _cap_per_domain(answer_pool, max_per_set)
         retain_pool      = retain_pool[:max_per_set]
-        log.info("  capped each set to max-per-set=%d", max_per_set)
+        log.info("  capped each set to max-per-set=%d (balanced across domains)",
+                 max_per_set)
 
     # Defer loading the model until we actually need it — avoids re-loading
     # when every set is already cached.

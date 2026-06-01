@@ -90,6 +90,11 @@ def setup_logging(name: str | None = None) -> logging.Logger:
     for noisy in ("httpx", "huggingface_hub.file_download", "numexpr",
                   "transformers.tokenization_utils_base"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # torchao emits WARNINGs when its optional fused kernels (e.g. _C_mxfp8,
+    # _C_cutlass_90a) can't load. Those target Hopper (sm_90) and are not used
+    # by our bf16 LoRA path — they won't load on Blackwell/other GPUs anyway.
+    # PEFT only needs torchao importable, so the failures are harmless noise.
+    logging.getLogger("torchao").setLevel(logging.ERROR)
     return logging.getLogger(name or "uoc")
 
 
