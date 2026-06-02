@@ -271,29 +271,11 @@ def _per_domain_init_scale(
 def _apply_lora(model):
     from peft import LoraConfig, TaskType, get_peft_model
 
-    target_modules = cfg.LORA_TARGET_MODULES
-    # Gemma 4 multimodal checkpoints wrap their vision/audio projections in
-    # Gemma4ClippableLinear — an nn.Module (not nn.Linear) — and loading via
-    # AutoModelForCausalLM still brings those towers along. PEFT walks the whole
-    # model matching a plain name list and crashes on the unsupported wrapper
-    # type *before* exclude_modules can filter it (huggingface/peft#3129). When
-    # such wrappers are present, scope LoRA to the language-model stack via a
-    # regex: the text decoder uses plain nn.Linear, so q/k/v/o + MLP match
-    # cleanly while the (never-run) vision/audio towers are left untouched.
-    has_clippable = any(
-        type(m).__name__ == "Gemma4ClippableLinear" for m in model.modules()
-    )
-    if has_clippable:
-        names = "|".join(cfg.LORA_TARGET_MODULES)
-        target_modules = rf".*language_model.*\.({names})$"
-        log.info("  Gemma clippable towers detected — scoping LoRA to the "
-                 "language model via regex: %s", target_modules)
-
     lcfg = LoraConfig(
         r=cfg.LORA_R,
         lora_alpha=cfg.LORA_ALPHA,
         lora_dropout=cfg.LORA_DROPOUT,
-        target_modules=target_modules,
+        target_modules=cfg.LORA_TARGET_MODULES,
         task_type=TaskType.CAUSAL_LM,
         bias="none",
     )

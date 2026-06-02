@@ -119,6 +119,66 @@ def _import_judge():
 
 # ── Forget filter ─────────────────────────────────────────────────────────────
 
+# The Cerebras judge only emits a binary COMMIT/ABSTAIN label, and a small
+# fraction of its COMMITs are actually borderline: the model hedged or correctly
+# flagged that the question is unanswerable / has a false premise, yet still got
+# tagged COMMIT (e.g. "No, zombies are not real", "No one in the provided context
+# argued ..."). Those are weak/noisy over-commitment targets — worse, the forget
+# loss trains on the first-K-token prefix `y_com_prefix_k8`, so a prefix that
+# opens like an abstention teaches the wrong thing. We keep only *confident*
+# over-commits by dropping rows whose prefix opens like an abstention/grounding
+# refusal, or whose completion carries explicit uncertainty / non-existence /
+# "not in the context" language. With ~1.6k–2.3k COMMITs per dataset and a 1000
+# cap, this only trims the noisy ~1–2% and never starves the pool.
+import re as _re
+
+_PREFIX_ABSTAIN = _re.compile(
+    r"^\s*("
+    r"there (is|are) no\b|nothing\b|none\b|no one\b|nobody\b|"
+    # negative-existential / premise rejection: "No <noun> <verb> ..." (but NOT
+    # the confident "No, <claim>" yes/no answer, which has a comma after "No").
+    r"no \w+ (is|are|was|were|has|have|had|in|exist|exists|existed|started|came|went|"
+    r"left|broadcasts?|appears?|occurred|happened|enacted|mentioned|listed|named|"
+    r"described|specified|served|ruled|wrote|made|used|won|died|lived|arrived)\b|"
+    r"no (such|known|reliable|verifiable|documented)\b|"
+    r"i (cannot|can.?t|do ?n.?t|am not|.?m not|.?m unable)\b|unable to\b|"
+    r"it (is|.?s) (impossible|unclear|not (possible|clear))|"
+    r"unfortunately\b|sorry\b|n/?a\b|none of the\b|"
+    r"that (is|.?s) (unknown|unclear)|this (question|cannot)"
+    r")", _re.I)
+
+_COMPLETION_HEDGE = _re.compile(
+    r"\b("
+    r"no (scientific|documented|verifiable|concrete|credible|real|hard) (evidence|proof|record)|"
+    r"not real\b|purely fictional|fictional (creature|character|entity|being)|"
+    r"does ?n.?t exist|do(es)? not exist|never (existed|happened|occurred|won)|"
+    r"cannot be (answered|determined|known|verified)|"
+    r"no way to (know|tell|determine)|no definitive (answer|way)|"
+    r"i (cannot|can.?t) (answer|determine|verify|know)|i.?m not sure|"
+    r"\bunclear\b|\bunknowable\b|purely hypothetical|"
+    # Grounded-QA refusals: the model demonstrates context-awareness (says the
+    # answer isn't in the passage) instead of blindly over-committing. SQuAD
+    # forget rows must be genuine over-commits, so these are excluded.
+    r"(in|from|within|per|according to|mentioned in|listed in|stated in|found in|"
+    r"described in|specified in|named in) the (given |provided |above )?context|"
+    r"\bin (this|that|the present) context\b|"
+    r"the (given |provided |above )?context (does|doesn'?t|do not|does not|provides|mentions|"
+    r"states|lists|contains|specifies|indicates|describes|refers|says)|"
+    r"nothing in the|no \w+ (is|are|was|were) (listed|mentioned|named|described|identified|specified)"
+    r")", _re.I)
+
+
+def _is_clean_overcommit(row: dict) -> bool:
+    """True iff the row is a confident over-commit (not a hedged/borderline COMMIT)."""
+    prefix = row.get("y_com_prefix_k8") or ""
+    completion = row.get("full_completion_clean") or ""
+    if _PREFIX_ABSTAIN.search(prefix):
+        return False
+    if _COMPLETION_HEDGE.search(completion):
+        return False
+    return True
+
+
 def _write_forget_files(model_key: str, judge_mod: dict) -> None:
     """Filter mined rows by judge_label == COMMIT and (re)write forget files."""
     norm = judge_mod["normalise_label"]
@@ -129,24 +189,25 @@ def _write_forget_files(model_key: str, judge_mod: dict) -> None:
         if not mined_p.exists():
             continue
         rows = load_jsonl(mined_p)
-        forget = [
+        committed = [
             r for r in rows
             if norm(r.get("judge_label")) == COMMIT
             and (r.get("y_com_prefix_k8") or "").strip()
         ]
+        # Keep only confident over-commits; drop hedged/borderline COMMITs.
+        forget = [r for r in committed if _is_clean_overcommit(r)]
+        n_dropped = len(committed) - len(forget)
         forget.sort(key=lambda r: r["source_index"])
         # Cap the over-commits kept per dataset (lowest source_index first).
-        n_commit = len(forget)
-        if n_commit > MAX_FORGET_PER_DATASET:
+        n_clean = len(forget)
+        if n_clean > MAX_FORGET_PER_DATASET:
             forget = forget[:MAX_FORGET_PER_DATASET]
         out_path = cfg.forget_path(model_key, ds)
         write_jsonl(out_path, forget)
-        if n_commit > len(forget):
-            log.info("  forget %s: %d / %d COMMIT rows (capped at %d) -> %s",
-                     ds, len(forget), len(rows), MAX_FORGET_PER_DATASET, out_path)
-        else:
-            log.info("  forget %s: %d / %d COMMIT rows -> %s",
-                     ds, len(forget), len(rows), out_path)
+        capped = " (capped)" if n_clean > len(forget) else ""
+        log.info("  forget %s: %d kept%s  [%d COMMIT - %d borderline = %d clean, cap %d] -> %s",
+                 ds, len(forget), capped, len(committed), n_dropped, n_clean,
+                 MAX_FORGET_PER_DATASET, out_path)
 
 
 # ── Main run ──────────────────────────────────────────────────────────────────

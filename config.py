@@ -76,13 +76,6 @@ MODEL_REGISTRY: dict[str, str] = {
     # The `-BF16` instruct release is used for the same no-FP8-dequant reason as
     # the 8B (the unsuffixed 14B instruct ships FP8 weights).
     "ministral14b_instruct": "mistralai/Ministral-3-14B-Instruct-2512-BF16",
-    # Gemma 4 E4B (Google). Dense decoder (enable_moe_block=False), ~4.5B
-    # effective / 42 text layers. Shipped as a multimodal
-    # Gemma4ForConditionalGeneration checkpoint; we load the text tower only
-    # (see _common.load_model_and_tokenizer). Chat templating uses
-    # enable_thinking=False, which on E2B/E4B emits a direct answer (no thinking
-    # tokens), keeping the prompt→answer transition aligned with the other models.
-    "gemma_instruct":     "google/gemma-4-E4B-it",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -93,8 +86,6 @@ LAYER_SLICE: dict[str, list[int]] = {
     "ministral_base":     [25, 26, 27, 28, 29, 30, 31, 32, 33],
     # Ministral-3-14B: 40 text layers → last 25% = layers 30-39.
     "ministral14b_instruct": [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
-    # Gemma 4 E4B: 42 text layers → last 25% = layers 31-41.
-    "gemma_instruct":     [31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41],
 }
 
 
