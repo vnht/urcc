@@ -164,8 +164,35 @@ _COMPLETION_HEDGE = _re.compile(
     r"\bin (this|that|the present) context\b|"
     r"the (given |provided |above )?context (does|doesn'?t|do not|does not|provides|mentions|"
     r"states|lists|contains|specifies|indicates|describes|refers|says)|"
-    r"nothing in the|no \w+ (is|are|was|were) (listed|mentioned|named|described|identified|specified)"
+    r"nothing in the|no \w+ (is|are|was|were) (listed|mentioned|named|described|identified|specified)|"
+    # Grounding-aware non-answers: "<X> is not mentioned/stated/listed ...". The
+    # model flags that the passage doesn't support the asked-for fact instead of
+    # blindly over-committing — must be excluded from SQuAD forget rows.
+    r"\bnot (mentioned|stated|listed|specified|provided|discussed|named|identified|"
+    r"defined|described|analyzed|analyzes|present)\b"
     r")", _re.I)
+
+# Assistant-persona deflections ("I'm a large language model, I don't have
+# personal preferences ...", "As an AI ..."). These are chat-style refusals to
+# answer subjective/preference prompts, not confident factual over-commits, and
+# their K8 prefix would teach the model to suppress the identity opener.
+_IDENTITY_DEFLECTION = _re.compile(
+    r"\bi'?m an? (large )?(language model|ai)\b|\bas an ai\b|"
+    r"\bi (do ?n.?t|don'?t|cannot|can'?t) have (personal|access|opinions|preferences|feelings)\b",
+    _re.I)
+
+# Premise-pushback / meta-commentary: the model reasons *about the question*
+# ("the question does not specify ...", "the question seems to be asking ...",
+# "there is no clear answer") instead of confidently asserting a wrong answer.
+# These are correct/cautious responses mis-tagged COMMIT, not over-commitment,
+# so they must not enter the forget set. Matched on prefix or full completion.
+_META_PUSHBACK = _re.compile(
+    r"\bthe question (does ?n.?t|does not|is asking|asks|seems|appears|"
+    r"is ambiguous|is unclear|contains|assumes|presupposes|implies|itself)\b|"
+    r"\b(does ?n.?t|do not|does not) (specify|provide|mention|state|indicate)\b|"
+    r"\bthere (is|.?s) no (clear |single |definitive |specific )?answer\b|"
+    r"\bthis (is|.?s) (a |an )?(trick|nonsensical|ambiguous|unclear|confusing)\b",
+    _re.I)
 
 
 def _is_clean_overcommit(row: dict) -> bool:
@@ -175,6 +202,10 @@ def _is_clean_overcommit(row: dict) -> bool:
     if _PREFIX_ABSTAIN.search(prefix):
         return False
     if _COMPLETION_HEDGE.search(completion):
+        return False
+    if _META_PUSHBACK.search(prefix) or _META_PUSHBACK.search(completion):
+        return False
+    if _IDENTITY_DEFLECTION.search(prefix) or _IDENTITY_DEFLECTION.search(completion):
         return False
     return True
 
