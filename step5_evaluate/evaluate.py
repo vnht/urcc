@@ -703,7 +703,7 @@ def parse_args() -> argparse.Namespace:
                    help="Which answerability datasets to evaluate "
                         "(default: kuq + squad — the two trained domains). "
                         "Other held-out sets registered in config.DOMAIN_OF: "
-                        "selfaware, falseqa, qaqa (no-context); "
+                        "selfaware, qaqa (no-context); "
                         "faitheval, nomiracl (with-context).")
     p.add_argument("--max-response-tokens", type=int, default=DEFAULT_MAX_RESPONSE_TOKENS,
                    help=f"Cap UltraChat response token length (default {DEFAULT_MAX_RESPONSE_TOKENS}).")

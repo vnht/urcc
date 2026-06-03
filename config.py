@@ -76,6 +76,11 @@ MODEL_REGISTRY: dict[str, str] = {
     # The `-BF16` instruct release is used for the same no-FP8-dequant reason as
     # the 8B (the unsuffixed 14B instruct ships FP8 weights).
     "ministral14b_instruct": "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    # Llama 3.1-8B (Meta). Dense, natively-trained transformer (32 layers, hidden
+    # 4096, GQA, RoPE) — standard q/k/v/o + gate/up/down projections, so it uses
+    # the default LoRA targets and loads via the generic AutoModelForCausalLM path.
+    "llama_instruct":     "meta-llama/Llama-3.1-8B-Instruct",
+    "llama_base":         "meta-llama/Llama-3.1-8B",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -86,6 +91,9 @@ LAYER_SLICE: dict[str, list[int]] = {
     "ministral_base":     [25, 26, 27, 28, 29, 30, 31, 32, 33],
     # Ministral-3-14B: 40 text layers → last 25% = layers 30-39.
     "ministral14b_instruct": [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+    # Llama 3.1-8B: 32 text layers → last 25% = layers 24-31 (same as Qwen).
+    "llama_instruct":     [24, 25, 26, 27, 28, 29, 30, 31],
+    "llama_base":         [24, 25, 26, 27, 28, 29, 30, 31],
 }
 
 
@@ -133,7 +141,6 @@ DOMAIN_OF: dict[str, str] = {
     "squad":      "squad",
     # New held-out, no-context
     "selfaware":  "kuq",
-    "falseqa":    "kuq",
     "qaqa":       "kuq",
     # New held-out, with-context
     "faitheval":  "squad",

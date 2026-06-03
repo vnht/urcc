@@ -276,7 +276,9 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
     log.info("Loading model %s ...", model_id)
     t0 = time.time()
 
-    if model_id.startswith("Qwen/"):
+    if model_id.startswith(("Qwen/", "meta-llama/")):
+        # Both load as plain dense CausalLMs with a standard chat template; the
+        # generic AutoModelForCausalLM + AutoTokenizer path covers both.
         from transformers import AutoModelForCausalLM, AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
         model = AutoModelForCausalLM.from_pretrained(

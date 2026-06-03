@@ -221,7 +221,6 @@ Each step lives in its own folder and owns its `data/` subdirectory.
         │   ├── kuq.jsonl              trained domain — no-context
         │   ├── squad.jsonl            trained domain — with-context
         │   ├── selfaware.jsonl        held-out — no-context
-        │   ├── falseqa.jsonl          held-out — no-context (false-premise)
         │   ├── qaqa.jsonl             held-out — no-context (false-premise)
         │   ├── truthfulqa.jsonl       held-out — no-context
         │   ├── faitheval.jsonl        held-out — with-context
@@ -261,7 +260,7 @@ python3 step3_build_anchors/build_anchors.py     --model qwen_instruct
 # Runs answerability (KUQ + SQuAD by default) AND UltraChat perplexity in one model load.
 # Pass --datasets to also run the held-out generalisation sets.
 python3 step5_evaluate/evaluate.py               --model qwen_instruct \
-    --datasets kuq squad selfaware falseqa qaqa truthfulqa faitheval musique nomiracl
+    --datasets kuq squad selfaware qaqa truthfulqa faitheval musique nomiracl
 
 # Step 4 — train with the two-component UOC loss
 python3 step4_train/train.py                     --model qwen_instruct \
@@ -269,7 +268,7 @@ python3 step4_train/train.py                     --model qwen_instruct \
 
 # Step 5 (trained) — evaluate the LoRA adapter and compare against the baseline
 python3 step5_evaluate/evaluate.py               --run-dir step4_train/data/runs/<run_name> \
-    --datasets kuq squad selfaware falseqa qaqa truthfulqa faitheval musique nomiracl \
+    --datasets kuq squad selfaware qaqa truthfulqa faitheval musique nomiracl \
     --baseline step5_evaluate/data/results/baseline_qwen_instruct
 
 # Plot training curves
