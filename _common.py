@@ -280,7 +280,12 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
         # Both load as plain dense CausalLMs with a standard chat template; the
         # generic AutoModelForCausalLM + AutoTokenizer path covers both.
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        # BPE tokenizers (Qwen, Llama) don't use WordPiece-style space cleanup;
+        # transformers already ignores the True default and warns. Set it False
+        # explicitly to silence the warning (no behavioural change).
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id, token=hf_token, clean_up_tokenization_spaces=False,
+        )
         model = AutoModelForCausalLM.from_pretrained(
             model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
         )
