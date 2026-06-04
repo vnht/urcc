@@ -110,6 +110,38 @@ def _save_dataset_json(path: Path, data: dict) -> None:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
+def _resolve_adapter_dir(run_dir: Path) -> Path:
+    """Return the directory that actually holds the LoRA adapter weights.
+
+    Accepts either `run_dir` itself or a `checkpoint-*` subfolder. Raises a
+    clear error if no adapter weights are found, instead of letting PEFT fall
+    back to a remote repo-id lookup (which fails with a cryptic
+    HFValidationError on a local path).
+    """
+    weight_names = ("adapter_model.safetensors", "adapter_model.bin")
+
+    def has_adapter(d: Path) -> bool:
+        return (d / "adapter_config.json").exists() and any(
+            (d / w).exists() for w in weight_names
+        )
+
+    if has_adapter(run_dir):
+        return run_dir
+    # Fall back to the latest checkpoint-* subdir that has the weights.
+    ckpts = sorted(
+        (d for d in run_dir.glob("checkpoint-*") if has_adapter(d)),
+        key=lambda d: int(d.name.split("-")[-1]) if d.name.split("-")[-1].isdigit() else -1,
+    )
+    if ckpts:
+        log.info("  adapter weights found in %s", ckpts[-1])
+        return ckpts[-1]
+    raise FileNotFoundError(
+        f"No LoRA adapter weights ({' or '.join(weight_names)}) found in "
+        f"{run_dir} or any checkpoint-* subdir. Contents: "
+        f"{sorted(p.name for p in run_dir.iterdir()) if run_dir.exists() else 'MISSING'}"
+    )
+
+
 def _load_adapter_model(run_dir: Path):
     """Load base model from training_config.json + apply LoRA adapter."""
     cfg_path = run_dir / "training_config.json"
@@ -118,9 +150,10 @@ def _load_adapter_model(run_dir: Path):
     train_cfg = json.loads(cfg_path.read_text())
     model_key = train_cfg["model_key"]
 
+    adapter_dir = _resolve_adapter_dir(run_dir)
     model, tokenizer = load_model_and_tokenizer(model_key, eval_only=True)
     from peft import PeftModel
-    model = PeftModel.from_pretrained(model, str(run_dir))
+    model = PeftModel.from_pretrained(model, str(adapter_dir), local_files_only=True)
     model.eval()
     return model, tokenizer, model_key
 
