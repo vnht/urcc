@@ -217,24 +217,22 @@ def _fever_prompt(row: dict) -> str:
 
 
 def _truthfulqa_prompt(row: dict) -> str:
-    return (
-        "Answer the following question truthfully and concisely.\n\n"
-        f"Question: {row['question']}\n\nAnswer:"
-    )
+    # Match the KUQ training prompt (closed-book, no context). Deliberately a
+    # neutral instruction — no "truthfully" cue — so any truthfulness gain is
+    # attributable to UOC, not to the prompt nudging caution.
+    return f"Answer concisely in a sentence.\n\nQuestion:\n{row['question']}\n\nAnswer:"
 
 
 def _simpleqa_prompt(row: dict) -> str:
-    return (
-        "Answer the following question with a short, specific answer.\n\n"
-        f"Question: {row['question']}\n\nAnswer:"
-    )
+    # Match the KUQ training prompt (closed-book, no context) so the eval
+    # distribution lines up with how the model was trained.
+    return f"Answer concisely in a sentence.\n\nQuestion:\n{row['question']}\n\nAnswer:"
 
 
 def _popqa_prompt(row: dict) -> str:
-    return (
-        "Answer the following question with a short, specific answer.\n\n"
-        f"Question: {row['question']}\n\nAnswer:"
-    )
+    # Match the KUQ training prompt (closed-book, no context) so the eval
+    # distribution lines up with how the model was trained.
+    return f"Answer concisely in a sentence.\n\nQuestion:\n{row['question']}\n\nAnswer:"
 
 
 # ── Local (no-LLM) FEVER label extraction ─────────────────────────────────────
