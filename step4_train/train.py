@@ -692,6 +692,7 @@ def train(args: argparse.Namespace) -> None:
     last_step_t = train_t0
 
     skipped_steps = 0  # count optim steps to skip during resume warm-up
+    done = False       # set once optim_step reaches total_optim_steps
 
     for ep in range(args.epochs):
         random.shuffle(forget_data)
@@ -734,14 +735,6 @@ def train(args: argparse.Namespace) -> None:
                 scheduler.step()
                 optimizer.zero_grad()
                 optim_step += 1
-
-                # Skip already-completed optim steps when resuming
-                if optim_step <= start_step:
-                    skipped_steps += 1
-                    accum_forget = torch.tensor(0.0)
-                    accum_retain = torch.tensor(0.0)
-                    accum_proj = []
-                    continue
 
                 now = time.time()
                 step_dt = now - last_step_t
@@ -823,6 +816,18 @@ def train(args: argparse.Namespace) -> None:
                     )
                     log.info("  checkpoint @ step %d  (resume from here on restart)",
                              optim_step)
+
+                # Stop exactly at the target step count. Critical on resume:
+                # optim_step starts at the restored checkpoint step (optimizer
+                # and scheduler are restored to match), so the epoch loop must
+                # terminate here instead of running a full fresh 3-epoch pass
+                # on top of the resumed steps.
+                if optim_step >= total_optim_steps:
+                    done = True
+                    break
+
+        if done:
+            break
 
     log_file.close()
     progress.done(extras={"final_step": optim_step,
