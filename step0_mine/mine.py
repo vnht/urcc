@@ -62,6 +62,17 @@ from _common import (
 # source_index first) so D_F stays balanced across datasets.
 MAX_FORGET_PER_DATASET = 1000
 
+# Datasets whose forget pool is selected to be *balanced across their subtype
+# label* (the `category` field in the sampled file) instead of taken first-N by
+# source_index. KUQ unanswerable questions carry a 6-way subtype taxonomy
+# (controversial / counterfactual / future unknown / ambiguous / unsolved
+# problem / false assumption); the natural mined skew under-represents the
+# scarcer subtypes (e.g. false assumption), so we water-fill an even quota per
+# subtype. This is a distribution-design choice on the *trained* KUQ domain — it
+# does NOT peek at any held-out eval set. SQuAD has no subtype field and is left
+# as first-N by source_index.
+BALANCE_BY_CATEGORY = frozenset({"kuq"})
+
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -210,6 +221,71 @@ def _is_clean_overcommit(row: dict) -> bool:
     return True
 
 
+def _category_map(dataset: str) -> dict[str, str]:
+    """Map source_id -> subtype `category` from the sampled file used in mining."""
+    path = cfg.sampled_unanswerable_path(dataset)
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for r in load_jsonl(path):
+        cat = r.get("category")
+        if cat is not None:
+            out[str(r.get("id"))] = cat
+    return out
+
+
+def _balanced_quota(avail: dict[str, int], total: int) -> dict[str, int]:
+    """Water-fill an even per-bucket quota summing to min(total, sum(avail)).
+
+    Each bucket gets an equal share; buckets that can't fill their share donate
+    the deficit, which is redistributed evenly among buckets that still have
+    surplus. Result is as close to uniform as the per-bucket availability allows.
+    """
+    alloc = {k: 0 for k in avail}
+    active = {k for k, n in avail.items() if n > 0}
+    remaining = min(total, sum(avail.values()))
+    while remaining > 0 and active:
+        share = remaining // len(active)
+        if share == 0:
+            # Hand out the final remainder one-by-one to the roomiest buckets.
+            for k in sorted(active, key=lambda k: avail[k] - alloc[k], reverse=True):
+                if remaining == 0:
+                    break
+                alloc[k] += 1
+                remaining -= 1
+                if alloc[k] >= avail[k]:
+                    active.discard(k)
+            break
+        for k in list(active):
+            add = min(share, avail[k] - alloc[k])
+            alloc[k] += add
+            remaining -= add
+            if alloc[k] >= avail[k]:
+                active.discard(k)
+    return alloc
+
+
+def _select_balanced(rows: list[dict], cat_of: dict[str, str],
+                     total: int) -> tuple[list[dict], dict[str, int]]:
+    """Pick `total` rows balanced across subtype, deterministic within bucket.
+
+    Rows whose source_id has no known category fall into an `__unknown__` bucket
+    so nothing is silently dropped before quota assignment.
+    """
+    buckets: dict[str, list[dict]] = {}
+    for r in rows:
+        cat = cat_of.get(str(r.get("source_id")), "__unknown__")
+        buckets.setdefault(cat, []).append(r)
+    for b in buckets.values():
+        b.sort(key=lambda r: r["source_index"])
+    quota = _balanced_quota({k: len(v) for k, v in buckets.items()}, total)
+    selected: list[dict] = []
+    for cat, n in quota.items():
+        selected.extend(buckets[cat][:n])
+    selected.sort(key=lambda r: r["source_index"])
+    return selected, quota
+
+
 def _write_forget_files(model_key: str, judge_mod: dict) -> None:
     """Filter mined rows by judge_label == COMMIT and (re)write forget files."""
     norm = judge_mod["normalise_label"]
@@ -228,17 +304,32 @@ def _write_forget_files(model_key: str, judge_mod: dict) -> None:
         # Keep only confident over-commits; drop hedged/borderline COMMITs.
         forget = [r for r in committed if _is_clean_overcommit(r)]
         n_dropped = len(committed) - len(forget)
-        forget.sort(key=lambda r: r["source_index"])
-        # Cap the over-commits kept per dataset (lowest source_index first).
         n_clean = len(forget)
-        if n_clean > MAX_FORGET_PER_DATASET:
-            forget = forget[:MAX_FORGET_PER_DATASET]
         out_path = cfg.forget_path(model_key, ds)
-        write_jsonl(out_path, forget)
-        capped = " (capped)" if n_clean > len(forget) else ""
-        log.info("  forget %s: %d kept%s  [%d COMMIT - %d borderline = %d clean, cap %d] -> %s",
-                 ds, len(forget), capped, len(committed), n_dropped, n_clean,
-                 MAX_FORGET_PER_DATASET, out_path)
+
+        if ds in BALANCE_BY_CATEGORY:
+            # Subtype-balanced selection on the trained domain (no eval peeking).
+            cat_of = _category_map(ds)
+            forget, quota = _select_balanced(forget, cat_of, MAX_FORGET_PER_DATASET)
+            write_jsonl(out_path, forget)
+            mix = "  ".join(f"{k}={v}" for k, v in sorted(quota.items(),
+                                                          key=lambda kv: -kv[1]))
+            capped = " (capped)" if n_clean > len(forget) else ""
+            log.info("  forget %s: %d kept%s  [%d COMMIT - %d borderline = %d clean, cap %d]"
+                     "  balanced-by-subtype -> %s",
+                     ds, len(forget), capped, len(committed), n_dropped, n_clean,
+                     MAX_FORGET_PER_DATASET, out_path)
+            log.info("    subtype quota: %s", mix)
+        else:
+            forget.sort(key=lambda r: r["source_index"])
+            # Cap the over-commits kept per dataset (lowest source_index first).
+            if n_clean > MAX_FORGET_PER_DATASET:
+                forget = forget[:MAX_FORGET_PER_DATASET]
+            write_jsonl(out_path, forget)
+            capped = " (capped)" if n_clean > len(forget) else ""
+            log.info("  forget %s: %d kept%s  [%d COMMIT - %d borderline = %d clean, cap %d] -> %s",
+                     ds, len(forget), capped, len(committed), n_dropped, n_clean,
+                     MAX_FORGET_PER_DATASET, out_path)
 
 
 # ── Main run ──────────────────────────────────────────────────────────────────
