@@ -33,6 +33,7 @@ Run
 from __future__ import annotations
 
 import argparse
+import json as _json
 import sys
 import time
 from pathlib import Path
@@ -222,15 +223,29 @@ def _is_clean_overcommit(row: dict) -> bool:
 
 
 def _category_map(dataset: str) -> dict[str, str]:
-    """Map source_id -> subtype `category` from the sampled file used in mining."""
-    path = cfg.sampled_unanswerable_path(dataset)
+    """Map source_id -> subtype `category`.
+
+    Joins against the *full processed dataset* (the stable id-space) rather than
+    the sampled file, which can be regenerated/re-sampled between mining runs and
+    would then fail to cover older mined source_ids.
+    """
+    path = cfg.REPO_ROOT / "datasets" / "processed" / f"{dataset}.jsonl"
     if not path.exists():
-        return {}
+        path = cfg.sampled_unanswerable_path(dataset)  # fallback
+        if not path.exists():
+            return {}
     out: dict[str, str] = {}
-    for r in load_jsonl(path):
-        cat = r.get("category")
-        if cat is not None:
-            out[str(r.get("id"))] = cat
+    # Read line-by-line (split on '\n' only): processed question text can contain
+    # unicode line separators that str.splitlines() would wrongly break records on.
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = _json.loads(line)
+            cat = r.get("category")
+            if cat is not None:
+                out[str(r.get("id"))] = cat
     return out
 
 
