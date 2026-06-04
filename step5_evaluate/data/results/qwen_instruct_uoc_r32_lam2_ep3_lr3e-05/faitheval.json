@@ -12,8 +12,8 @@
     "num_empty_completions": 0,
     "num_empty_completions_answerable": 0,
     "num_empty_completions_unanswerable": 0,
-    "true_commitment_rate": NaN,
-    "false_abstention_rate": NaN,
+    "true_commitment_rate": 0,
+    "false_abstention_rate": 0,
     "true_abstention_rate": 0.849,
     "false_commitment_rate": 0.151,
     "decision_accuracy": 0.849
