@@ -1,0 +1,17 @@
+{
+  "subspace_file": "subspace_ministral14b_instruct_r32.pt",
+  "anchors_file": "anchors_ministral14b_instruct.pt",
+  "layers": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39
+  ],
+  "rank": 32
+}
