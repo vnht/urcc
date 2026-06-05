@@ -276,11 +276,9 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
     log.info("Loading model %s ...", model_id)
     t0 = time.time()
 
-    if model_id.startswith(("Qwen/", "meta-llama/")):
-        # Both load as plain dense CausalLMs with a standard chat template; the
-        # generic AutoModelForCausalLM + AutoTokenizer path covers both.
+    if model_id.startswith("Qwen/"):
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        # BPE tokenizers (Qwen, Llama) don't use WordPiece-style space cleanup;
+        # Qwen BPE tokenizer doesn't use WordPiece-style space cleanup;
         # transformers already ignores the True default and warns. Set it False
         # explicitly to silence the warning (no behavioural change).
         tokenizer = AutoTokenizer.from_pretrained(
