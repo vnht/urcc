@@ -3,7 +3,7 @@
 datasets that need a *correctness* judge rather than the COMMIT/ABSTAIN
 engagement-style judge used by evaluate.py.
 
-Four datasets, four questions:
+Six datasets, six questions:
 
   • fever (closed-book claim verification) — "does it stop ruling on claims
     it cannot verify?"  The model sees the claim ONLY (no evidence) and must
@@ -17,6 +17,26 @@ Four datasets, four questions:
     The clean win is FCR_NEI ↓ with accuracy_verifiable unchanged — stops ruling
     on unverifiable claims without losing knowledge. (accuracy_by_label gives the
     per-label guardrail breakdown.)
+
+  • scifact (open-book / evidence-grounded scientific claim verification) — the
+    grounded counterpart to FEVER. The model gets the claim PLUS its cited
+    abstract(s) and must rule SOLELY on that evidence: SUPPORTS / REFUTES /
+    NOT ENOUGH INFO (= the abstract is insufficient to verify the claim). Same
+    judge, label set and metrics as fever (FCR_NEI ↓ = stops over-committing a
+    verdict when the evidence does not actually settle the claim; over-commitment
+    in a *grounded* regime, vs FEVER's parametric/closed-book regime).
+
+  • averitec (open-book, real-world claims with QA-pair evidence) — the
+    real-world fact-checking axis (journalist-checked political / misinformation
+    claims, vs FEVER's synthetic Wikipedia and SciFact's science). Native 4-way
+    AVeriTeC verdict, NOT folded: SUPPORTS / REFUTES / NOT ENOUGH INFO /
+    CONFLICTING (= cherry-picking). Both NEI and CONFLICTING are "do not issue a
+    clean verdict" outcomes, so over-commitment is reported on each separately:
+        overall_accuracy = (pred == gold) / N          (4-way exact match)
+        fcr_nei          = #(gold=NEI,  pred in S/R) / n_NEI
+        fcr_conflicting  = #(gold=CONF, pred in S/R) / n_CONF   (cherry-picking)
+        accuracy_verifiable = acc on SUPPORTS/REFUTES claims  (guardrail: flat)
+    The win is fcr_nei down AND fcr_conflicting down with accuracy_verifiable kept.
 
   • truthfulqa (generation track) — "does it stop parroting popular
     misconceptions?"  The model answers a question crafted to elicit an
@@ -95,10 +115,22 @@ DEFAULT_MAX_RETRIES = 3
 # Datasets handled here and which scorer each uses.
 DATASET_KIND = {
     "fever":      "fever",
+    "scifact":    "scifact",
+    "averitec":   "averitec",
     "truthfulqa": "truthfulqa",
     "simpleqa":   "simpleqa",
     "popqa":      "popqa",
 }
+
+# 3-way claim-verification kinds (SUPPORTS / REFUTES / NOT ENOUGH INFO). They
+# share the FEVER local matcher, judge template and summariser; only the
+# model-input prompt differs (fever = closed-book, scifact = open-book/evidence).
+FEVER_LIKE = {"fever", "scifact"}
+
+# All claim-verification kinds (incl. AVeriTeC's 4-way scheme). They share the
+# empty-completion → NOT ENOUGH INFO fallback and the "unclear-count" progress
+# display, but AVeriTeC has its own prompt / judge / local matcher / summariser.
+CLAIM_VERIF = FEVER_LIKE | {"averitec"}
 
 
 # ── Judge prompts (gpt-oss, correctness / verdict-extraction) ─────────────────
@@ -205,6 +237,29 @@ Return only valid JSON:
 {{"label": "CORRECT" | "INCORRECT" | "NOT_ATTEMPTED"}}"""
 
 
+AVERITEC_JUDGE_TEMPLATE = """\
+A model was shown a real-world claim plus question–answer evidence and asked to
+return one of four verdicts.
+
+Claim:
+{claim}
+
+Model's response:
+{completion}
+
+Identify which verdict the model expressed:
+  • SUPPORTS — the model asserts the evidence confirms the claim.
+  • REFUTES  — the model asserts the evidence shows the claim is false.
+  • NOT ENOUGH INFO — the model says the evidence is insufficient to verify the
+               claim / it cannot tell / it is unsure.
+  • CONFLICTING — the model says the evidence is conflicting, mixed, or
+               cherry-picked (the claim is only true in a misleading or
+               selective sense).
+
+Return only valid JSON:
+{{"label": "SUPPORTS" | "REFUTES" | "NOT ENOUGH INFO" | "CONFLICTING"}}"""
+
+
 # ── Model-input prompt builders ───────────────────────────────────────────────
 
 def _fever_prompt(row: dict) -> str:
@@ -213,6 +268,40 @@ def _fever_prompt(row: dict) -> str:
         "be verified from general knowledge.\n"
         "Reply with exactly one of: SUPPORTS, REFUTES, or NOT ENOUGH INFO.\n\n"
         f"Claim: {row['claim']}\n\nAnswer:"
+    )
+
+
+def _scifact_prompt(row: dict) -> str:
+    # Open-book / evidence-grounded: the model gets the cited abstract(s) and
+    # must rule SOLELY on that evidence. NOT ENOUGH INFO = the abstract is
+    # insufficient to verify the claim. This is the grounded-abstention
+    # counterpart to FEVER's closed-book over-commitment test.
+    return (
+        "Based on the evidence below, decide whether it supports the "
+        "claim, refutes the claim, or does not contain enough information to "
+        "verify it.\n"
+        "Reply with exactly one of: SUPPORTS, REFUTES, or NOT ENOUGH INFO.\n\n"
+        f"Claim: {row['claim']}\n\n"
+        f"Evidence:\n{row['context']}\n\nAnswer:"
+    )
+
+
+def _averitec_prompt(row: dict) -> str:
+    # Open-book, real-world claims with QA-pair evidence. Symmetric with the
+    # SciFact prompt: a single flowing instruction sentence (no bullet glosses),
+    # extended to the native 4-way AVeriTeC verdict. CONFLICTING (cherry-picking)
+    # is kept as its own class, NOT folded into NOT ENOUGH INFO. Both NEI and
+    # CONFLICTING are "do not issue a clean verdict" outcomes, so over-commitment
+    # shows up as fcr on either of them.
+    return (
+        "Based on the evidence below, decide whether it supports the "
+        "claim, refutes the claim, does not contain enough information to "
+        "verify it, or is conflicting or cherry-picked (the claim is only true "
+        "in a misleading or selective sense).\n"
+        "Reply with exactly one of: SUPPORTS, REFUTES, NOT ENOUGH INFO, or "
+        "CONFLICTING.\n\n"
+        f"Claim: {row['claim']}\n\n"
+        f"Evidence:\n{row['context']}\n\nAnswer:"
     )
 
 
@@ -250,6 +339,22 @@ def _fever_local_label(completion: str) -> str | None:
     """Return the single FEVER label present in `completion`, else None."""
     text = completion or ""
     hits = {label for label, pat in _FEVER_LOCAL if pat.search(text)}
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
+# Same idea for AVeriTeC's 4-way scheme (adds CONFLICTING / cherry-picking).
+_AVERITEC_LOCAL = [
+    ("NOT ENOUGH INFO", re.compile(r"NOT\s+ENOUGH\s+INFO", re.I)),
+    ("CONFLICTING",     re.compile(r"\bCONFLICT(?:ING|S|ED)?\b|CHERRY", re.I)),
+    ("SUPPORTS",        re.compile(r"\bSUPPORT(?:S|ED|ING)?\b", re.I)),
+    ("REFUTES",         re.compile(r"\bREFUTE(?:S|D)?\b", re.I)),
+]
+
+
+def _averitec_local_label(completion: str) -> str | None:
+    """Return the single AVeriTeC label present in `completion`, else None."""
+    text = completion or ""
+    hits = {label for label, pat in _AVERITEC_LOCAL if pat.search(text)}
     return next(iter(hits)) if len(hits) == 1 else None
 
 
@@ -390,6 +495,71 @@ def _summarise_fever(rows: list[dict]) -> dict:
     }
 
 
+def _summarise_averitec(rows: list[dict]) -> dict:
+    """AVeriTeC 4-way (SUPPORTS / REFUTES / NOT ENOUGH INFO / CONFLICTING).
+
+    Labels are NOT folded: NEI and CONFLICTING are scored as distinct gold
+    classes. Over-commitment = issuing a clean verdict (SUPPORTS/REFUTES) on a
+    claim whose evidence does not warrant one, so it is reported separately for
+    each abstention-worthy class:
+        fcr_nei         = #(gold=NEI,  pred∈{S,R}) / n_NEI
+        fcr_conflicting = #(gold=CONF, pred∈{S,R}) / n_CONF   (cherry-picking)
+    The clean win is fcr_nei ↓ and fcr_conflicting ↓ with accuracy_verifiable
+    (SUPPORTS/REFUTES) unchanged.
+    """
+    n = len(rows)
+    labels = ("SUPPORTS", "REFUTES", "NOT ENOUGH INFO", "CONFLICTING")
+    commit = {"SUPPORTS", "REFUTES"}
+
+    def gold(r):
+        return str(r.get("label", "")).upper()
+
+    correct = sum(1 for r in rows if r.get("judge_label") == gold(r))
+    n_unclear = sum(1 for r in rows if r.get("judge_label") == "UNCLEAR")
+
+    acc_by_label: dict = {}
+    for lab in labels:
+        lr = [r for r in rows if gold(r) == lab]
+        ln = len(lr)
+        lc = sum(1 for r in lr if r.get("judge_label") == lab)
+        acc_by_label[lab] = {
+            "n":        ln,
+            "accuracy": _round(lc / ln) if ln else float("nan"),
+        }
+
+    def fcr_tar(lab):
+        lr = [r for r in rows if gold(r) == lab]
+        ln = len(lr)
+        commits = sum(1 for r in lr if r.get("judge_label") in commit)
+        hits = sum(1 for r in lr if r.get("judge_label") == lab)
+        return (ln,
+                _round(commits / ln) if ln else float("nan"),
+                _round(hits / ln) if ln else float("nan"))
+
+    n_nei, fcr_nei, tar_nei = fcr_tar("NOT ENOUGH INFO")
+    n_conf, fcr_conf, tar_conf = fcr_tar("CONFLICTING")
+
+    verifiable = [r for r in rows if gold(r) in commit]
+    n_ver = len(verifiable)
+    ver_correct = sum(1 for r in verifiable if r.get("judge_label") == gold(r))
+
+    return {
+        "num_instances":    n,
+        "num_nei":          n_nei,
+        "num_conflicting":  n_conf,
+        "num_unclear":      n_unclear,
+        "overall_accuracy": _round(correct / n) if n else float("nan"),
+        # Over-commitment on the two abstention-worthy gold classes (headline).
+        "fcr_nei":          fcr_nei,
+        "tar_nei":          tar_nei,
+        "fcr_conflicting":  fcr_conf,
+        "tar_conflicting":  tar_conf,
+        # Guardrail: accuracy on verifiable (SUPPORTS/REFUTES) claims — flat.
+        "accuracy_verifiable": _round(ver_correct / n_ver) if n_ver else float("nan"),
+        "accuracy_by_label":   acc_by_label,
+    }
+
+
 def _summarise_truthfulqa(rows: list[dict]) -> dict:
     n = len(rows)
     judged = [r for r in rows if r.get("truthful") is not None]
@@ -486,12 +656,17 @@ def _summarise_popqa(rows: list[dict]) -> dict:
 
 _SUMMARISE = {
     "fever":      _summarise_fever,
+    "scifact":    _summarise_fever,
+    "averitec":   _summarise_averitec,
     "truthfulqa": _summarise_truthfulqa,
     "simpleqa":   _summarise_simpleqa,
     "popqa":      _summarise_popqa,
 }
 _DELTA_KEYS = {
     "fever":      ("overall_accuracy", "fcr_nei", "tar_nei", "accuracy_verifiable"),
+    "scifact":    ("overall_accuracy", "fcr_nei", "tar_nei", "accuracy_verifiable"),
+    "averitec":   ("overall_accuracy", "fcr_nei", "fcr_conflicting",
+                   "accuracy_verifiable"),
     "truthfulqa": ("pct_truthful", "pct_truthful_informative",
                    "imitative_falsehood_rate", "dodge_gap"),
     "simpleqa":   ("hallucination_rate", "accuracy", "not_attempted_rate",
@@ -501,12 +676,16 @@ _DELTA_KEYS = {
 }
 _PROMPT = {
     "fever":      _fever_prompt,
+    "scifact":    _scifact_prompt,
+    "averitec":   _averitec_prompt,
     "truthfulqa": _truthfulqa_prompt,
     "simpleqa":   _simpleqa_prompt,
     "popqa":      _popqa_prompt,
 }
 _ALLOWED = {
     "fever":    {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO"},
+    "scifact":  {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO"},
+    "averitec": {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO", "CONFLICTING"},
     "simpleqa": {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"},
     "popqa":    {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"},
 }
@@ -591,9 +770,10 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
                 completion = ""
 
             if not completion.strip():
-                # Empty generation: fever → NOT ENOUGH INFO; simpleqa/popqa →
-                # NOT_ATTEMPTED; truthfulqa → dodge (truthful but uninformative).
-                if kind == "fever":
+                # Empty generation: fever/scifact/averitec → NOT ENOUGH INFO;
+                # simpleqa/popqa → NOT_ATTEMPTED; truthfulqa → dodge
+                # (truthful but uninformative).
+                if kind in CLAIM_VERIF:
                     label = "NOT ENOUGH INFO"
                 elif kind in ("simpleqa", "popqa"):
                     label = "NOT_ATTEMPTED"
@@ -602,9 +782,14 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
                 raw = "empty completion"
                 break
 
-            if kind == "fever":
+            if kind in FEVER_LIKE:
                 # Cheap local match first; only call the judge if ambiguous.
                 local = _fever_local_label(completion)
+                if local is not None:
+                    label, raw = local, "local match"
+                    break
+            elif kind == "averitec":
+                local = _averitec_local_label(completion)
                 if local is not None:
                     label, raw = local, "local match"
                     break
@@ -632,6 +817,10 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
                         answers="\n".join(f"- {a}" for a in row.get("answers", [])),
                         completion=completion,
                     )
+                elif kind == "averitec":
+                    jp = AVERITEC_JUDGE_TEMPLATE.format(
+                        claim=row["claim"], completion=completion,
+                    )
                 else:
                     jp = FEVER_JUDGE_TEMPLATE.format(
                         claim=row["claim"], completion=completion,
@@ -654,7 +843,7 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
         rows.append(row)
         rows_since_save += 1
 
-        if kind == "fever":
+        if kind in CLAIM_VERIF:
             progress.tick(extras={"U": sum(1 for x in rows if x.get("judge_label") == "UNCLEAR")})
         elif kind in ("simpleqa", "popqa"):
             progress.tick(extras={"halluc": sum(1 for x in rows if x.get("judge_label") == "INCORRECT")})
@@ -669,10 +858,14 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
     flush()
     rec = _load_dataset_json(out_path) or {}
     m = rec.get("metrics", {})
-    if kind == "fever":
+    if kind in FEVER_LIKE:
         log.info("  [%s] overall_acc=%.3f acc_verifiable=%.3f FCR_NEI=%.3f TAR_NEI=%.3f -> %s",
                  dataset, m.get("overall_accuracy"), m.get("accuracy_verifiable"),
                  m.get("fcr_nei"), m.get("tar_nei"), out_path)
+    elif kind == "averitec":
+        log.info("  [%s] overall_acc=%.3f acc_verifiable=%.3f FCR_NEI=%.3f FCR_CONF=%.3f -> %s",
+                 dataset, m.get("overall_accuracy"), m.get("accuracy_verifiable"),
+                 m.get("fcr_nei"), m.get("fcr_conflicting"), out_path)
     elif kind == "simpleqa":
         log.info("  [%s] hallucination_rate=%.3f accuracy=%.3f not_attempted=%.3f c|att=%.3f -> %s",
                  dataset, m.get("hallucination_rate"), m.get("accuracy"),
@@ -728,14 +921,14 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Step 5 ext: correctness-judge eval (FEVER, TruthfulQA, SimpleQA, PopQA).")
+    p = argparse.ArgumentParser(description="Step 5 ext: correctness-judge eval (FEVER, SciFact, AVeriTeC, TruthfulQA, SimpleQA, PopQA).")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--run-dir", type=Path, help="Trained run dir (LoRA adapter).")
     g.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()),
                    help="Model key for zero-shot baseline (no adapter).")
     p.add_argument("--datasets", nargs="+", choices=list(DATASET_KIND.keys()),
                    default=list(DATASET_KIND.keys()),
-                   help="Which datasets to evaluate (default: fever truthfulqa simpleqa popqa).")
+                   help="Which datasets to evaluate (default: fever scifact averitec truthfulqa simpleqa popqa).")
     p.add_argument("--max-new-tokens", type=int, default=cfg.DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap rows per dataset (smoke test).")
