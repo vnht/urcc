@@ -76,6 +76,16 @@ MODEL_REGISTRY: dict[str, str] = {
     # The `-BF16` instruct release is used for the same no-FP8-dequant reason as
     # the 8B (the unsuffixed 14B instruct ships FP8 weights).
     "ministral14b_instruct": "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    # OpenAI gpt-oss-20b. Sparse Mixture-of-Experts (24 layers, hidden 2880,
+    # 32 experts top-4) whose expert FFNs are stored as FUSED 3-D nn.Parameter
+    # tensors (`mlp.experts.gate_up_proj` / `mlp.experts.down_proj`), not
+    # nn.Linear — so LoRA targets them via `target_parameters` (see
+    # LORA_TARGET_PARAMETERS below), while attention stays standard q/k/v/o.
+    # Ships MXFP4-quantised experts: loaded with FineGrained MXFP4 dequant to
+    # bf16 (~40GB). A reasoning model on the harmony chat format — the analysis
+    # (CoT) channel cannot be disabled, only its effort lowered, so generation
+    # is parsed down to the `final` channel (see _common.generate_greedy).
+    "gptoss_instruct":    "openai/gpt-oss-20b",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -86,6 +96,8 @@ LAYER_SLICE: dict[str, list[int]] = {
     "ministral_base":     [25, 26, 27, 28, 29, 30, 31, 32, 33],
     # Ministral-3-14B: 40 text layers → last 25% = layers 30-39.
     "ministral14b_instruct": [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+    # gpt-oss-20b: 24 text layers → last 25% = layers 18-23.
+    "gptoss_instruct":    [18, 19, 20, 21, 22, 23],
 }
 
 
@@ -165,6 +177,50 @@ LORA_ALPHA          = 32
 LORA_DROPOUT        = 0.05
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
                        "up_proj", "down_proj", "gate_proj"]
+
+# ── Fused-expert MoE LoRA (gpt-oss et al.) ────────────────────────────────────
+# Some MoE models store expert FFNs as fused 3-D nn.Parameter tensors instead of
+# nn.Linear modules, so standard `target_modules` can't reach them. For these
+# models PEFT (>=0.17) targets the raw parameters via `target_parameters`, and
+# attention is targeted separately with the (Linear) names in LORA_ATTN_TARGETS.
+# A model_key present in LORA_TARGET_PARAMETERS routes step4's _apply_lora down
+# the MoE path; absent keys use the standard dense LORA_TARGET_MODULES path.
+LORA_TARGET_PARAMETERS: dict[str, list[str]] = {
+    "gptoss_instruct": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+}
+LORA_ATTN_TARGETS: dict[str, list[str]] = {
+    "gptoss_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
+}
+
+
+def lora_target_parameters(model_key: str) -> list[str] | None:
+    """Fused-expert parameter targets for `model_key`, or None for dense models."""
+    return LORA_TARGET_PARAMETERS.get(model_key)
+
+
+def lora_attn_targets(model_key: str) -> list[str]:
+    """Attention (nn.Linear) LoRA targets used alongside target_parameters."""
+    return LORA_ATTN_TARGETS.get(model_key, ["q_proj", "k_proj", "v_proj", "o_proj"])
+
+
+# ── Harmony / reasoning (gpt-oss) ─────────────────────────────────────────────
+# gpt-oss always emits an `analysis` (CoT) channel before the `final` answer;
+# it can't be disabled, only lowered. We use the lowest effort to minimise the
+# CoT length (and the generation budget it consumes) since URC only needs the
+# committal `final`-channel answer.
+GPTOSS_REASONING_EFFORT = "low"
+
+# Reasoning models burn part of the decode budget on the analysis channel before
+# the final answer appears, so they need a larger cap than the dense default.
+GPTOSS_MAX_NEW_TOKENS = 512
+
+
+def max_new_tokens_for(model_key: str) -> int:
+    """Greedy-decode cap for a model: larger for reasoning models whose CoT
+    precedes the final answer."""
+    if model_key == "gptoss_instruct":
+        return GPTOSS_MAX_NEW_TOKENS
+    return DEFAULT_MAX_NEW_TOKENS
 
 DEFAULT_LR              = 3e-5
 DEFAULT_EPOCHS          = 3

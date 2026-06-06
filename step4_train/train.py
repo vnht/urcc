@@ -268,17 +268,35 @@ def _per_domain_init_scale(
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 
-def _apply_lora(model):
+def _apply_lora(model, model_key: str):
     from peft import LoraConfig, TaskType, get_peft_model
 
-    lcfg = LoraConfig(
-        r=cfg.LORA_R,
-        lora_alpha=cfg.LORA_ALPHA,
-        lora_dropout=cfg.LORA_DROPOUT,
-        target_modules=cfg.LORA_TARGET_MODULES,
-        task_type=TaskType.CAUSAL_LM,
-        bias="none",
-    )
+    expert_params = cfg.lora_target_parameters(model_key)
+    if expert_params:
+        # Fused-expert MoE (e.g. gpt-oss): expert FFNs are 3-D nn.Parameter
+        # tensors, not nn.Linear, so they're targeted via `target_parameters`
+        # while attention uses standard nn.Linear `target_modules`. A LoRA on a
+        # fused [num_experts, ...] tensor applies the same rank across all
+        # experts, so `rank_pattern` sets the per-expert-tensor rank to r.
+        lcfg = LoraConfig(
+            r=cfg.LORA_R,
+            lora_alpha=cfg.LORA_ALPHA,
+            lora_dropout=cfg.LORA_DROPOUT,
+            target_modules=cfg.lora_attn_targets(model_key),
+            target_parameters=expert_params,
+            rank_pattern={p.split(".")[-1]: cfg.LORA_R for p in expert_params},
+            task_type=TaskType.CAUSAL_LM,
+            bias="none",
+        )
+    else:
+        lcfg = LoraConfig(
+            r=cfg.LORA_R,
+            lora_alpha=cfg.LORA_ALPHA,
+            lora_dropout=cfg.LORA_DROPOUT,
+            target_modules=cfg.LORA_TARGET_MODULES,
+            task_type=TaskType.CAUSAL_LM,
+            bias="none",
+        )
     model = get_peft_model(model, lcfg)
     model.print_trainable_parameters()
     return model
@@ -604,7 +622,7 @@ def train(args: argparse.Namespace) -> None:
                                           is_trainable=True)
         model.print_trainable_parameters()
     else:
-        model = _apply_lora(model)
+        model = _apply_lora(model, model_key)
     model.train()
 
     # Optimiser + scheduler
@@ -874,7 +892,10 @@ def train(args: argparse.Namespace) -> None:
         "lora_r":           cfg.LORA_R,
         "lora_alpha":       cfg.LORA_ALPHA,
         "lora_dropout":     cfg.LORA_DROPOUT,
-        "lora_target_modules": cfg.LORA_TARGET_MODULES,
+        "lora_target_modules": (cfg.lora_attn_targets(model_key)
+                                if cfg.lora_target_parameters(model_key)
+                                else cfg.LORA_TARGET_MODULES),
+        "lora_target_parameters": cfg.lora_target_parameters(model_key),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
         "init_scales":      {k: round(float(v), 4) for k, v in init_scales.items()},
         "early_stop":                  bool(args.early_stop),

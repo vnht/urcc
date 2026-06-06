@@ -483,14 +483,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()), required=True)
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap per dataset (smoke testing)")
-    p.add_argument("--max-new-tokens", type=int, default=cfg.DEFAULT_MAX_NEW_TOKENS)
+    p.add_argument("--max-new-tokens", type=int, default=None,
+                   help="Greedy decode cap (defaults per-model: larger for "
+                        "reasoning models whose CoT precedes the final answer).")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    max_new_tokens = (args.max_new_tokens if args.max_new_tokens is not None
+                      else cfg.max_new_tokens_for(args.model))
     run(args.model, max_per_dataset=args.max_per_dataset,
-        max_new_tokens=args.max_new_tokens)
+        max_new_tokens=max_new_tokens)
 
 
 if __name__ == "__main__":

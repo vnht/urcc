@@ -698,6 +698,12 @@ def run(args: argparse.Namespace) -> None:
             log.info("  Base model loaded: %s (%s) — no adapter",
                      model_key, cfg.MODEL_REGISTRY[model_key])
 
+    # Resolve the per-model decode budget if not explicitly overridden
+    # (reasoning models need a larger cap; their CoT precedes the final answer).
+    if args.max_new_tokens is None:
+        args.max_new_tokens = cfg.max_new_tokens_for(model_key)
+    log.info("  max_new_tokens=%d", args.max_new_tokens)
+
     if not args.skip_judge:
         judge_mod = _import_judge()
         for dataset in args.datasets:
@@ -726,8 +732,9 @@ def parse_args() -> argparse.Namespace:
                    help="Run directory (step4_train/data/runs/<run_name>) for trained eval.")
     g.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()),
                    help="Model key for zero-shot baseline eval (no adapter).")
-    p.add_argument("--max-new-tokens", type=int, default=cfg.DEFAULT_MAX_NEW_TOKENS,
-                   help="Greedy decode cap for the answerability eval.")
+    p.add_argument("--max-new-tokens", type=int, default=None,
+                   help="Greedy decode cap for the answerability eval "
+                        "(defaults per-model: larger for reasoning models).")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap answerability eval to N rows per dataset (smoke).")
     p.add_argument("--datasets", nargs="+",

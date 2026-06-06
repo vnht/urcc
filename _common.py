@@ -57,6 +57,7 @@ if sys.platform == "darwin":
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -68,6 +69,7 @@ if sys.platform == "darwin":
 from dotenv import load_dotenv
 
 from config import (
+    GPTOSS_REASONING_EFFORT,
     KUQ_PROMPT_TEMPLATE,
     LAYER_SLICE,
     MODEL_REGISTRY,
@@ -323,6 +325,24 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
         # always size generations via max_new_tokens, so drop the stale default.
         if getattr(model, "generation_config", None) is not None:
             model.generation_config.max_length = None
+    elif model_id.startswith("openai/"):
+        # gpt-oss: dense CausalLM wrapper over a sparse MoE. Standard
+        # AutoTokenizer (the harmony chat template ships with the tokenizer).
+        # The released checkpoint stores expert weights in MXFP4; dequantise to
+        # bf16 so the model trains/runs without Hopper-only MXFP4 kernels
+        # (~40GB). `attn_implementation="eager"` avoids the flash-attn3 kernel
+        # dependency gpt-oss otherwise prefers.
+        from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            token=hf_token,
+            quantization_config=Mxfp4Config(dequantize=True),
+            attn_implementation="eager",
+        )
     else:
         raise ValueError(f"Unsupported model: {model_id}")
 
@@ -395,6 +415,17 @@ def tokenise_chat_prompt_response(
         prompt_ids = tokenizer.apply_chat_template(
             user_msg, tokenize=True, add_generation_prompt=True, return_dict=False,
         )
+    elif "gptoss" in model_key:
+        # Harmony chat prefix at the lowest reasoning effort. The UltraChat
+        # response is appended at the generation point; the (prompt, response)
+        # construction is identical for every retain-general row and for both
+        # the frozen-base and adapter forward passes, so it yields a consistent
+        # per-example retain target regardless of channel-position nuances.
+        prompt_fmt = tokenizer.apply_chat_template(
+            user_msg, tokenize=False, add_generation_prompt=True,
+            reasoning_effort=GPTOSS_REASONING_EFFORT,
+        )
+        prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
     else:
         prompt_fmt = tokenizer.apply_chat_template(
             user_msg, tokenize=False, add_generation_prompt=True,
@@ -457,26 +488,65 @@ def mean_answer_activation(
 
 # ── Greedy generation (shared by step 0 mining and step 5 evaluation) ────────
 
+_HARMONY_FINAL_RE = re.compile(
+    r"<\|channel\|>\s*final\s*<\|message\|>(.*?)(?:<\|return\|>|<\|end\|>|$)",
+    re.DOTALL,
+)
+
+
+def parse_harmony_final(decoded: str) -> str:
+    """Extract the `final`-channel text from a decoded gpt-oss harmony output.
+
+    gpt-oss always emits an `analysis` (chain-of-thought) channel before the
+    user-facing `final` channel; the CoT must never be judged or used as the
+    committal answer. We return the content of the *last* final channel.
+
+    If no final channel is present we return "" (an empty completion). This
+    happens when the model exhausts the token budget mid-analysis, and an empty
+    string is the integrity-preserving choice: callers treat it as a non-answer
+    rather than risking the judge / forget-prefix seeing chain-of-thought text.
+    It also makes any harmony-token decoding mismatch fail loudly during the
+    smoke test instead of silently leaking CoT into the pipeline.
+    """
+    matches = _HARMONY_FINAL_RE.findall(decoded)
+    if matches:
+        return matches[-1].strip()
+    return ""
+
+
+def _build_generation_input_ids(tokenizer, model_key: str, prompt: str) -> list[int]:
+    """Tokenise a prompt into model input ids for greedy generation, applying
+    the model's chat template for instruct models."""
+    if "base" in model_key:
+        return list(tokenizer.encode(prompt, add_special_tokens=True))
+
+    user_msg = [{"role": "user", "content": prompt}]
+    if "ministral" in model_key:
+        return list(tokenizer.apply_chat_template(
+            user_msg, tokenize=True, add_generation_prompt=True, return_dict=False,
+        ))
+    if "gptoss" in model_key:
+        # gpt-oss harmony template: select the lowest reasoning effort to keep
+        # the analysis channel short. Thinking cannot be disabled outright.
+        txt = tokenizer.apply_chat_template(
+            user_msg, tokenize=False, add_generation_prompt=True,
+            reasoning_effort=GPTOSS_REASONING_EFFORT,
+        )
+        return list(tokenizer.encode(txt, add_special_tokens=False))
+    txt = tokenizer.apply_chat_template(
+        user_msg, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    return list(tokenizer.encode(txt, add_special_tokens=False))
+
+
 def generate_greedy(model, tokenizer, model_key: str, prompt: str,
                     max_new_tokens: int = 64) -> str:
-    """One greedy completion. Handles both base and instruct chat templates."""
-    if "base" in model_key:
-        ids = tokenizer.encode(prompt, add_special_tokens=True)
-        input_ids = torch.tensor([ids], dtype=torch.long)
-    else:
-        user_msg = [{"role": "user", "content": prompt}]
-        if "ministral" in model_key:
-            ids = tokenizer.apply_chat_template(
-                user_msg, tokenize=True, add_generation_prompt=True, return_dict=False,
-            )
-            input_ids = torch.tensor([ids], dtype=torch.long)
-        else:
-            txt = tokenizer.apply_chat_template(
-                user_msg, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            ids = tokenizer.encode(txt, add_special_tokens=False)
-            input_ids = torch.tensor([ids], dtype=torch.long)
+    """One greedy completion. Handles base, instruct, and harmony (gpt-oss)
+    chat formats. For gpt-oss the raw harmony output is parsed down to the
+    `final` channel so the returned text is the committal answer only."""
+    ids = _build_generation_input_ids(tokenizer, model_key, prompt)
+    input_ids = torch.tensor([ids], dtype=torch.long)
 
     device = next(model.parameters()).device
     input_ids = input_ids.to(device)
@@ -494,6 +564,12 @@ def generate_greedy(model, tokenizer, model_key: str, prompt: str,
                           getattr(tokenizer, "eos_token_id", 0),
         )
     new_tokens = out[0, input_ids.shape[1]:].tolist()
+
+    if "gptoss" in model_key:
+        # Decode WITH special tokens so the harmony channel markers survive for
+        # parsing, then keep only the final-channel answer.
+        decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        return parse_harmony_final(decoded)
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 

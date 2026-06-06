@@ -33,6 +33,16 @@ torchao>=0.16.0; sys_platform == 'linux'
 # Pure-python wheel: safe to install everywhere on Linux.
 flash-linear-attention; sys_platform == 'linux'
 
+# ── gpt-oss (openai/gpt-oss-20b) ──────────────────────────────────────────
+# The released checkpoint ships MXFP4-quantised experts. We load with
+# transformers' Mxfp4Config(dequantize=True) → bf16 (~40GB, needs an 80GB GPU),
+# which requires the MXFP4 dequant path bundled in recent transformers (already
+# pinned to git HEAD above) plus triton on the GPU host. LoRA on its fused
+# expert tensors uses peft>=0.17 `target_parameters` (already satisfied by the
+# peft>=0.19 pin above). No extra package is required beyond a triton install on
+# the (Linux/CUDA) training host.
+triton; sys_platform == 'linux'
+
 # `causal-conv1d` is intentionally NOT pinned: it needs nvcc + CUDA dev headers
 # to build from source on Colab/H100, and Qwen3.5 / Ministral don't use it.
 # Install manually if you need it for a different model:
