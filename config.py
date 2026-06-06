@@ -209,11 +209,16 @@ LORA_TARGET_PARAMETERS: dict[str, list[str]] = {
     # `router.per_expert_scale`), so attention is the only nn.Linear target.
     "gemma_instruct":  ["experts.gate_up_proj", "experts.down_proj"],
 }
-LORA_ATTN_TARGETS: dict[str, list[str]] = {
+LORA_ATTN_TARGETS: dict[str, list[str] | str] = {
     "gptoss_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # gemma attention is standard q/k/v/o. (No separate shared-expert MLP exists
-    # in the HF Gemma4 impl, so nothing else to target here.)
-    "gemma_instruct":  ["q_proj", "k_proj", "v_proj", "o_proj"],
+    # gemma-4 is multimodal: a bare ["q_proj", ...] suffix list also matches the
+    # SigLIP VISION tower's attention, whose projections are Gemma4ClippableLinear
+    # (a clipping wrapper PEFT can't adapt). A regex string (PEFT re.fullmatch)
+    # scopes LoRA to the TEXT stack's self-attention only — the text q/k/v/o are
+    # plain nn.Linear. The fused text experts are handled separately via
+    # target_parameters; the vision tower gets no adapters.
+    "gemma_instruct":  r".*language_model\.layers\.\d+\.self_attn\."
+                       r"(?:q_proj|k_proj|v_proj|o_proj)",
 }
 
 
@@ -222,8 +227,10 @@ def lora_target_parameters(model_key: str) -> list[str] | None:
     return LORA_TARGET_PARAMETERS.get(model_key)
 
 
-def lora_attn_targets(model_key: str) -> list[str]:
-    """Attention (nn.Linear) LoRA targets used alongside target_parameters."""
+def lora_attn_targets(model_key: str) -> list[str] | str:
+    """Attention LoRA targets used alongside target_parameters. Either a suffix
+    list or a regex string (the latter scopes multimodal models to their text
+    stack so the vision tower is excluded)."""
     return LORA_ATTN_TARGETS.get(model_key, ["q_proj", "k_proj", "v_proj", "o_proj"])
 
 

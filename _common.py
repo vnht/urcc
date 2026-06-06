@@ -345,15 +345,12 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
             attn_implementation="eager",
         )
     elif model_id.startswith("google/"):
-        # gemma-4-26B-A4B: a multimodal (`*ForConditionalGeneration`) wrapper
-        # over a Gemma-4 text MoE. We train/run text-only, so AutoModelForCausalLM
-        # is the cleanest entry point — it resolves to the causal text model for
-        # gemma and exposes hidden_states/logits the rest of the pipeline expects.
-        # If the released checkpoint only exposes the VL wrapper (no CausalLM
-        # auto-map), this raises and we fall back to loading the wrapper and using
-        # its `.language_model` / `.model.language_model` (PHASE-0 host check).
-        # Native bf16 (no MXFP4). `eager` attention avoids the flash-attn kernel
-        # dependency the hybrid local/global attention otherwise prefers.
+        # gemma-4-26B-A4B: a multimodal `Gemma4ForConditionalGeneration` wrapper
+        # over a Gemma-4 text MoE (text stack at `.model.language_model`).
+        # AutoModelForCausalLM loads it and text-only forward/generate works
+        # without pixel inputs. Native bf16 (no MXFP4); `eager` attention avoids
+        # the flash-attn kernel dependency the hybrid local/global attention
+        # otherwise prefers.
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
@@ -364,6 +361,21 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
             token=hf_token,
             attn_implementation="eager",
         )
+        # Drop the multimodal towers: their attention/FFN use Gemma4ClippableLinear
+        # (a non-nn.Linear wrapper PEFT's LoRA injection rejects — and the type
+        # check fires BEFORE exclude_modules can filter it, see peft#3129). We
+        # only ever run text, so deleting the towers frees their memory AND
+        # guarantees LoRA never walks into a ClippableLinear. This is the PEFT
+        # maintainer's recommended text-only workaround. Defensive: 26B has no
+        # audio tower, and attribute layout may vary, so guard every delete.
+        inner = getattr(model, "model", model)
+        for _attr in ("vision_tower", "embed_vision", "audio_tower", "embed_audio"):
+            if hasattr(inner, _attr):
+                try:
+                    delattr(inner, _attr)
+                    log.info("  dropped multimodal submodule model.%s", _attr)
+                except (AttributeError, KeyError):
+                    pass
     else:
         raise ValueError(f"Unsupported model: {model_id}")
 
