@@ -155,6 +155,14 @@ def _load_adapter_model(run_dir: Path):
     from peft import PeftModel
     model = PeftModel.from_pretrained(model, str(adapter_dir), local_files_only=True)
     model.eval()
+    # Fused-expert MoE (gpt-oss, gemma-4): PEFT's ParamWrapper materializes a
+    # full dense LoRA delta for every expert on each decode step, which makes
+    # PeftModel.generate() ~10× slower than the bare base model. Merge the
+    # adapter into the base weights before eval so inference matches baseline
+    # speed (PEFT's recommended path for MoE inference).
+    if cfg.lora_target_parameters(model_key):
+        log.info("  merging LoRA into base weights (fused-expert MoE eval)")
+        model = model.merge_and_unload()
     return model, tokenizer, model_key
 
 
