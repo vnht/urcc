@@ -630,6 +630,22 @@ def train(args: argparse.Namespace) -> None:
         model = _apply_lora(model, model_key)
     model.train()
 
+    # Fused-expert MoE LoRA (gpt-oss): PEFT's ParamWrapper materializes the full
+    # dense delta-weight for each expert tensor on every forward (~2GB per
+    # gate_up_proj), and the autograd graph retains all layers' deltas until
+    # backward — which OOMs even a single example. Gradient checkpointing
+    # discards the forward graph and recomputes it in backward, so only one
+    # layer's delta is live at a time. Disable the KV cache (unused in training)
+    # and make the frozen embeddings emit grad so checkpointed blocks track.
+    if cfg.lora_target_parameters(model_key):
+        if getattr(model, "config", None) is not None:
+            model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+        model.enable_input_require_grads()
+        log.info("  gradient checkpointing enabled (fused-expert MoE)")
+
     # Optimiser + scheduler
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
