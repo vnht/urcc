@@ -1,0 +1,13 @@
+{
+  "subspace_file": "subspace_gptoss_instruct_r32.pt",
+  "anchors_file": "anchors_gptoss_instruct.pt",
+  "layers": [
+    18,
+    19,
+    20,
+    21,
+    22,
+    23
+  ],
+  "rank": 32
+}

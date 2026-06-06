@@ -86,18 +86,6 @@ MODEL_REGISTRY: dict[str, str] = {
     # (CoT) channel cannot be disabled, only its effort lowered, so generation
     # is parsed down to the `final` channel (see _common.generate_greedy).
     "gptoss_instruct":    "openai/gpt-oss-20b",
-    # Google Gemma-4-26B-A4B-it. Sparse MoE (30 layers, 128 experts top-8,
-    # 25.2B total / 3.8B active). Loads as `Gemma4ForConditionalGeneration` (a
-    # multimodal wrapper whose text stack is at `.model.language_model`); text-
-    # only forward/generate works without pixel inputs. Like gpt-oss its routed
-    # expert FFNs are fused 3-D nn.Parameter tensors (`...layers.N.experts.
-    # gate_up_proj` / `down_proj`, targeted via LORA_TARGET_PARAMETERS), but
-    # unlike gpt-oss it ships native bf16 (no MXFP4 dequant). Configurable
-    # thinking: we disable it (chat template pre-fills an empty
-    # `<|channel>thought\n<channel|>` scaffold into the prompt), so the greedy
-    # answer is whatever follows the final `<channel|>` close token (see
-    # _common.parse_gemma_final).
-    "gemma_instruct":     "google/gemma-4-26B-A4B-it",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -110,8 +98,6 @@ LAYER_SLICE: dict[str, list[int]] = {
     "ministral14b_instruct": [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
     # gpt-oss-20b: 24 text layers → last 25% = layers 18-23.
     "gptoss_instruct":    [18, 19, 20, 21, 22, 23],
-    # gemma-4-26B-A4B: 30 text layers → last 25% (ceil) = layers 22-29.
-    "gemma_instruct":     [22, 23, 24, 25, 26, 27, 28, 29],
 }
 
 
@@ -201,24 +187,9 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 # the MoE path; absent keys use the standard dense LORA_TARGET_MODULES path.
 LORA_TARGET_PARAMETERS: dict[str, list[str]] = {
     "gptoss_instruct": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
-    # gemma-4-26B-A4B routed experts (Gemma4TextExperts). Confirmed on host: the
-    # fused expert tensors hang directly off the decoder layer as
-    # `...layers.N.experts.gate_up_proj` (128, 1408, 2816) and
-    # `...layers.N.experts.down_proj` (128, 2816, 704) — no `mlp.` prefix. There
-    # is no separate shared-expert module in the HF impl (only `experts` +
-    # `router.per_expert_scale`), so attention is the only nn.Linear target.
-    "gemma_instruct":  ["experts.gate_up_proj", "experts.down_proj"],
 }
 LORA_ATTN_TARGETS: dict[str, list[str] | str] = {
     "gptoss_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # gemma-4 is multimodal: a bare ["q_proj", ...] suffix list also matches the
-    # SigLIP VISION tower's attention, whose projections are Gemma4ClippableLinear
-    # (a clipping wrapper PEFT can't adapt). A regex string (PEFT re.fullmatch)
-    # scopes LoRA to the TEXT stack's self-attention only — the text q/k/v/o are
-    # plain nn.Linear. The fused text experts are handled separately via
-    # target_parameters; the vision tower gets no adapters.
-    "gemma_instruct":  r".*language_model\.layers\.\d+\.self_attn\."
-                       r"(?:q_proj|k_proj|v_proj|o_proj)",
 }
 
 
@@ -245,14 +216,21 @@ GPTOSS_REASONING_EFFORT = "low"
 # the final answer appears, so they need a larger cap than the dense default.
 GPTOSS_MAX_NEW_TOKENS = 512
 
-# ── Gemma 4 (configurable thinking) ───────────────────────────────────────────
-# Gemma-4 thinking is disabled by omitting the `<|think|>` control token from
-# the system prompt. The 26B/31B variants still emit an (empty) `thought`
-# channel scaffold before the answer, so we parse the final answer out of the
-# decoded output (see _common.parse_gemma_final) and give a small budget bump
-# over the dense default to absorb the channel-scaffold tokens.
-GEMMA_ENABLE_THINKING = False
-GEMMA_MAX_NEW_TOKENS = 128
+# gpt-oss attention backend for GENERATION/eval/mining (training always uses
+# eager — see load_model_and_tokenizer). The model uses attention SINKS
+# (learnable per-head logits added before softmax), so plain `sdpa` is NOT
+# supported — it silently drops the sink term and corrupts results. Correct
+# backends, fastest first:
+#   "kernels-community/vllm-flash-attn3" — fastest, but Hopper-only (H100/H200);
+#       NOT for Blackwell/Ada/Ampere (won't load the sm_90 kernel).
+#   "flex_attention" — sink-aware (transformers applies the LSE renormalisation),
+#       torch.compile-backed, runs on Ampere/Ada/Hopper/Blackwell, and is far
+#       faster than eager. Safe default (incl. RTX PRO 6000 Blackwell, sm_120).
+#   "eager"          — correct everywhere but the slowest path.
+# Blackwell note: flex needs a torch built for sm_120 (PyTorch ≥2.7 / CUDA 12.8+,
+# which the gpt-oss transformers-v5 stack already requires). If you hit a "no
+# kernel image"/compile error, fall back to "eager".
+GPTOSS_ATTN_IMPLEMENTATION = "flex_attention"
 
 
 def max_new_tokens_for(model_key: str) -> int:
@@ -260,8 +238,6 @@ def max_new_tokens_for(model_key: str) -> int:
     precedes the final answer."""
     if model_key == "gptoss_instruct":
         return GPTOSS_MAX_NEW_TOKENS
-    if model_key == "gemma_instruct":
-        return GEMMA_MAX_NEW_TOKENS
     return DEFAULT_MAX_NEW_TOKENS
 
 DEFAULT_LR              = 3e-5
