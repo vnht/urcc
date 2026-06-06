@@ -448,14 +448,13 @@ def tokenise_chat_prompt_response(
         )
         prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
     elif "gemma" in model_key:
-        # Gemma-4 chat prefix with thinking off (no `<|think|>` system token).
-        # The retain-general response is appended at the generation point; the
-        # construction is identical for every retain row and for both the
-        # frozen-base and adapter passes, giving a consistent retain target.
-        msgs = ([{"role": "system", "content": "<|think|>"}] + user_msg
-                if GEMMA_ENABLE_THINKING else user_msg)
+        # Gemma-4 chat prefix with thinking off (template `enable_thinking`
+        # kwarg). The retain-general response is appended at the generation
+        # point; the construction is identical for every retain row and for both
+        # the frozen-base and adapter passes, giving a consistent retain target.
         prompt_fmt = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True,
+            user_msg, tokenize=False, add_generation_prompt=True,
+            enable_thinking=GEMMA_ENABLE_THINKING,
         )
         prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
     else:
@@ -546,47 +545,35 @@ def parse_harmony_final(decoded: str) -> str:
     return ""
 
 
-# Gemma-4 channel markers. Tolerant of `<|channel|>`/`<|channel>` and
-# `<|message|>`/`<|message>` so parsing survives either tokenizer rendering.
-# PHASE-0 (host): confirm the real decoded tokens (channel/message/end names)
-# with a one-shot generate() on the GPU host and tighten these if needed.
-_GEMMA_CH = r"<\|channel\|?>"
-_GEMMA_MSG = r"<\|message\|?>"
-_GEMMA_END = r"(?:<\|end\|?>|<\|return\|?>|<\|eot\|?>|<end_of_turn>|$)"
-_GEMMA_FINAL_RE = re.compile(
-    _GEMMA_CH + r"\s*(?:final|answer|response)\b\s*" + _GEMMA_MSG + r"?(.*?)"
-    + _GEMMA_END,
-    re.DOTALL,
+# Gemma-4 channel control tokens (confirmed from chat_template.jinja):
+#   open thought channel: "<|channel>"   close any channel: "<channel|>"
+#   turn marker: "<|turn>" (followed by a plain-text role)   think trigger: "<|think|>"
+# With thinking disabled the template pre-fills "<|channel>thought\n<channel|>"
+# into the PROMPT, so the model's generated continuation is just the answer
+# (followed by an end/turn token). With thinking enabled the model emits its
+# own "<|channel>thought\n...<channel|>" block first. Either way the committal
+# answer is whatever follows the LAST channel-close token.
+_GEMMA_CHANNEL_CLOSE = "<channel|>"
+_GEMMA_SPECIAL_RE = re.compile(
+    r"<\|?(?:turn|channel|think|message|tool|tool_call|tool_response|"
+    r"image|audio|video|start_of_turn|end_of_turn|bos|eos|pad)\|?>"
 )
-_GEMMA_THOUGHT_RE = re.compile(
-    _GEMMA_CH + r"\s*thought\b.*?" + _GEMMA_MSG + r"?(.*)",
-    re.DOTALL,
-)
-_GEMMA_SPECIAL_RE = re.compile(r"<\|[^|>]*\|?>|</?(?:start|end)_of_turn>")
 
 
 def parse_gemma_final(decoded: str) -> str:
-    """Extract the user-facing answer from a decoded gemma-4 output.
+    """Extract the committal answer from a decoded gemma-4 continuation.
 
-    Gemma-4 (26B/31B) always emits a `thought` channel scaffold before the
-    answer even when thinking is disabled (the thought block is then empty).
-    The committal answer is the text that follows it, never the thought
-    content. Resolution order:
-      1. an explicit final/answer/response channel (thinking-enabled runs), else
-      2. the text after the (empty) `thought` channel message scaffold, else
-      3. the decoded text with channel markers and a stray leading "thought"
-         token stripped (defensive fallback).
-    Returns "" only if nothing remains after stripping scaffold.
+    The answer is the text after the final channel-close token (`<channel|>`),
+    which drops any thought/reasoning content. When thinking is disabled the
+    continuation has no channel token (the scaffold lives in the prompt), so the
+    whole continuation is the answer. Remaining gemma control tokens and a
+    stray leading role word (from a leaked `<|turn>model`) are then stripped.
     """
-    finals = _GEMMA_FINAL_RE.findall(decoded)
-    if finals:
-        return finals[-1].strip()
-
-    m = _GEMMA_THOUGHT_RE.search(decoded)
-    tail = m.group(1) if m else decoded
-    tail = _GEMMA_SPECIAL_RE.sub("", tail)
-    tail = re.sub(r"^\s*thought\b", "", tail, count=1)
-    return tail.strip()
+    if _GEMMA_CHANNEL_CLOSE in decoded:
+        decoded = decoded.rsplit(_GEMMA_CHANNEL_CLOSE, 1)[-1]
+    cleaned = _GEMMA_SPECIAL_RE.sub("", decoded)
+    cleaned = re.sub(r"^\s*(?:model|assistant)\s*\n?", "", cleaned, count=1)
+    return cleaned.strip()
 
 
 def _build_generation_input_ids(tokenizer, model_key: str, prompt: str) -> list[int]:
@@ -609,12 +596,12 @@ def _build_generation_input_ids(tokenizer, model_key: str, prompt: str) -> list[
         )
         return list(tokenizer.encode(txt, add_special_tokens=False))
     if "gemma" in model_key:
-        # Gemma-4 thinking is off unless a `<|think|>` system token is present;
-        # the (empty) thought channel is stripped from the output afterwards.
-        msgs = ([{"role": "system", "content": "<|think|>"}] + user_msg
-                if GEMMA_ENABLE_THINKING else user_msg)
+        # Gemma-4 toggles reasoning via the template's `enable_thinking` kwarg
+        # (which injects the `<|think|>` token / pre-fills the empty thought
+        # scaffold). We keep it off; the scaffold is stripped from the output.
         txt = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True,
+            user_msg, tokenize=False, add_generation_prompt=True,
+            enable_thinking=GEMMA_ENABLE_THINKING,
         )
         return list(tokenizer.encode(txt, add_special_tokens=False))
     txt = tokenizer.apply_chat_template(

@@ -86,22 +86,17 @@ MODEL_REGISTRY: dict[str, str] = {
     # (CoT) channel cannot be disabled, only its effort lowered, so generation
     # is parsed down to the `final` channel (see _common.generate_greedy).
     "gptoss_instruct":    "openai/gpt-oss-20b",
-    # Google Gemma-4-26B-A4B-it. Sparse MoE (30 layers, 128 experts top-8 plus
-    # 1 always-on SHARED expert, 25.2B total / 3.8B active). Like gpt-oss its
-    # routed expert FFNs are fused 3-D nn.Parameter tensors (targeted via
-    # LORA_TARGET_PARAMETERS), but unlike gpt-oss it ships native bf16 (no MXFP4
-    # dequant). It is a multimodal `*ForConditionalGeneration` wrapper, so the
-    # text language-model + processor tokenizer are unwrapped at load time. A
-    # configurable-thinking model: thinking is disabled (no `<|think|>` in the
-    # system prompt), but the 26B/31B variants still emit an (empty) `thought`
-    # channel before the answer, so generation is parsed down to the final
-    # answer (see _common.parse_gemma_final).
-    #
-    # PHASE-0 (host) verification needed: exact fused routed-expert parameter
-    # names (LORA_TARGET_PARAMETERS below), the VL wrapper / language-model
-    # attribute (_common loader), and the real decoded thought/answer channel
-    # tokens (_common.parse_gemma_final) — confirm via named_parameters() and a
-    # one-shot decode on the GPU host, exactly like the gpt-oss smoke test.
+    # Google Gemma-4-26B-A4B-it. Sparse MoE (30 layers, 128 experts top-8,
+    # 25.2B total / 3.8B active). Loads as `Gemma4ForConditionalGeneration` (a
+    # multimodal wrapper whose text stack is at `.model.language_model`); text-
+    # only forward/generate works without pixel inputs. Like gpt-oss its routed
+    # expert FFNs are fused 3-D nn.Parameter tensors (`...layers.N.experts.
+    # gate_up_proj` / `down_proj`, targeted via LORA_TARGET_PARAMETERS), but
+    # unlike gpt-oss it ships native bf16 (no MXFP4 dequant). Configurable
+    # thinking: we disable it (chat template pre-fills an empty
+    # `<|channel>thought\n<channel|>` scaffold into the prompt), so the greedy
+    # answer is whatever follows the final `<channel|>` close token (see
+    # _common.parse_gemma_final).
     "gemma_instruct":     "google/gemma-4-26B-A4B-it",
 }
 
@@ -206,18 +201,18 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 # the MoE path; absent keys use the standard dense LORA_TARGET_MODULES path.
 LORA_TARGET_PARAMETERS: dict[str, list[str]] = {
     "gptoss_instruct": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
-    # gemma-4-26B-A4B routed experts. Best-guess names following the transformers
-    # v5 fused-MoE (`torch._grouped_mm`) convention; CONFIRM on the GPU host with
-    # `[n for n,_ in model.named_parameters() if 'expert' in n]` before the run —
-    # Gemma may keep gate/up separate (`mlp.experts.gate_proj`/`up_proj`) instead
-    # of fusing them into `gate_up_proj`.
-    "gemma_instruct":  ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+    # gemma-4-26B-A4B routed experts (Gemma4TextExperts). Confirmed on host: the
+    # fused expert tensors hang directly off the decoder layer as
+    # `...layers.N.experts.gate_up_proj` (128, 1408, 2816) and
+    # `...layers.N.experts.down_proj` (128, 2816, 704) — no `mlp.` prefix. There
+    # is no separate shared-expert module in the HF impl (only `experts` +
+    # `router.per_expert_scale`), so attention is the only nn.Linear target.
+    "gemma_instruct":  ["experts.gate_up_proj", "experts.down_proj"],
 }
 LORA_ATTN_TARGETS: dict[str, list[str]] = {
     "gptoss_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # gemma attention is standard q/k/v/o. The always-on shared expert is an
-    # nn.Linear MLP (not fused); add its gate/up/down_proj here once the exact
-    # module path is confirmed on host to also LoRA-adapt the shared expert.
+    # gemma attention is standard q/k/v/o. (No separate shared-expert MLP exists
+    # in the HF Gemma4 impl, so nothing else to target here.)
     "gemma_instruct":  ["q_proj", "k_proj", "v_proj", "o_proj"],
 }
 
