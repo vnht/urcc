@@ -43,6 +43,15 @@ flash-linear-attention; sys_platform == 'linux'
 # the (Linux/CUDA) training host.
 triton; sys_platform == 'linux'
 
+# ── gemma-4 (google/gemma-4-26B-A4B-it) ───────────────────────────────────
+# Native bf16 sparse MoE (~50GB, needs an 80GB GPU); no MXFP4/FP8 dequant.
+# Requires a recent transformers with Gemma-4 support (git HEAD pinned above)
+# and LoRA on its fused routed-expert tensors via peft>=0.17 `target_parameters`
+# (satisfied by the peft>=0.19 pin). The checkpoint is a multimodal wrapper, so
+# its vision tower may pull in pillow (usually already present). The repo is
+# GATED on Hugging Face: accept the license and export HF_TOKEN before loading.
+pillow
+
 # `causal-conv1d` is intentionally NOT pinned: it needs nvcc + CUDA dev headers
 # to build from source on Colab/H100, and Qwen3.5 / Ministral don't use it.
 # Install manually if you need it for a different model:

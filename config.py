@@ -86,6 +86,23 @@ MODEL_REGISTRY: dict[str, str] = {
     # (CoT) channel cannot be disabled, only its effort lowered, so generation
     # is parsed down to the `final` channel (see _common.generate_greedy).
     "gptoss_instruct":    "openai/gpt-oss-20b",
+    # Google Gemma-4-26B-A4B-it. Sparse MoE (30 layers, 128 experts top-8 plus
+    # 1 always-on SHARED expert, 25.2B total / 3.8B active). Like gpt-oss its
+    # routed expert FFNs are fused 3-D nn.Parameter tensors (targeted via
+    # LORA_TARGET_PARAMETERS), but unlike gpt-oss it ships native bf16 (no MXFP4
+    # dequant). It is a multimodal `*ForConditionalGeneration` wrapper, so the
+    # text language-model + processor tokenizer are unwrapped at load time. A
+    # configurable-thinking model: thinking is disabled (no `<|think|>` in the
+    # system prompt), but the 26B/31B variants still emit an (empty) `thought`
+    # channel before the answer, so generation is parsed down to the final
+    # answer (see _common.parse_gemma_final).
+    #
+    # PHASE-0 (host) verification needed: exact fused routed-expert parameter
+    # names (LORA_TARGET_PARAMETERS below), the VL wrapper / language-model
+    # attribute (_common loader), and the real decoded thought/answer channel
+    # tokens (_common.parse_gemma_final) — confirm via named_parameters() and a
+    # one-shot decode on the GPU host, exactly like the gpt-oss smoke test.
+    "gemma_instruct":     "google/gemma-4-26B-A4B-it",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -98,6 +115,8 @@ LAYER_SLICE: dict[str, list[int]] = {
     "ministral14b_instruct": [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
     # gpt-oss-20b: 24 text layers → last 25% = layers 18-23.
     "gptoss_instruct":    [18, 19, 20, 21, 22, 23],
+    # gemma-4-26B-A4B: 30 text layers → last 25% (ceil) = layers 22-29.
+    "gemma_instruct":     [22, 23, 24, 25, 26, 27, 28, 29],
 }
 
 
@@ -187,9 +206,19 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 # the MoE path; absent keys use the standard dense LORA_TARGET_MODULES path.
 LORA_TARGET_PARAMETERS: dict[str, list[str]] = {
     "gptoss_instruct": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+    # gemma-4-26B-A4B routed experts. Best-guess names following the transformers
+    # v5 fused-MoE (`torch._grouped_mm`) convention; CONFIRM on the GPU host with
+    # `[n for n,_ in model.named_parameters() if 'expert' in n]` before the run —
+    # Gemma may keep gate/up separate (`mlp.experts.gate_proj`/`up_proj`) instead
+    # of fusing them into `gate_up_proj`.
+    "gemma_instruct":  ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
 }
 LORA_ATTN_TARGETS: dict[str, list[str]] = {
     "gptoss_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    # gemma attention is standard q/k/v/o. The always-on shared expert is an
+    # nn.Linear MLP (not fused); add its gate/up/down_proj here once the exact
+    # module path is confirmed on host to also LoRA-adapt the shared expert.
+    "gemma_instruct":  ["q_proj", "k_proj", "v_proj", "o_proj"],
 }
 
 
@@ -214,12 +243,23 @@ GPTOSS_REASONING_EFFORT = "low"
 # the final answer appears, so they need a larger cap than the dense default.
 GPTOSS_MAX_NEW_TOKENS = 512
 
+# ── Gemma 4 (configurable thinking) ───────────────────────────────────────────
+# Gemma-4 thinking is disabled by omitting the `<|think|>` control token from
+# the system prompt. The 26B/31B variants still emit an (empty) `thought`
+# channel scaffold before the answer, so we parse the final answer out of the
+# decoded output (see _common.parse_gemma_final) and give a small budget bump
+# over the dense default to absorb the channel-scaffold tokens.
+GEMMA_ENABLE_THINKING = False
+GEMMA_MAX_NEW_TOKENS = 128
+
 
 def max_new_tokens_for(model_key: str) -> int:
     """Greedy-decode cap for a model: larger for reasoning models whose CoT
     precedes the final answer."""
     if model_key == "gptoss_instruct":
         return GPTOSS_MAX_NEW_TOKENS
+    if model_key == "gemma_instruct":
+        return GEMMA_MAX_NEW_TOKENS
     return DEFAULT_MAX_NEW_TOKENS
 
 DEFAULT_LR              = 3e-5

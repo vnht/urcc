@@ -69,6 +69,7 @@ if sys.platform == "darwin":
 from dotenv import load_dotenv
 
 from config import (
+    GEMMA_ENABLE_THINKING,
     GPTOSS_REASONING_EFFORT,
     KUQ_PROMPT_TEMPLATE,
     LAYER_SLICE,
@@ -343,6 +344,26 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
             quantization_config=Mxfp4Config(dequantize=True),
             attn_implementation="eager",
         )
+    elif model_id.startswith("google/"):
+        # gemma-4-26B-A4B: a multimodal (`*ForConditionalGeneration`) wrapper
+        # over a Gemma-4 text MoE. We train/run text-only, so AutoModelForCausalLM
+        # is the cleanest entry point — it resolves to the causal text model for
+        # gemma and exposes hidden_states/logits the rest of the pipeline expects.
+        # If the released checkpoint only exposes the VL wrapper (no CausalLM
+        # auto-map), this raises and we fall back to loading the wrapper and using
+        # its `.language_model` / `.model.language_model` (PHASE-0 host check).
+        # Native bf16 (no MXFP4). `eager` attention avoids the flash-attn kernel
+        # dependency the hybrid local/global attention otherwise prefers.
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            token=hf_token,
+            attn_implementation="eager",
+        )
     else:
         raise ValueError(f"Unsupported model: {model_id}")
 
@@ -424,6 +445,17 @@ def tokenise_chat_prompt_response(
         prompt_fmt = tokenizer.apply_chat_template(
             user_msg, tokenize=False, add_generation_prompt=True,
             reasoning_effort=GPTOSS_REASONING_EFFORT,
+        )
+        prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
+    elif "gemma" in model_key:
+        # Gemma-4 chat prefix with thinking off (no `<|think|>` system token).
+        # The retain-general response is appended at the generation point; the
+        # construction is identical for every retain row and for both the
+        # frozen-base and adapter passes, giving a consistent retain target.
+        msgs = ([{"role": "system", "content": "<|think|>"}] + user_msg
+                if GEMMA_ENABLE_THINKING else user_msg)
+        prompt_fmt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
         )
         prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
     else:
@@ -514,6 +546,49 @@ def parse_harmony_final(decoded: str) -> str:
     return ""
 
 
+# Gemma-4 channel markers. Tolerant of `<|channel|>`/`<|channel>` and
+# `<|message|>`/`<|message>` so parsing survives either tokenizer rendering.
+# PHASE-0 (host): confirm the real decoded tokens (channel/message/end names)
+# with a one-shot generate() on the GPU host and tighten these if needed.
+_GEMMA_CH = r"<\|channel\|?>"
+_GEMMA_MSG = r"<\|message\|?>"
+_GEMMA_END = r"(?:<\|end\|?>|<\|return\|?>|<\|eot\|?>|<end_of_turn>|$)"
+_GEMMA_FINAL_RE = re.compile(
+    _GEMMA_CH + r"\s*(?:final|answer|response)\b\s*" + _GEMMA_MSG + r"?(.*?)"
+    + _GEMMA_END,
+    re.DOTALL,
+)
+_GEMMA_THOUGHT_RE = re.compile(
+    _GEMMA_CH + r"\s*thought\b.*?" + _GEMMA_MSG + r"?(.*)",
+    re.DOTALL,
+)
+_GEMMA_SPECIAL_RE = re.compile(r"<\|[^|>]*\|?>|</?(?:start|end)_of_turn>")
+
+
+def parse_gemma_final(decoded: str) -> str:
+    """Extract the user-facing answer from a decoded gemma-4 output.
+
+    Gemma-4 (26B/31B) always emits a `thought` channel scaffold before the
+    answer even when thinking is disabled (the thought block is then empty).
+    The committal answer is the text that follows it, never the thought
+    content. Resolution order:
+      1. an explicit final/answer/response channel (thinking-enabled runs), else
+      2. the text after the (empty) `thought` channel message scaffold, else
+      3. the decoded text with channel markers and a stray leading "thought"
+         token stripped (defensive fallback).
+    Returns "" only if nothing remains after stripping scaffold.
+    """
+    finals = _GEMMA_FINAL_RE.findall(decoded)
+    if finals:
+        return finals[-1].strip()
+
+    m = _GEMMA_THOUGHT_RE.search(decoded)
+    tail = m.group(1) if m else decoded
+    tail = _GEMMA_SPECIAL_RE.sub("", tail)
+    tail = re.sub(r"^\s*thought\b", "", tail, count=1)
+    return tail.strip()
+
+
 def _build_generation_input_ids(tokenizer, model_key: str, prompt: str) -> list[int]:
     """Tokenise a prompt into model input ids for greedy generation, applying
     the model's chat template for instruct models."""
@@ -533,6 +608,15 @@ def _build_generation_input_ids(tokenizer, model_key: str, prompt: str) -> list[
             reasoning_effort=GPTOSS_REASONING_EFFORT,
         )
         return list(tokenizer.encode(txt, add_special_tokens=False))
+    if "gemma" in model_key:
+        # Gemma-4 thinking is off unless a `<|think|>` system token is present;
+        # the (empty) thought channel is stripped from the output afterwards.
+        msgs = ([{"role": "system", "content": "<|think|>"}] + user_msg
+                if GEMMA_ENABLE_THINKING else user_msg)
+        txt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+        )
+        return list(tokenizer.encode(txt, add_special_tokens=False))
     txt = tokenizer.apply_chat_template(
         user_msg, tokenize=False, add_generation_prompt=True,
         enable_thinking=False,
@@ -542,9 +626,9 @@ def _build_generation_input_ids(tokenizer, model_key: str, prompt: str) -> list[
 
 def generate_greedy(model, tokenizer, model_key: str, prompt: str,
                     max_new_tokens: int = 64) -> str:
-    """One greedy completion. Handles base, instruct, and harmony (gpt-oss)
-    chat formats. For gpt-oss the raw harmony output is parsed down to the
-    `final` channel so the returned text is the committal answer only."""
+    """One greedy completion. Handles base, instruct, harmony (gpt-oss) and
+    gemma channel chat formats. For gpt-oss/gemma the raw channel output is
+    parsed down to the committal final answer only."""
     ids = _build_generation_input_ids(tokenizer, model_key, prompt)
     input_ids = torch.tensor([ids], dtype=torch.long)
 
@@ -570,6 +654,11 @@ def generate_greedy(model, tokenizer, model_key: str, prompt: str,
         # parsing, then keep only the final-channel answer.
         decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
         return parse_harmony_final(decoded)
+    if "gemma" in model_key:
+        # Decode WITH special tokens so the thought/answer channel markers
+        # survive for parsing, then keep only the final answer.
+        decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        return parse_gemma_final(decoded)
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
