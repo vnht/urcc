@@ -278,10 +278,15 @@ def _apply_lora(model, model_key: str):
         # while attention uses standard nn.Linear `target_modules`. A LoRA on a
         # fused [num_experts, ...] tensor applies the same rank across all
         # experts, so `rank_pattern` sets the per-expert-tensor rank to r.
+        #
+        # PEFT's fused-parameter wrapper (lora.ParamWrapper) does not support
+        # lora_dropout != 0, and a single LoraConfig shares one dropout across
+        # its module + parameter targets — so the whole MoE adapter runs with
+        # dropout 0 (the attention modules included).
         lcfg = LoraConfig(
             r=cfg.LORA_R,
             lora_alpha=cfg.LORA_ALPHA,
-            lora_dropout=cfg.LORA_DROPOUT,
+            lora_dropout=0.0,
             target_modules=cfg.lora_attn_targets(model_key),
             target_parameters=expert_params,
             rank_pattern={p.split(".")[-1]: cfg.LORA_R for p in expert_params},
@@ -891,7 +896,7 @@ def train(args: argparse.Namespace) -> None:
         "warmup_ratio":     cfg.DEFAULT_WARMUP_RATIO,
         "lora_r":           cfg.LORA_R,
         "lora_alpha":       cfg.LORA_ALPHA,
-        "lora_dropout":     cfg.LORA_DROPOUT,
+        "lora_dropout":     0.0 if cfg.lora_target_parameters(model_key) else cfg.LORA_DROPOUT,
         "lora_target_modules": (cfg.lora_attn_targets(model_key)
                                 if cfg.lora_target_parameters(model_key)
                                 else cfg.LORA_TARGET_MODULES),
