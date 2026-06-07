@@ -610,6 +610,8 @@ def train(args: argparse.Namespace) -> None:
         f"{model_key}_uoc_r{args.rank}"
         f"_lam{args.lambda_retain:g}_ep{args.epochs}_lr{args.lr:.0e}"
     )
+    if args.tag:
+        run_name = f"{run_name}_{args.tag}"
     out_dir = cfg.RUNS_DIR / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Run name: %s", run_name)
@@ -983,6 +985,10 @@ def parse_args() -> argparse.Namespace:
                         "count as a new best and trigger a best-adapter snapshot. "
                         "Default: 0.0 (any improvement counts).")
     p.add_argument("--dry-run",      action="store_true")
+    p.add_argument("--tag", type=str, default="",
+                   help="Optional suffix appended to the run name (e.g. "
+                        "'routerexpert') so a variant writes to its own run dir "
+                        "instead of clobbering an existing adapter/results.")
     return p.parse_args()
 
 

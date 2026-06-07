@@ -186,10 +186,27 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 # A model_key present in LORA_TARGET_PARAMETERS routes step4's _apply_lora down
 # the MoE path; absent keys use the standard dense LORA_TARGET_MODULES path.
 LORA_TARGET_PARAMETERS: dict[str, list[str]] = {
-    "gptoss_instruct": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+    # MoE experiment: force the *MoE path* (routed experts + the router gate) to
+    # carry the whole unlearning intervention, instead of letting the dense
+    # attention LoRA absorb the geometric forget loss without changing behaviour.
+    #   - experts.gate_up_proj / down_proj: per-expert fused FFN tensors (3-D).
+    #   - router.weight: the GptOssTopKRouter gate is a raw 2-D nn.Parameter
+    #     (num_experts × hidden), NOT an nn.Linear, so it is also targeted here
+    #     via target_parameters. LoRA on it re-weights the contribution of the
+    #     selected experts; note top-4 selection is argmax (non-differentiable),
+    #     so this changes how much each routed expert speaks, not WHICH experts
+    #     are routed.
+    "gptoss_instruct": [
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+        "mlp.router.weight",
+    ],
 }
 LORA_ATTN_TARGETS: dict[str, list[str] | str] = {
-    "gptoss_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    # Empty = no attention LoRA for gpt-oss (drop q/k/v/o). PEFT supports an
+    # empty target_modules alongside target_parameters; this makes the experts +
+    # router the ONLY adaptable params so they must carry the intervention.
+    "gptoss_instruct": [],
 }
 
 
