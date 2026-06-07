@@ -268,7 +268,7 @@ def _per_domain_init_scale(
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 
-def _apply_lora(model, model_key: str):
+def _apply_lora(model, model_key: str, moe_attn_lora: bool = False):
     from peft import LoraConfig, TaskType, get_peft_model
 
     expert_params = cfg.lora_target_parameters(model_key)
@@ -279,15 +279,26 @@ def _apply_lora(model, model_key: str):
         # fused [num_experts, ...] tensor applies the same rank across all
         # experts, so `rank_pattern` sets the per-expert-tensor rank to r.
         #
+        # Attention targets are an A/B knob (`--moe-attn-lora`): the default MoE
+        # config drops attention so the experts+router must carry the whole
+        # intervention (works for squad). For parametric-recall (kuq) the fact
+        # *retrieval* is largely attention-mediated, so adding q/k/v/o back is a
+        # hypothesis worth testing — hence the flag rather than a config edit.
+        #
         # PEFT's fused-parameter wrapper (lora.ParamWrapper) does not support
         # lora_dropout != 0, and a single LoraConfig shares one dropout across
         # its module + parameter targets — so the whole MoE adapter runs with
         # dropout 0 (the attention modules included).
+        attn_targets = (["q_proj", "k_proj", "v_proj", "o_proj"]
+                        if moe_attn_lora else cfg.lora_attn_targets(model_key))
+        log.info("  MoE LoRA attention targets: %s%s",
+                 attn_targets or "(none)",
+                 "  [--moe-attn-lora]" if moe_attn_lora else "")
         lcfg = LoraConfig(
             r=cfg.LORA_R,
             lora_alpha=cfg.LORA_ALPHA,
             lora_dropout=0.0,
-            target_modules=cfg.lora_attn_targets(model_key),
+            target_modules=attn_targets,
             target_parameters=expert_params,
             rank_pattern={p.split(".")[-1]: cfg.LORA_R for p in expert_params},
             task_type=TaskType.CAUSAL_LM,
@@ -351,7 +362,7 @@ def _compute_forget_loss(
             continue
         try:
             full_ids, p_len, n_ans = tokenise_prompt_plus_answer(
-                tokenizer, prompt, answer, k_answer_tokens=k_answer_tokens,
+                tokenizer, model_key, prompt, answer, k_answer_tokens=k_answer_tokens,
             )
         except Exception:
             continue
@@ -427,7 +438,7 @@ def _compute_retain_loss(
                 continue
             try:
                 full_ids, resp_start, n_ans = tokenise_prompt_plus_answer(
-                    tokenizer, prompt, answer, k_answer_tokens=k_answer_tokens,
+                    tokenizer, model_key, prompt, answer, k_answer_tokens=k_answer_tokens,
                 )
             except Exception:
                 continue
@@ -629,7 +640,7 @@ def train(args: argparse.Namespace) -> None:
                                           is_trainable=True)
         model.print_trainable_parameters()
     else:
-        model = _apply_lora(model, model_key)
+        model = _apply_lora(model, model_key, moe_attn_lora=args.moe_attn_lora)
     model.train()
 
     # Fused-expert MoE LoRA (gpt-oss): PEFT's ParamWrapper materializes the full
@@ -915,10 +926,13 @@ def train(args: argparse.Namespace) -> None:
         "lora_r":           cfg.LORA_R,
         "lora_alpha":       cfg.LORA_ALPHA,
         "lora_dropout":     0.0 if cfg.lora_target_parameters(model_key) else cfg.LORA_DROPOUT,
-        "lora_target_modules": (cfg.lora_attn_targets(model_key)
-                                if cfg.lora_target_parameters(model_key)
-                                else cfg.LORA_TARGET_MODULES),
+        "lora_target_modules": (
+            (["q_proj", "k_proj", "v_proj", "o_proj"] if args.moe_attn_lora
+             else cfg.lora_attn_targets(model_key))
+            if cfg.lora_target_parameters(model_key)
+            else cfg.LORA_TARGET_MODULES),
         "lora_target_parameters": cfg.lora_target_parameters(model_key),
+        "moe_attn_lora": bool(args.moe_attn_lora),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
         "init_scales":      {k: round(float(v), 4) for k, v in init_scales.items()},
         "early_stop":                  bool(args.early_stop),
@@ -989,6 +1003,11 @@ def parse_args() -> argparse.Namespace:
                    help="Optional suffix appended to the run name (e.g. "
                         "'routerexpert') so a variant writes to its own run dir "
                         "instead of clobbering an existing adapter/results.")
+    p.add_argument("--moe-attn-lora", action="store_true",
+                   help="MoE models only: add attention LoRA (q/k/v/o) alongside "
+                        "the experts+router target_parameters. Default off (experts+"
+                        "router only). Use for the kuq parametric-recall A/B test "
+                        "where fact retrieval is attention-mediated. Pair with --tag.")
     return p.parse_args()
 
 

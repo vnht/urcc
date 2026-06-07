@@ -386,17 +386,27 @@ def encode_text(tokenizer, text: str, add_special_tokens: bool = True) -> list[i
 
 def tokenise_prompt_plus_answer(
     tokenizer,
+    model_key: str,
     prompt: str,
     answer: str,
     k_answer_tokens: int | None = None,
 ) -> tuple[list[int], int, int]:
     """Returns (full_ids, prompt_len, n_answer_tokens).
 
+    The prompt is wrapped with the model's chat template via the *same* helper
+    used at mining and eval time (``_build_generation_input_ids``), so the
+    extracted answer-window activations live in the exact surface regime the
+    model actually answers in. This matters most for harmony/CoT reasoning
+    models (gpt-oss): a raw-text prompt omits the harmony system + channel
+    scaffolding and is badly off-distribution, which previously left the whole
+    A/B/C/D intervention built on a format the model never sees at inference.
+    Base models fall back to plain text inside the helper.
+
     The answer is encoded without special tokens and (if k_answer_tokens is
     given) truncated to its first K tokens — this matches the mining
     convention so that anchors and forget activations align.
     """
-    prompt_ids = encode_text(tokenizer, prompt, add_special_tokens=True)
+    prompt_ids = _build_generation_input_ids(tokenizer, model_key, prompt)
     answer_ids = encode_text(tokenizer, answer, add_special_tokens=False)
     if k_answer_tokens is not None:
         answer_ids = answer_ids[:k_answer_tokens]

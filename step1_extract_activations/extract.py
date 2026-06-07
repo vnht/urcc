@@ -229,7 +229,7 @@ def _extract_means_for(
             continue
         try:
             full_ids, p_len, n_ans = tokenise_prompt_plus_answer(
-                tokenizer, prompt, answer, k_answer_tokens=k_answer_tokens,
+                tokenizer, model_key, prompt, answer, k_answer_tokens=k_answer_tokens,
             )
         except Exception as exc:
             log.debug("  %s tokenise error: %s", desc, exc)
