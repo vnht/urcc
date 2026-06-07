@@ -419,11 +419,20 @@ def tokenise_chat_prompt_response(
     model_key: str,
     prompt: str,
     response: str,
+    open_final_channel: bool = False,
 ) -> tuple[list[int], int]:
     """Tokenise (prompt, response) for retain-general training.
 
     Instruct models use chat templates; base models use plain text.
     Returns (full_ids, response_start).
+
+    open_final_channel (gpt-oss only): when True, the harmony `final`-channel
+    header (`<|channel|>final<|message|>`) is appended after the assistant
+    generation prompt so the response is scored as legitimate final-channel
+    content. Without it the response is appended right after `<|start|>assistant`,
+    where the model expects a channel marker — which makes the first response
+    token near-impossible and blows up perplexity. Eval (perplexity) opts in;
+    training leaves it False so the retain target is unchanged.
     """
     if "base" in model_key:
         prompt_ids   = encode_text(tokenizer, prompt, add_special_tokens=True)
@@ -445,6 +454,8 @@ def tokenise_chat_prompt_response(
             user_msg, tokenize=False, add_generation_prompt=True,
             reasoning_effort=GPTOSS_REASONING_EFFORT,
         )
+        if open_final_channel:
+            prompt_fmt += "<|channel|>final<|message|>"
         prompt_ids = tokenizer.encode(prompt_fmt, add_special_tokens=False)
     else:
         prompt_fmt = tokenizer.apply_chat_template(

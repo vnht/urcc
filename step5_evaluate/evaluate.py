@@ -262,7 +262,7 @@ def _row_nll(model, tokenizer, model_key: str, prompt: str, response: str,
              max_response_tokens: int) -> tuple[float, int]:
     """Returns (sum_nll, n_response_tokens). Cross-entropy on response tokens only."""
     full_ids, prompt_len = tokenise_chat_prompt_response(
-        tokenizer, model_key, prompt, response,
+        tokenizer, model_key, prompt, response, open_final_channel=True,
     )
     response_len = len(full_ids) - prompt_len
     if response_len <= 0:
