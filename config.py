@@ -219,18 +219,17 @@ GPTOSS_MAX_NEW_TOKENS = 512
 # gpt-oss attention backend for GENERATION/eval/mining (training always uses
 # eager — see load_model_and_tokenizer). The model uses attention SINKS
 # (learnable per-head logits added before softmax), so plain `sdpa` is NOT
-# supported — it silently drops the sink term and corrupts results. Correct
-# backends, fastest first:
-#   "kernels-community/vllm-flash-attn3" — fastest, but Hopper-only (H100/H200);
-#       NOT for Blackwell/Ada/Ampere (won't load the sm_90 kernel).
-#   "flex_attention" — sink-aware (transformers applies the LSE renormalisation),
-#       torch.compile-backed, runs on Ampere/Ada/Hopper/Blackwell, and is far
-#       faster than eager. Safe default (incl. RTX PRO 6000 Blackwell, sm_120).
-#   "eager"          — correct everywhere but the slowest path.
-# Blackwell note: flex needs a torch built for sm_120 (PyTorch ≥2.7 / CUDA 12.8+,
-# which the gpt-oss transformers-v5 stack already requires). If you hit a "no
-# kernel image"/compile error, fall back to "eager".
-GPTOSS_ATTN_IMPLEMENTATION = "flex_attention"
+# supported — it silently drops the sink term and corrupts results. Options:
+#   "eager"          — correct everywhere, no compile. Slowest, but the only
+#       backend that reliably works on the Colab Blackwell (sm_120) image:
+#       flex_attention there fails to compile with Inductor "NoValidChoicesError"
+#       (the Triton flex template has no valid sm_120 config and the HOP has no
+#       ATEN fallback). Default.
+#   "flex_attention" — sink-aware and much faster than eager IF Inductor/Triton
+#       can compile it (works on Hopper/Ampere with a matching torch); broken on
+#       the current Colab Blackwell+Triton build, so do NOT use it there.
+#   "kernels-community/vllm-flash-attn3" — fastest, but Hopper-only (H100/H200).
+GPTOSS_ATTN_IMPLEMENTATION = "eager"
 
 
 def max_new_tokens_for(model_key: str) -> int:
