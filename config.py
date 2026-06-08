@@ -86,6 +86,10 @@ MODEL_REGISTRY: dict[str, str] = {
     # (CoT) channel cannot be disabled, only its effort lowered, so generation
     # is parsed down to the `final` channel (see _common.generate_greedy).
     "gptoss_instruct":    "openai/gpt-oss-20b",
+    # Meta Llama 3.1 8B pre-trained (base, no instruction tuning).
+    # Dense decoder: 32 layers, hidden 4096, GQA (32 query / 8 KV heads),
+    # SwiGLU FFN — LORA_TARGET_MODULES applies without changes.
+    "llama_base":         "meta-llama/Llama-3.1-8B",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -98,6 +102,8 @@ LAYER_SLICE: dict[str, list[int]] = {
     "ministral14b_instruct": [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
     # gpt-oss-20b: 24 text layers → last 25% = layers 18-23.
     "gptoss_instruct":    [18, 19, 20, 21, 22, 23],
+    # Llama 3.1 8B: 32 text layers → last 25% = layers 24-31.
+    "llama_base":         [24, 25, 26, 27, 28, 29, 30, 31],
 }
 
 

@@ -290,6 +290,20 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
         model = AutoModelForCausalLM.from_pretrained(
             model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
         )
+    elif model_id.startswith("meta-llama/"):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        # Llama 3 base has no dedicated pad token; point it at eos so
+        # generate() doesn't warn about an unset pad_token_id.
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
+        )
+        # Llama 3.1 generation_config sets max_length=131072; drop it to avoid
+        # "both max_new_tokens and max_length set" warnings on every generate().
+        if getattr(model, "generation_config", None) is not None:
+            model.generation_config.max_length = None
     elif model_id.startswith("mistralai/"):
         from transformers import (
             Mistral3ForConditionalGeneration,
