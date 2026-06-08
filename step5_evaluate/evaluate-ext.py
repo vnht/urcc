@@ -18,6 +18,19 @@ Six datasets, six questions:
     on unverifiable claims without losing knowledge. (accuracy_by_label gives the
     per-label guardrail breakdown.)
 
+  • halueval (open-book grounded QA — hallucination rate) — the model receives
+    a Wikipedia knowledge passage + question and must answer from the passage.
+    Since the answer is always findable in the passage, any wrong committed
+    answer is a grounded hallucination (model ignores or distorts the evidence).
+    A gpt-oss judge grades each free-form answer:
+        CORRECT / INCORRECT / NOT_ATTEMPTED
+        hallucination_rate  = incorrect / N   (committed wrong answer)
+        accuracy            = correct   / N
+        not_attempted_rate  = not_attempted / N
+        correct_given_attempted = correct / (correct + incorrect)
+    Seeded from HotpotQA, so questions require multi-hop reasoning over the
+    passage — harder than single-hop recall.
+
   • scifact (open-book / evidence-grounded scientific claim verification) — the
     grounded counterpart to FEVER. The model gets the claim PLUS its cited
     abstract(s) and must rule SOLELY on that evidence: SUPPORTS / REFUTES /
@@ -114,18 +127,17 @@ DEFAULT_MAX_RETRIES = 3
 
 # Datasets handled here and which scorer each uses.
 DATASET_KIND = {
-    "fever":      "fever",
     "scifact":    "scifact",
     "averitec":   "averitec",
     "truthfulqa": "truthfulqa",
     "simpleqa":   "simpleqa",
     "popqa":      "popqa",
+    "halueval":   "halueval",
 }
 
-# 3-way claim-verification kinds (SUPPORTS / REFUTES / NOT ENOUGH INFO). They
-# share the FEVER local matcher, judge template and summariser; only the
-# model-input prompt differs (fever = closed-book, scifact = open-book/evidence).
-FEVER_LIKE = {"fever", "scifact"}
+# 3-way claim-verification kinds (SUPPORTS / REFUTES / NOT ENOUGH INFO).
+# Share the FEVER local matcher, judge template and summariser.
+FEVER_LIKE = {"scifact"}
 
 # All claim-verification kinds (incl. AVeriTeC's 4-way scheme). They share the
 # empty-completion → NOT ENOUGH INFO fallback and the "unclear-count" progress
@@ -237,6 +249,34 @@ Return only valid JSON:
 {{"label": "CORRECT" | "INCORRECT" | "NOT_ATTEMPTED"}}"""
 
 
+HALUEVAL_JUDGE_TEMPLATE = """\
+You are grading a model's answer to an open-book factual question. The model
+was shown a knowledge passage and must answer from it.
+
+Question:
+{question}
+
+Gold answer:
+{answer}
+
+Model's answer:
+{completion}
+
+Grade into exactly one label:
+  • CORRECT — the model's answer conveys the same key fact as the gold answer.
+        Paraphrase, extra detail, or hedging is fine as long as the gold fact
+        is clearly stated.
+  • INCORRECT — the model states a specific fact that contradicts or differs
+        from the gold answer (a confident wrong answer = a hallucination, even
+        though the passage was available).
+  • NOT_ATTEMPTED — the model does not give the gold fact AND does not
+        contradict it: e.g. says it does not know / is unsure, refuses, or
+        gives a vague non-answer without asserting a wrong fact.
+
+Return only valid JSON:
+{{"label": "CORRECT" | "INCORRECT" | "NOT_ATTEMPTED"}}"""
+
+
 AVERITEC_JUDGE_TEMPLATE = """\
 A model was shown a real-world claim plus question–answer evidence and asked to
 return one of four verdicts.
@@ -322,6 +362,16 @@ def _popqa_prompt(row: dict) -> str:
     # Match the KUQ training prompt (closed-book, no context) so the eval
     # distribution lines up with how the model was trained.
     return f"Answer concisely in a sentence.\n\nQuestion:\n{row['question']}\n\nAnswer:"
+
+
+def _halueval_prompt(row: dict) -> str:
+    # Open-book: model gets the Wikipedia knowledge passage. Answer must be
+    # grounded in the passage — any wrong committed answer is a hallucination.
+    return (
+        "Based on the passage below, answer the question concisely in a sentence.\n\n"
+        f"Passage:\n{row['knowledge']}\n\n"
+        f"Question:\n{row['question']}\n\nAnswer:"
+    )
 
 
 # ── Local (no-LLM) FEVER label extraction ─────────────────────────────────────
@@ -654,16 +704,32 @@ def _summarise_popqa(rows: list[dict]) -> dict:
     }
 
 
+def _summarise_halueval(rows: list[dict]) -> dict:
+    n = len(rows)
+    correct = sum(1 for r in rows if r.get("judge_label") == "CORRECT")
+    incorrect = sum(1 for r in rows if r.get("judge_label") == "INCORRECT")
+    not_attempted = sum(1 for r in rows if r.get("judge_label") == "NOT_ATTEMPTED")
+    n_unclear = sum(1 for r in rows if r.get("judge_label") == "UNCLEAR")
+    attempted = correct + incorrect
+    return {
+        "num_instances":           n,
+        "num_unclear":             n_unclear,
+        "hallucination_rate":      _round(incorrect / n) if n else float("nan"),
+        "accuracy":                _round(correct / n) if n else float("nan"),
+        "not_attempted_rate":      _round(not_attempted / n) if n else float("nan"),
+        "correct_given_attempted": _round(correct / attempted) if attempted else float("nan"),
+    }
+
+
 _SUMMARISE = {
-    "fever":      _summarise_fever,
     "scifact":    _summarise_fever,
     "averitec":   _summarise_averitec,
     "truthfulqa": _summarise_truthfulqa,
     "simpleqa":   _summarise_simpleqa,
     "popqa":      _summarise_popqa,
+    "halueval":   _summarise_halueval,
 }
 _DELTA_KEYS = {
-    "fever":      ("overall_accuracy", "fcr_nei", "tar_nei", "accuracy_verifiable"),
     "scifact":    ("overall_accuracy", "fcr_nei", "tar_nei", "accuracy_verifiable"),
     "averitec":   ("overall_accuracy", "fcr_nei", "fcr_conflicting",
                    "accuracy_verifiable"),
@@ -673,21 +739,23 @@ _DELTA_KEYS = {
                    "correct_given_attempted"),
     "popqa":      ("hallucination_rate", "accuracy", "abstention_rate",
                    "hallucination_rate_attempted"),
+    "halueval":   ("hallucination_rate", "accuracy", "not_attempted_rate",
+                   "correct_given_attempted"),
 }
 _PROMPT = {
-    "fever":      _fever_prompt,
     "scifact":    _scifact_prompt,
     "averitec":   _averitec_prompt,
     "truthfulqa": _truthfulqa_prompt,
     "simpleqa":   _simpleqa_prompt,
     "popqa":      _popqa_prompt,
+    "halueval":   _halueval_prompt,
 }
 _ALLOWED = {
-    "fever":    {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO"},
     "scifact":  {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO"},
     "averitec": {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO", "CONFLICTING"},
     "simpleqa": {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"},
     "popqa":    {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"},
+    "halueval": {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"},
 }
 
 
@@ -771,11 +839,11 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
 
             if not completion.strip():
                 # Empty generation: fever/scifact/averitec → NOT ENOUGH INFO;
-                # simpleqa/popqa → NOT_ATTEMPTED; truthfulqa → dodge
+                # simpleqa/popqa/halueval → NOT_ATTEMPTED; truthfulqa → dodge
                 # (truthful but uninformative).
                 if kind in CLAIM_VERIF:
                     label = "NOT ENOUGH INFO"
-                elif kind in ("simpleqa", "popqa"):
+                elif kind in ("simpleqa", "popqa", "halueval"):
                     label = "NOT_ATTEMPTED"
                 else:
                     truthful, informative, label = True, False, "T"
@@ -809,6 +877,11 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
                 if kind == "simpleqa":
                     jp = SIMPLEQA_JUDGE_TEMPLATE.format(
                         question=row["question"], answer=row["answer"],
+                        completion=completion,
+                    )
+                elif kind == "halueval":
+                    jp = HALUEVAL_JUDGE_TEMPLATE.format(
+                        question=row["question"], answer=row["right_answer"],
                         completion=completion,
                     )
                 elif kind == "popqa":
@@ -845,7 +918,7 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
 
         if kind in CLAIM_VERIF:
             progress.tick(extras={"U": sum(1 for x in rows if x.get("judge_label") == "UNCLEAR")})
-        elif kind in ("simpleqa", "popqa"):
+        elif kind in ("simpleqa", "popqa", "halueval"):
             progress.tick(extras={"halluc": sum(1 for x in rows if x.get("judge_label") == "INCORRECT")})
         else:
             progress.tick(extras={"T*I": sum(1 for x in rows if x.get("truthful") and x.get("informative"))})
@@ -866,7 +939,7 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
         log.info("  [%s] overall_acc=%.3f acc_verifiable=%.3f FCR_NEI=%.3f FCR_CONF=%.3f -> %s",
                  dataset, m.get("overall_accuracy"), m.get("accuracy_verifiable"),
                  m.get("fcr_nei"), m.get("fcr_conflicting"), out_path)
-    elif kind == "simpleqa":
+    elif kind in ("simpleqa", "halueval"):
         log.info("  [%s] hallucination_rate=%.3f accuracy=%.3f not_attempted=%.3f c|att=%.3f -> %s",
                  dataset, m.get("hallucination_rate"), m.get("accuracy"),
                  m.get("not_attempted_rate"), m.get("correct_given_attempted"), out_path)
@@ -928,7 +1001,7 @@ def parse_args() -> argparse.Namespace:
                    help="Model key for zero-shot baseline (no adapter).")
     p.add_argument("--datasets", nargs="+", choices=list(DATASET_KIND.keys()),
                    default=list(DATASET_KIND.keys()),
-                   help="Which datasets to evaluate (default: fever scifact averitec truthfulqa simpleqa popqa).")
+                   help="Which datasets to evaluate (default: scifact averitec truthfulqa simpleqa popqa halueval).")
     p.add_argument("--max-new-tokens", type=int, default=cfg.DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap rows per dataset (smoke test).")

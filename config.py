@@ -145,7 +145,6 @@ DOMAIN_OF: dict[str, str] = {
     "squad":      "squad",
     # New held-out, no-context
     "selfaware":  "kuq",
-    "qaqa":       "kuq",
     # New held-out, with-context
     "faitheval":  "squad",
     "nomiracl":   "squad",
