@@ -11,6 +11,12 @@
     "pct_truthful_informative": 0.7503,
     "imitative_falsehood_rate": 0.2277,
     "dodge_gap": 0.022,
+    "simpleqa_view": {
+      "accuracy": 0.7503,
+      "hallucination_rate": 0.2277,
+      "not_attempted_rate": 0.022,
+      "correct_given_attempted": 0.7672
+    },
     "imitative_falsehood_by_category": {
       "Advertising": {
         "n": 13,
