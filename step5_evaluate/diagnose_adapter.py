@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -50,6 +51,43 @@ PROBES = [
 
 def _prompt(q: str) -> str:
     return f"Answer concisely in a sentence.\n\nQuestion:\n{q}\n\nAnswer:"
+
+
+def _gather_degenerate_probes(run_name: str, n: int) -> list[dict]:
+    """Pull the REAL prompts that degenerated in this run's saved results.
+
+    Uses the exact stored `prompt` so we reproduce the actual failure, not a
+    synthetic stand-in. Samples up to n, spread across datasets.
+    """
+    results_dir = cfg.RESULTS_DIR / run_name
+    files = sorted(results_dir.glob("*.json"))
+    by_ds: dict[str, list[dict]] = {}
+    for f in files:
+        try:
+            rec = json.loads(f.read_text())
+        except Exception:
+            continue
+        rows = rec.get("rows") or []
+        degs = [r for r in rows
+                if r.get("prompt") and _is_degenerate(r.get("completion"))]
+        if degs:
+            by_ds[f.stem] = degs
+    if not by_ds:
+        return []
+    # Round-robin across datasets so the probe set isn't dominated by one.
+    probes: list[dict] = []
+    idx = 0
+    while len(probes) < n and any(idx < len(v) for v in by_ds.values()):
+        for ds, degs in by_ds.items():
+            if idx < len(degs) and len(probes) < n:
+                r = degs[idx]
+                q = (r.get("question") or r.get("claim") or r.get("prompt") or "")[:45]
+                probes.append({"label": f"{ds}:{q}", "prompt": r["prompt"],
+                               "old": (r.get("completion") or "").strip()[:60]})
+        idx += 1
+    log.info("  pulled %d real degenerate probes from %s (datasets: %s)",
+             len(probes), run_name, {k: len(v) for k, v in by_ds.items()})
+    return probes
 
 
 def _is_degenerate(c: str) -> bool:
@@ -90,17 +128,18 @@ def _apply_scaling(model, base: dict, factor: float, zero_layers: set[int] | Non
             mod.scaling[ad] = 0.0 if layer in zero_layers else base[(name, ad)] * factor
 
 
-def _run_setting(model, tokenizer, model_key, label: str, max_new_tokens: int):
+def _run_setting(model, tokenizer, model_key, label: str, probes: list[dict],
+                 max_new_tokens: int):
     deg = 0
     print(f"\n===== {label} =====")
-    for q in PROBES:
-        out = generate_greedy(model, tokenizer, model_key, _prompt(q),
+    for pr in probes:
+        out = generate_greedy(model, tokenizer, model_key, pr["prompt"],
                               max_new_tokens=max_new_tokens)
         bad = _is_degenerate(out)
         deg += bad
         flag = "DEGENERATE" if bad else "ok"
-        print(f"  [{flag:10s}] Q: {q[:45]:45s} -> {out.strip()[:90]!r}")
-    print(f"  --> {deg}/{len(PROBES)} degenerate")
+        print(f"  [{flag:10s}] {pr['label'][:50]:50s} -> {out.strip()[:80]!r}")
+    print(f"  --> {deg}/{len(probes)} degenerate")
     return deg
 
 
@@ -109,14 +148,29 @@ def main() -> None:
     p.add_argument("--run-dir", type=Path, required=True)
     p.add_argument("--scales", type=float, nargs="+",
                    default=[0.0, 0.25, 0.5, 0.75, 1.0])
-    p.add_argument("--ablate-last", type=int, nargs="+", default=[1, 2],
+    p.add_argument("--ablate-last", type=int, nargs="+", default=[],
                    help="Also test full-strength with the last K layers ablated.")
+    p.add_argument("--from-results", action="store_true",
+                   help="Use the REAL degenerate prompts from this run's saved "
+                        "results instead of the synthetic probe set.")
+    p.add_argument("--n-probes", type=int, default=12,
+                   help="How many real degenerate probes to sample (--from-results).")
     p.add_argument("--max-new-tokens", type=int, default=None)
     args = p.parse_args()
 
-    model, tokenizer, model_key = _load_adapter_model(args.run_dir.resolve())
+    run_dir = args.run_dir.resolve()
+    if args.from_results:
+        probes = _gather_degenerate_probes(run_dir.name, args.n_probes)
+        if not probes:
+            log.warning("  No degenerate rows found in saved results for %s — "
+                        "falling back to synthetic probes.", run_dir.name)
+            probes = [{"label": q, "prompt": _prompt(q)} for q in PROBES]
+    else:
+        probes = [{"label": q, "prompt": _prompt(q)} for q in PROBES]
+
+    model, tokenizer, model_key = _load_adapter_model(run_dir)
     mnt = args.max_new_tokens or cfg.max_new_tokens_for(model_key)
-    log.info("  model_key=%s  max_new_tokens=%d", model_key, mnt)
+    log.info("  model_key=%s  max_new_tokens=%d  probes=%d", model_key, mnt, len(probes))
 
     base = _capture_base_scaling(model)
     layers = sorted({int(_LAYER_RE.search(n).group(1))
@@ -134,18 +188,19 @@ def main() -> None:
     for f in args.scales:
         _apply_scaling(model, base, f)
         results[f"scale={f:.2f}"] = _run_setting(
-            model, tokenizer, model_key, f"SCALE x{f:.2f}", mnt)
+            model, tokenizer, model_key, f"SCALE x{f:.2f}", probes, mnt)
 
-    # 2) last-K-layer ablation at full strength
+    # 2) last-K-layer ablation at full strength (optional)
     for k in args.ablate_last:
         zero = {max_layer - i for i in range(k)}
         _apply_scaling(model, base, 1.0, zero_layers=zero)
         results[f"full,ablate_last_{k}"] = _run_setting(
-            model, tokenizer, model_key, f"FULL, ablate last {k} layers {sorted(zero)}", mnt)
+            model, tokenizer, model_key, f"FULL, ablate last {k} layers {sorted(zero)}",
+            probes, mnt)
 
     print("\n================ SUMMARY ================")
     for k, v in results.items():
-        print(f"  {k:24s} degenerate {v}/{len(PROBES)}")
+        print(f"  {k:24s} degenerate {v}/{len(probes)}")
     print("\nReading: scale=0.00 should be clean (base). If a scale<1.0 is clean "
           "but 1.0 is not, over-suppression is confirmed. If 'ablate_last_*' is "
           "clean at full strength, the final-layer edits are the culprit.")
