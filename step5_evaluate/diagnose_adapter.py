@@ -53,13 +53,12 @@ def _prompt(q: str) -> str:
     return f"Answer concisely in a sentence.\n\nQuestion:\n{q}\n\nAnswer:"
 
 
-def _gather_degenerate_probes(run_name: str, n: int) -> list[dict]:
+def _gather_degenerate_probes(results_dir: Path, n: int) -> list[dict]:
     """Pull the REAL prompts that degenerated in this run's saved results.
 
     Uses the exact stored `prompt` so we reproduce the actual failure, not a
     synthetic stand-in. Samples up to n, spread across datasets.
     """
-    results_dir = cfg.RESULTS_DIR / run_name
     files = sorted(results_dir.glob("*.json"))
     by_ds: dict[str, list[dict]] = {}
     for f in files:
@@ -86,7 +85,7 @@ def _gather_degenerate_probes(run_name: str, n: int) -> list[dict]:
                                "old": (r.get("completion") or "").strip()[:60]})
         idx += 1
     log.info("  pulled %d real degenerate probes from %s (datasets: %s)",
-             len(probes), run_name, {k: len(v) for k, v in by_ds.items()})
+             len(probes), results_dir.name, {k: len(v) for k, v in by_ds.items()})
     return probes
 
 
@@ -145,7 +144,8 @@ def _run_setting(model, tokenizer, model_key, label: str, probes: list[dict],
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--run-dir", type=Path, required=True)
+    p.add_argument("--run-dir", type=Path, required=True,
+                   help="Adapter/training dir (must contain training_config.json).")
     p.add_argument("--scales", type=float, nargs="+",
                    default=[0.0, 0.25, 0.5, 0.75, 1.0])
     p.add_argument("--ablate-last", type=int, nargs="+", default=[],
@@ -153,6 +153,9 @@ def main() -> None:
     p.add_argument("--from-results", action="store_true",
                    help="Use the REAL degenerate prompts from this run's saved "
                         "results instead of the synthetic probe set.")
+    p.add_argument("--results-dir", type=Path, default=None,
+                   help="Where to read saved results for --from-results. "
+                        "Defaults to RESULTS_DIR/<run-dir name>.")
     p.add_argument("--n-probes", type=int, default=12,
                    help="How many real degenerate probes to sample (--from-results).")
     p.add_argument("--max-new-tokens", type=int, default=None)
@@ -160,10 +163,11 @@ def main() -> None:
 
     run_dir = args.run_dir.resolve()
     if args.from_results:
-        probes = _gather_degenerate_probes(run_dir.name, args.n_probes)
+        results_dir = (args.results_dir or cfg.RESULTS_DIR / run_dir.name).resolve()
+        probes = _gather_degenerate_probes(results_dir, args.n_probes)
         if not probes:
-            log.warning("  No degenerate rows found in saved results for %s — "
-                        "falling back to synthetic probes.", run_dir.name)
+            log.warning("  No degenerate rows found in saved results at %s — "
+                        "falling back to synthetic probes.", results_dir)
             probes = [{"label": q, "prompt": _prompt(q)} for q in PROBES]
     else:
         probes = [{"label": q, "prompt": _prompt(q)} for q in PROBES]
