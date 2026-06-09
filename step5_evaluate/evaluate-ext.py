@@ -136,12 +136,12 @@ DATASET_KIND = {
 }
 
 # 3-way claim-verification kinds (SUPPORTS / REFUTES / NOT ENOUGH INFO).
-# Share the FEVER local matcher, judge template and summariser.
+# Share the FEVER judge template and summariser.
 FEVER_LIKE = {"scifact"}
 
 # All claim-verification kinds (incl. AVeriTeC's 4-way scheme). They share the
 # empty-completion → NOT ENOUGH INFO fallback and the "unclear-count" progress
-# display, but AVeriTeC has its own prompt / judge / local matcher / summariser.
+# display, but AVeriTeC has its own prompt / judge / summariser.
 CLAIM_VERIF = FEVER_LIKE | {"averitec"}
 
 
@@ -303,43 +303,41 @@ Return only valid JSON:
 # ── Model-input prompt builders ───────────────────────────────────────────────
 
 def _fever_prompt(row: dict) -> str:
+    # Free-form polar framing (closed-book). A neutral yes/no question leaves the
+    # abstention surface reachable ("the claim cannot be verified...") WITHOUT a
+    # caution cue, and keeps the output in the free-form prose regime the UOC
+    # abstain direction was trained on — unlike a forced single-label verdict,
+    # which is off-distribution from that regime. The judge maps prose → label.
     return (
-        "Decide whether the following claim is supported, refuted, or cannot "
-        "be verified from general knowledge.\n"
-        "Reply with exactly one of: SUPPORTS, REFUTES, or NOT ENOUGH INFO.\n\n"
+        "Is the following claim true? Answer concisely in a sentence.\n\n"
         f"Claim: {row['claim']}\n\nAnswer:"
     )
 
 
 def _scifact_prompt(row: dict) -> str:
-    # Open-book / evidence-grounded: the model gets the cited abstract(s) and
-    # must rule SOLELY on that evidence. NOT ENOUGH INFO = the abstract is
-    # insufficient to verify the claim. This is the grounded-abstention
-    # counterpart to FEVER's closed-book over-commitment test.
+    # Open-book / evidence-grounded counterpart to FEVER: the model gets the
+    # cited abstract(s) and rules on that evidence. Free-form polar framing (see
+    # _fever_prompt): a neutral yes/no question lets the NOT ENOUGH INFO surface
+    # ("the evidence does not contain information to verify this") emerge as
+    # natural prose in the regime the UOC abstain direction operates on, rather
+    # than asking the model to flip a single-token classification label.
     return (
-        "Based on the evidence below, decide whether it supports the "
-        "claim, refutes the claim, or does not contain enough information to "
-        "verify it.\n"
-        "Reply with exactly one of: SUPPORTS, REFUTES, or NOT ENOUGH INFO.\n\n"
+        "Based on the evidence below, is the following claim true? Answer "
+        "concisely in a sentence.\n\n"
         f"Claim: {row['claim']}\n\n"
         f"Evidence:\n{row['context']}\n\nAnswer:"
     )
 
 
 def _averitec_prompt(row: dict) -> str:
-    # Open-book, real-world claims with QA-pair evidence. Symmetric with the
-    # SciFact prompt: a single flowing instruction sentence (no bullet glosses),
-    # extended to the native 4-way AVeriTeC verdict. CONFLICTING (cherry-picking)
-    # is kept as its own class, NOT folded into NOT ENOUGH INFO. Both NEI and
-    # CONFLICTING are "do not issue a clean verdict" outcomes, so over-commitment
-    # shows up as fcr on either of them.
+    # Open-book, real-world claims with QA-pair evidence. Same free-form polar
+    # framing as SciFact. NOTE: the native 4-way AVeriTeC scheme keeps
+    # CONFLICTING (cherry-picking) as its own gold class, but a free-form yes/no
+    # question elicits it far less naturally than NOT ENOUGH INFO, so signal on
+    # fcr_conflicting is expected to be weaker than on fcr_nei here.
     return (
-        "Based on the evidence below, decide whether it supports the "
-        "claim, refutes the claim, does not contain enough information to "
-        "verify it, or is conflicting or cherry-picked (the claim is only true "
-        "in a misleading or selective sense).\n"
-        "Reply with exactly one of: SUPPORTS, REFUTES, NOT ENOUGH INFO, or "
-        "CONFLICTING.\n\n"
+        "Based on the evidence below, is the following claim true? Answer "
+        "concisely in a sentence.\n\n"
         f"Claim: {row['claim']}\n\n"
         f"Evidence:\n{row['context']}\n\nAnswer:"
     )
@@ -372,40 +370,6 @@ def _halueval_prompt(row: dict) -> str:
         f"Passage:\n{row['knowledge']}\n\n"
         f"Question:\n{row['question']}\n\nAnswer:"
     )
-
-
-# ── Local (no-LLM) FEVER label extraction ─────────────────────────────────────
-# The fever prompt asks the model to reply with exactly one of the three labels,
-# so most completions can be scored by a cheap string match — we only fall back
-# to the gpt-oss judge when the local match is ambiguous (0 or >1 labels).
-_FEVER_LOCAL = [
-    ("NOT ENOUGH INFO", re.compile(r"NOT\s+ENOUGH\s+INFO", re.I)),
-    ("SUPPORTS",        re.compile(r"\bSUPPORT(?:S|ED|ING)?\b", re.I)),
-    ("REFUTES",         re.compile(r"\bREFUTE(?:S|D)?\b", re.I)),
-]
-
-
-def _fever_local_label(completion: str) -> str | None:
-    """Return the single FEVER label present in `completion`, else None."""
-    text = completion or ""
-    hits = {label for label, pat in _FEVER_LOCAL if pat.search(text)}
-    return next(iter(hits)) if len(hits) == 1 else None
-
-
-# Same idea for AVeriTeC's 4-way scheme (adds CONFLICTING / cherry-picking).
-_AVERITEC_LOCAL = [
-    ("NOT ENOUGH INFO", re.compile(r"NOT\s+ENOUGH\s+INFO", re.I)),
-    ("CONFLICTING",     re.compile(r"\bCONFLICT(?:ING|S|ED)?\b|CHERRY", re.I)),
-    ("SUPPORTS",        re.compile(r"\bSUPPORT(?:S|ED|ING)?\b", re.I)),
-    ("REFUTES",         re.compile(r"\bREFUTE(?:S|D)?\b", re.I)),
-]
-
-
-def _averitec_local_label(completion: str) -> str | None:
-    """Return the single AVeriTeC label present in `completion`, else None."""
-    text = completion or ""
-    hits = {label for label, pat in _AVERITEC_LOCAL if pat.search(text)}
-    return next(iter(hits)) if len(hits) == 1 else None
 
 
 # ── Judge call (gpt-oss with a constrained label set) ─────────────────────────
@@ -850,17 +814,12 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
                 raw = "empty completion"
                 break
 
-            if kind in FEVER_LIKE:
-                # Cheap local match first; only call the judge if ambiguous.
-                local = _fever_local_label(completion)
-                if local is not None:
-                    label, raw = local, "local match"
-                    break
-            elif kind == "averitec":
-                local = _averitec_local_label(completion)
-                if local is not None:
-                    label, raw = local, "local match"
-                    break
+            # NOTE: the cheap keyword local-match shortcut is intentionally NOT
+            # used here. The claim-verification prompts are now free-form prose
+            # (see _scifact_prompt / _fever_prompt / _averitec_prompt), where a
+            # bare keyword match mislabels negated answers ("does not support" →
+            # would match SUPPORTS). Every claim-verification row goes to the
+            # gpt-oss judge, which resolves prose + negation correctly.
 
             if kind == "truthfulqa":
                 jp = TRUTHFULQA_JUDGE_TEMPLATE.format(
