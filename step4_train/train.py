@@ -320,6 +320,37 @@ def _apply_lora(model, model_key: str, moe_attn_lora: bool = False,
     return model
 
 
+@torch.no_grad()
+def _mean_lora_delta_norm(model) -> float:
+    """Mean Frobenius norm of the effective LoRA delta (α/r)·B·A per module.
+
+    This is the quantity that, when too large, causes degeneration. Watching it
+    fall as weight_decay rises lets us pick the decay without a full eval each
+    time. Cheap: ‖BA‖_F² = trace((A·Aᵀ)(Bᵀ·B)) needs only r×r matmuls.
+    """
+    norms: list[float] = []
+    for mod in model.modules():
+        A_dict = getattr(mod, "lora_A", None)
+        B_dict = getattr(mod, "lora_B", None)
+        scaling = getattr(mod, "scaling", None)
+        if not (isinstance(A_dict, torch.nn.ModuleDict)
+                and isinstance(B_dict, torch.nn.ModuleDict)
+                and isinstance(scaling, dict)):
+            continue
+        for ad in A_dict:
+            try:
+                A = A_dict[ad].weight            # (r, in)
+                B = B_dict[ad].weight            # (out, r)
+                s = float(scaling.get(ad, 1.0))
+            except Exception:
+                continue
+            AAt = A @ A.transpose(0, 1)          # (r, r)
+            BtB = B.transpose(0, 1) @ B          # (r, r)
+            fro2 = (AAt * BtB).sum()             # trace(AAt·BtB), both symmetric
+            norms.append(s * float(fro2.clamp_min(0).sqrt()))
+    return sum(norms) / len(norms) if norms else 0.0
+
+
 # ── Loss components (always the same operation: ‖ Vᵀ(h - target) ‖²) ───────────
 
 def _project_to_pole(
@@ -663,10 +694,15 @@ def train(args: argparse.Namespace) -> None:
         log.info("  gradient checkpointing enabled (fused-expert MoE)")
 
     # Optimiser + scheduler
+    # weight_decay > 0 penalises the LoRA A/B magnitude directly, capping the
+    # converged delta (α/r)·BA. This is the real train-time fix for over-strong
+    # adapters: unlike lowering α (which Adam compensates for by growing BA),
+    # decoupled decay sets an equilibrium magnitude the forget loss can't exceed.
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=0.0,
+        lr=args.lr, weight_decay=args.weight_decay,
     )
+    log.info("  AdamW weight_decay=%g", args.weight_decay)
     f_steps_per_epoch = math.ceil(len(forget_data) / args.forget_batch)
     total_optim_steps = math.ceil(f_steps_per_epoch / args.grad_accum) * args.epochs
     warmup = max(1, int(total_optim_steps * cfg.DEFAULT_WARMUP_RATIO))
@@ -709,8 +745,8 @@ def train(args: argparse.Namespace) -> None:
     # CSV log — append on resume so prior history is preserved
     log_path = out_dir / "loss_log.csv"
     log_fields = ["step", "L_total", "L_forget", "L_retain",
-                  "mean_proj_norm", "learning_rate", "grad_norm",
-                  "step_time_s", "elapsed_s"]
+                  "mean_proj_norm", "lora_delta_norm", "learning_rate",
+                  "grad_norm", "step_time_s", "elapsed_s"]
     is_new_log = not log_path.exists() or not resume
     log_file = open(log_path, "a" if resume and log_path.exists() else "w", newline="")
     log_writer = csv.DictWriter(log_file, fieldnames=log_fields)
@@ -807,6 +843,7 @@ def train(args: argparse.Namespace) -> None:
                     "L_forget":        round(avg_forget, 6),
                     "L_retain":        round(avg_retain, 6),
                     "mean_proj_norm":  round(mean_proj,  6),
+                    "lora_delta_norm": round(_mean_lora_delta_norm(model), 4),
                     "learning_rate":   lr_now,
                     "grad_norm":       round(float(grad_norm), 4),
                     "step_time_s":     round(step_dt, 3),
@@ -845,6 +882,7 @@ def train(args: argparse.Namespace) -> None:
                     "L":    f"{avg_total:.4f}",
                     "L_F":  f"{avg_forget:.4f}",
                     "L_R":  f"{avg_retain:.4f}",
+                    "|Δ|":  f"{row['lora_delta_norm']:.3f}",
                     "lr":   f"{lr_now:.2e}",
                     "gn":   f"{float(grad_norm):.3f}",
                     "dt":   f"{step_dt:.2f}s",
@@ -921,6 +959,7 @@ def train(args: argparse.Namespace) -> None:
         "lambda_retain":    args.lambda_retain,
         "epochs":           args.epochs,
         "lr":               args.lr,
+        "weight_decay":     args.weight_decay,
         "forget_batch":     args.forget_batch,
         "retain_batch":     args.retain_batch,
         "grad_accum":       args.grad_accum,
@@ -982,9 +1021,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rank", type=int, default=cfg.SUBSPACE_RANK)
     p.add_argument("--lora-alpha", type=int, default=None,
                    help=f"Override LoRA alpha (default cfg.LORA_ALPHA="
-                        f"{cfg.LORA_ALPHA}). Halve it (e.g. 16) for over-strong "
-                        f"adapters that degenerate at full strength. Use --tag "
+                        f"{cfg.LORA_ALPHA}). NOTE: lowering alpha alone does NOT "
+                        f"reduce the converged update magnitude (Adam compensates "
+                        f"by growing BA); use --weight-decay for that. Use --tag "
                         f"to keep the run dir distinct.")
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="AdamW decoupled weight decay on the LoRA weights "
+                        "(default 0.0). Use >0 (e.g. 0.1) to cap the converged "
+                        "adapter magnitude and prevent degeneration in "
+                        "low-redundancy backbones (e.g. Ministral). Use --tag "
+                        "to keep the run dir distinct.")
     p.add_argument("--lambda-retain", type=float, default=cfg.DEFAULT_LAMBDA_RETAIN,
                    help="Weight on L_retain (default: 1.0)")
     p.add_argument("--epochs",       type=int,   default=cfg.DEFAULT_EPOCHS)
