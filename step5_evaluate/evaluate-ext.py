@@ -797,6 +797,10 @@ def run(args: argparse.Namespace) -> None:
             model, tokenizer, model_key = _load_base_model(args.model)
     log.info("  model: %s (%s)", model_key, cfg.MODEL_REGISTRY[model_key])
 
+    if args.max_new_tokens is None:
+        args.max_new_tokens = cfg.max_new_tokens_for(model_key)
+    log.info("  max_new_tokens=%d", args.max_new_tokens)
+
     from judge import make_cerebras_client  # type: ignore[import]
     client = make_cerebras_client()
 
@@ -818,7 +822,11 @@ def parse_args() -> argparse.Namespace:
                    default=list(DATASET_KIND.keys()),
                    help="Which datasets to evaluate (default: all of "
                         "scifact averitec truthfulqa simpleqa popqa).")
-    p.add_argument("--max-new-tokens", type=int, default=cfg.DEFAULT_MAX_NEW_TOKENS)
+    p.add_argument("--max-new-tokens", type=int, default=None,
+                   help="Greedy decode cap. Default: per-model "
+                        "cfg.max_new_tokens_for (512 for gpt-oss so its harmony "
+                        "analysis channel does not exhaust the budget before the "
+                        "final answer; 64 otherwise).")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap rows per dataset (smoke test).")
     p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
