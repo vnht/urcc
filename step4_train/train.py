@@ -268,9 +268,11 @@ def _per_domain_init_scale(
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 
-def _apply_lora(model, model_key: str, moe_attn_lora: bool = False):
+def _apply_lora(model, model_key: str, moe_attn_lora: bool = False,
+                lora_alpha: int | None = None):
     from peft import LoraConfig, TaskType, get_peft_model
 
+    lora_alpha = cfg.LORA_ALPHA if lora_alpha is None else lora_alpha
     expert_params = cfg.lora_target_parameters(model_key)
     if expert_params:
         # Fused-expert MoE (e.g. gpt-oss): expert FFNs are 3-D nn.Parameter
@@ -296,7 +298,7 @@ def _apply_lora(model, model_key: str, moe_attn_lora: bool = False):
                  "  [--moe-attn-lora]" if moe_attn_lora else "")
         lcfg = LoraConfig(
             r=cfg.LORA_R,
-            lora_alpha=cfg.LORA_ALPHA,
+            lora_alpha=lora_alpha,
             lora_dropout=0.0,
             target_modules=attn_targets,
             target_parameters=expert_params,
@@ -307,7 +309,7 @@ def _apply_lora(model, model_key: str, moe_attn_lora: bool = False):
     else:
         lcfg = LoraConfig(
             r=cfg.LORA_R,
-            lora_alpha=cfg.LORA_ALPHA,
+            lora_alpha=lora_alpha,
             lora_dropout=cfg.LORA_DROPOUT,
             target_modules=cfg.LORA_TARGET_MODULES,
             task_type=TaskType.CAUSAL_LM,
@@ -640,7 +642,8 @@ def train(args: argparse.Namespace) -> None:
                                           is_trainable=True)
         model.print_trainable_parameters()
     else:
-        model = _apply_lora(model, model_key, moe_attn_lora=args.moe_attn_lora)
+        model = _apply_lora(model, model_key, moe_attn_lora=args.moe_attn_lora,
+                            lora_alpha=args.lora_alpha)
     model.train()
 
     # Fused-expert MoE LoRA (gpt-oss): PEFT's ParamWrapper materializes the full
@@ -924,7 +927,7 @@ def train(args: argparse.Namespace) -> None:
         "checkpoint_every": args.checkpoint_every,
         "warmup_ratio":     cfg.DEFAULT_WARMUP_RATIO,
         "lora_r":           cfg.LORA_R,
-        "lora_alpha":       cfg.LORA_ALPHA,
+        "lora_alpha":       args.lora_alpha if args.lora_alpha is not None else cfg.LORA_ALPHA,
         "lora_dropout":     0.0 if cfg.lora_target_parameters(model_key) else cfg.LORA_DROPOUT,
         "lora_target_modules": (
             (["q_proj", "k_proj", "v_proj", "o_proj"] if args.moe_attn_lora
@@ -977,6 +980,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Step 4: train UOC (two-component loss).")
     p.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()), required=True)
     p.add_argument("--rank", type=int, default=cfg.SUBSPACE_RANK)
+    p.add_argument("--lora-alpha", type=int, default=None,
+                   help=f"Override LoRA alpha (default cfg.LORA_ALPHA="
+                        f"{cfg.LORA_ALPHA}). Halve it (e.g. 16) for over-strong "
+                        f"adapters that degenerate at full strength. Use --tag "
+                        f"to keep the run dir distinct.")
     p.add_argument("--lambda-retain", type=float, default=cfg.DEFAULT_LAMBDA_RETAIN,
                    help="Weight on L_retain (default: 1.0)")
     p.add_argument("--epochs",       type=int,   default=cfg.DEFAULT_EPOCHS)

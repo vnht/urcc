@@ -142,8 +142,29 @@ def _resolve_adapter_dir(run_dir: Path) -> Path:
     )
 
 
-def _load_adapter_model(run_dir: Path):
-    """Load base model from training_config.json + apply LoRA adapter."""
+def _scale_lora(model, factor: float) -> int:
+    """Multiply every LoRA layer's scaling by `factor` (inference-time only).
+
+    Lets us dial the adapter's contribution down without retraining. Needed for
+    over-strong adapters (e.g. Ministral) whose full-strength delta causes
+    repetition collapse; ~0.5x stays fluent while keeping the unlearning signal.
+    Must run BEFORE merge_and_unload so the merged weights inherit the scale.
+    """
+    n = 0
+    for mod in model.modules():
+        scaling = getattr(mod, "scaling", None)
+        if isinstance(scaling, dict):
+            for ad in scaling:
+                scaling[ad] *= factor
+                n += 1
+    return n
+
+
+def _load_adapter_model(run_dir: Path, adapter_scale: float = 1.0):
+    """Load base model from training_config.json + apply LoRA adapter.
+
+    adapter_scale != 1.0 dials the LoRA contribution up/down at inference time.
+    """
     cfg_path = run_dir / "training_config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"training_config.json not found in {run_dir}")
@@ -155,6 +176,9 @@ def _load_adapter_model(run_dir: Path):
     from peft import PeftModel
     model = PeftModel.from_pretrained(model, str(adapter_dir), local_files_only=True)
     model.eval()
+    if adapter_scale != 1.0:
+        n = _scale_lora(model, adapter_scale)
+        log.info("  scaled %d LoRA modules by %.3fx (inference-time)", n, adapter_scale)
     # Fused-expert MoE (gpt-oss): PEFT's ParamWrapper materializes a
     # full dense LoRA delta for every expert on each decode step, which makes
     # PeftModel.generate() ~10× slower than the bare base model. Merge the
@@ -677,10 +701,14 @@ def run(args: argparse.Namespace) -> None:
         run_dir: Path = args.run_dir.resolve()
         result_name = run_dir.name
         mode = "trained"
+        if args.adapter_scale != 1.0:
+            result_name = f"{result_name}_scale{args.adapter_scale:g}"
     else:
         run_dir = None
         result_name = f"baseline_{args.model}"
         mode = "baseline"
+        if args.adapter_scale != 1.0:
+            log.warning("  --adapter-scale ignored for baseline (no adapter)")
 
     out_dir = cfg.results_dir_for(result_name)
     baseline_dir: Path | None = None
@@ -698,9 +726,10 @@ def run(args: argparse.Namespace) -> None:
 
     with Stopwatch("model load"):
         if mode == "trained":
-            model, tokenizer, model_key = _load_adapter_model(run_dir)
-            log.info("  Adapter loaded for %s (%s)",
-                     model_key, cfg.MODEL_REGISTRY[model_key])
+            model, tokenizer, model_key = _load_adapter_model(
+                run_dir, adapter_scale=args.adapter_scale)
+            log.info("  Adapter loaded for %s (%s)  adapter_scale=%g",
+                     model_key, cfg.MODEL_REGISTRY[model_key], args.adapter_scale)
         else:
             model, tokenizer, model_key = _load_base_model(args.model)
             log.info("  Base model loaded: %s (%s) — no adapter",
@@ -740,6 +769,12 @@ def parse_args() -> argparse.Namespace:
                    help="Run directory (step4_train/data/runs/<run_name>) for trained eval.")
     g.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()),
                    help="Model key for zero-shot baseline eval (no adapter).")
+    p.add_argument("--adapter-scale", type=float, default=1.0,
+                   help="Scale the LoRA contribution at inference (1.0 = as "
+                        "trained). Use <1.0 for over-strong adapters that "
+                        "degenerate at full strength (e.g. Ministral: 0.5). "
+                        "Results are written to <run>_scale<f> so full-strength "
+                        "results are not overwritten.")
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="Greedy decode cap for the answerability eval "
                         "(defaults per-model: larger for reasoning models).")
