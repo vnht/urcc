@@ -90,6 +90,13 @@ MODEL_REGISTRY: dict[str, str] = {
     # Dense decoder: 32 layers, hidden 4096, GQA (32 query / 8 KV heads),
     # SwiGLU FFN — LORA_TARGET_MODULES applies without changes.
     "llama_base":         "meta-llama/Llama-3.1-8B",
+    # Microsoft Phi-4 (14.7B). Dense decoder (Phi3ForCausalLM): 40 layers,
+    # hidden 5120, trained predominantly on synthetic/distilled data. Uses
+    # FUSED projections — `qkv_proj` (attention) and `gate_up_proj` (MLP) —
+    # instead of split q/k/v and gate/up, so the LoRA targets are remapped in
+    # LORA_DENSE_TARGET_OVERRIDES (same full attn+MLP coverage as qwen, just
+    # fused module names; the training recipe is otherwise identical).
+    "phi4_instruct":      "microsoft/phi-4",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -104,6 +111,8 @@ LAYER_SLICE: dict[str, list[int]] = {
     "gptoss_instruct":    [18, 19, 20, 21, 22, 23],
     # Llama 3.1 8B: 32 text layers → last 25% = layers 24-31.
     "llama_base":         [24, 25, 26, 27, 28, 29, 30, 31],
+    # Phi-4: 40 layers → last 25% = layers 30-39.
+    "phi4_instruct":      [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
 }
 
 
@@ -216,10 +225,22 @@ def lora_inference_zero_suffixes(model_key: str) -> list[str]:
     return LORA_INFERENCE_ZERO_SUFFIXES.get(model_key, [])
 
 
+# Per-model remap of the dense LoRA targets for backbones whose nn.Linear
+# names differ from the Llama-style default. Coverage is kept IDENTICAL to
+# qwen (all attention + all MLP projections) — only the module names change,
+# so the training recipe stays consistent across models.
+#   phi4: fused attention (`qkv_proj` = q+k+v in one Linear) and fused MLP
+#   input (`gate_up_proj` = gate+up in one Linear).
+LORA_DENSE_TARGET_OVERRIDES: dict[str, list[str]] = {
+    "phi4_instruct": ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
+}
+
+
 def lora_dense_targets(model_key: str) -> list[str]:
-    """Dense-model LoRA target_modules for `model_key`. Not consulted for
-    fused-expert MoE models (see LORA_TARGET_PARAMETERS)."""
-    return LORA_TARGET_MODULES
+    """Dense-model LoRA target_modules for `model_key` (name remap only —
+    coverage is the same full attn+MLP set for every dense model). Not
+    consulted for fused-expert MoE models (see LORA_TARGET_PARAMETERS)."""
+    return LORA_DENSE_TARGET_OVERRIDES.get(model_key, LORA_TARGET_MODULES)
 
 # ── Fused-expert MoE LoRA (gpt-oss et al.) ────────────────────────────────────
 # Some MoE models store expert FFNs as fused 3-D nn.Parameter tensors instead of

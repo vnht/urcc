@@ -290,10 +290,14 @@ def load_model_and_tokenizer(model_key: str, eval_only: bool = True):
         model = AutoModelForCausalLM.from_pretrained(
             model_id, dtype=torch.bfloat16, device_map="auto", token=hf_token,
         )
-    elif model_id.startswith("meta-llama/"):
+    elif model_id.startswith(("meta-llama/", "microsoft/")):
+        # Llama 3.1 (base) and Phi-4 (instruct): standard dense CausalLM,
+        # standard AutoTokenizer (Phi-4's chat template ships with the
+        # tokenizer; its fused qkv/gate_up projections only matter for LoRA
+        # targeting, not loading).
         from transformers import AutoModelForCausalLM, AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
-        # Llama 3 base has no dedicated pad token; point it at eos so
+        # No dedicated pad token on these checkpoints; point it at eos so
         # generate() doesn't warn about an unset pad_token_id.
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
