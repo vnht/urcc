@@ -270,7 +270,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Step 2: build subspace V.")
     p.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()), required=True)
     p.add_argument("--rank",  type=int, default=cfg.SUBSPACE_RANK)
-    p.add_argument("--ridge", type=float, default=cfg.SUBSPACE_RIDGE)
+    p.add_argument("--ridge", type=float, default=None,
+                   help="Eigenproblem ridge. Default: the per-model value from "
+                        "cfg.subspace_ridge() (SUBSPACE_RIDGE_OVERRIDES, else "
+                        "SUBSPACE_RIDGE).")
     p.add_argument("--retain-basis-rank", type=int, default=cfg.RETAIN_BASIS_RANK)
     p.add_argument("--overwrite", action="store_true",
                    help="Recompute even if output already exists")
@@ -279,7 +282,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run(args.model, rank=args.rank, ridge=args.ridge,
+    ridge = args.ridge if args.ridge is not None else cfg.subspace_ridge(args.model)
+    run(args.model, rank=args.rank, ridge=ridge,
         retain_basis_rank=args.retain_basis_rank, overwrite=args.overwrite)
 
 

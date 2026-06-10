@@ -334,9 +334,11 @@ def _apply_lora(model, model_key: str, moe_attn_lora: bool = False,
             bias="none",
         )
     else:
-        dense_targets = target_modules or cfg.LORA_TARGET_MODULES
+        dense_targets = target_modules or cfg.lora_dense_targets(model_key)
         if target_modules:
-            log.info("  LoRA target_modules override: %s", dense_targets)
+            log.info("  LoRA target_modules CLI override: %s", dense_targets)
+        elif dense_targets != cfg.LORA_TARGET_MODULES:
+            log.info("  LoRA target_modules (per-model config): %s", dense_targets)
         lcfg = LoraConfig(
             r=cfg.LORA_R,
             lora_alpha=lora_alpha,
@@ -1030,7 +1032,8 @@ def train(args: argparse.Namespace) -> None:
             (["q_proj", "k_proj", "v_proj", "o_proj"] if args.moe_attn_lora
              else cfg.lora_attn_targets(model_key))
             if cfg.lora_target_parameters(model_key)
-            else (_parse_lora_targets(args.lora_targets) or cfg.LORA_TARGET_MODULES)),
+            else (_parse_lora_targets(args.lora_targets)
+                  or cfg.lora_dense_targets(model_key))),
         "lora_target_parameters": cfg.lora_target_parameters(model_key),
         "moe_attn_lora": bool(args.moe_attn_lora),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
