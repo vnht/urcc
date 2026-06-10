@@ -268,11 +268,38 @@ def _per_domain_init_scale(
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 
+def _parse_lora_targets(spec: str) -> list[str] | None:
+    """'q_proj,k_proj' -> ['q_proj', 'k_proj'];  '' -> None (use config default)."""
+    items = [t.strip() for t in (spec or "").split(",") if t.strip()]
+    return items or None
+
+
+def _num_text_layers(model) -> int:
+    """Number of transformer layers in the (text) stack, multimodal-safe."""
+    mcfg = model.config
+    tc = getattr(mcfg, "text_config", None)
+    return int(getattr(tc if tc is not None else mcfg, "num_hidden_layers"))
+
+
 def _apply_lora(model, model_key: str, moe_attn_lora: bool = False,
-                lora_alpha: int | None = None):
+                lora_alpha: int | None = None, exclude_last: int = 0,
+                target_modules: list[str] | None = None):
     from peft import LoraConfig, TaskType, get_peft_model
 
     lora_alpha = cfg.LORA_ALPHA if lora_alpha is None else lora_alpha
+
+    # Optionally keep the last N layers un-adapted. Motivation (Ministral-14B):
+    # its final layer is an output funnel — hidden norm doubles (120 → 237)
+    # while the effective rank of the activation covariance halves (PR 62 → 34)
+    # in one step — so LoRA edits there write straight into the pre-lm_head
+    # state with no downstream layers to absorb the perturbation, which is
+    # where the repetition collapse is enacted.
+    layers_to_transform: list[int] | None = None
+    if exclude_last > 0:
+        n_layers = _num_text_layers(model)
+        layers_to_transform = list(range(n_layers - exclude_last))
+        log.info("  LoRA layers_to_transform: 0..%d  (last %d of %d layers excluded)",
+                 n_layers - exclude_last - 1, exclude_last, n_layers)
     expert_params = cfg.lora_target_parameters(model_key)
     if expert_params:
         # Fused-expert MoE (e.g. gpt-oss): expert FFNs are 3-D nn.Parameter
@@ -307,11 +334,15 @@ def _apply_lora(model, model_key: str, moe_attn_lora: bool = False,
             bias="none",
         )
     else:
+        dense_targets = target_modules or cfg.LORA_TARGET_MODULES
+        if target_modules:
+            log.info("  LoRA target_modules override: %s", dense_targets)
         lcfg = LoraConfig(
             r=cfg.LORA_R,
             lora_alpha=lora_alpha,
             lora_dropout=cfg.LORA_DROPOUT,
-            target_modules=cfg.LORA_TARGET_MODULES,
+            target_modules=dense_targets,
+            layers_to_transform=layers_to_transform,
             task_type=TaskType.CAUSAL_LM,
             bias="none",
         )
@@ -674,7 +705,9 @@ def train(args: argparse.Namespace) -> None:
         model.print_trainable_parameters()
     else:
         model = _apply_lora(model, model_key, moe_attn_lora=args.moe_attn_lora,
-                            lora_alpha=args.lora_alpha)
+                            lora_alpha=args.lora_alpha,
+                            exclude_last=args.lora_exclude_last,
+                            target_modules=_parse_lora_targets(args.lora_targets))
     model.train()
 
     # Fused-expert MoE LoRA (gpt-oss): PEFT's ParamWrapper materializes the full
@@ -997,7 +1030,7 @@ def train(args: argparse.Namespace) -> None:
             (["q_proj", "k_proj", "v_proj", "o_proj"] if args.moe_attn_lora
              else cfg.lora_attn_targets(model_key))
             if cfg.lora_target_parameters(model_key)
-            else cfg.LORA_TARGET_MODULES),
+            else (_parse_lora_targets(args.lora_targets) or cfg.LORA_TARGET_MODULES)),
         "lora_target_parameters": cfg.lora_target_parameters(model_key),
         "moe_attn_lora": bool(args.moe_attn_lora),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
@@ -1006,6 +1039,7 @@ def train(args: argparse.Namespace) -> None:
         "early_stop_window":           int(args.early_stop_window),
         "early_stop_min_improvement":  float(args.early_stop_min_improvement),
         "forget_floor":                float(args.forget_floor),
+        "lora_exclude_last":           int(args.lora_exclude_last),
         "primary_adapter_source":      promoted_source,   # "best" or "final"
         "forget_examples":  len(forget_data),
         "retain_examples":  len(retain_data),
@@ -1087,6 +1121,20 @@ def parse_args() -> argparse.Namespace:
                         "loss minimum, whose optimum is repetition collapse on "
                         "low-redundancy backbones (e.g. Ministral). The "
                         "floor-step adapter is promoted as the primary.")
+    p.add_argument("--lora-targets", type=str, default="",
+                   help="Dense models: comma-separated override of LoRA "
+                        "target_modules (default: cfg.LORA_TARGET_MODULES). "
+                        "E.g. 'q_proj,k_proj,v_proj,o_proj' for attention-only "
+                        "— restricts the adapter to re-mixing existing token "
+                        "information instead of writing new residual-stream "
+                        "content via MLP, which is what enacts token-loop "
+                        "collapse. Pair with --tag.")
+    p.add_argument("--lora-exclude-last", type=int, default=0,
+                   help="Dense models: exclude the last N transformer layers "
+                        "from LoRA (layers_to_transform). Use when the "
+                        "final-layer edits enact the repetition collapse "
+                        "(confirm first with diagnose_adapter.py "
+                        "--ablate-last). Pair with --tag.")
     p.add_argument("--dry-run",      action="store_true")
     p.add_argument("--tag", type=str, default="",
                    help="Optional suffix appended to the run name (e.g. "
