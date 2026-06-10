@@ -90,10 +90,15 @@ def _gather_degenerate_probes(results_dir: Path, n: int) -> list[dict]:
 
 
 def _is_degenerate(c: str) -> bool:
-    c = c or ""
-    if not c.strip():
+    c = (c or "").strip()
+    if not c:
         return True
     if re.search(r"(\*\s*){6,}", c) or re.search(r"(—\s*){4,}", c):
+        return True
+    # Generic short-unit loop: any 2-12 char unit repeated 5+ times back to
+    # back (catches '**&**&**&', '**& **& **&', ' sentence& sentence&', …
+    # which the patterns above miss).
+    if re.search(r"(.{2,12}?)\1{4,}", c):
         return True
     toks = c.split()
     return len(toks) >= 10 and len(set(toks)) <= 3

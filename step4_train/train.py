@@ -712,6 +712,9 @@ def train(args: argparse.Namespace) -> None:
     summary_initial: dict = {}
     # Early-stop / best-step tracking — survives across resume via trainer_state.
     loss_window: deque = deque(maxlen=max(int(args.early_stop_window), 1))
+    # Forget-floor stop: smoothed L_forget window (same smoothing horizon).
+    # Not persisted across resume — it refills within `early_stop_window` steps.
+    forget_window: deque = deque(maxlen=max(int(args.early_stop_window), 1))
     best_smoothed_loss = float("inf")
     best_step_recorded = -1
     if resume:
@@ -876,6 +879,26 @@ def train(args: argparse.Namespace) -> None:
                         _save_adapter_snapshot(out_dir / BEST_SUBDIR, model)
                         new_best = True
 
+                # Forget-floor stop — halt once the smoothed L_forget reaches
+                # the floor. L_forget is init_scale-normalised (≈1.0 at step 0)
+                # so the floor transfers across models and subspace rebuilds.
+                # This stops the forget squeeze at the fluency boundary instead
+                # of training to the loss minimum, whose optimum is the
+                # degenerate repetition collapse (over-suppression). Stopping
+                # criterion only — the loss itself is unchanged.
+                forget_window.append(avg_forget)
+                if (args.forget_floor > 0
+                        and len(forget_window) >= forget_window.maxlen
+                        and sum(forget_window) / len(forget_window) <= args.forget_floor):
+                    smoothed_forget = sum(forget_window) / len(forget_window)
+                    log.info("  forget-floor hit @ step %d (smoothed L_forget=%.4f "
+                             "<= floor %.4f) — stopping", optim_step,
+                             smoothed_forget, args.forget_floor)
+                    best_step_recorded = optim_step
+                    best_smoothed_loss = sum(loss_window) / len(loss_window)
+                    _save_adapter_snapshot(out_dir / BEST_SUBDIR, model)
+                    done = True
+
                 progress.tick(extras={
                     "ep":   ep + 1,
                     "step": f"{optim_step}/{total_optim_steps}",
@@ -914,9 +937,11 @@ def train(args: argparse.Namespace) -> None:
                 # optim_step starts at the restored checkpoint step (optimizer
                 # and scheduler are restored to match), so the epoch loop must
                 # terminate here instead of running a full fresh 3-epoch pass
-                # on top of the resumed steps.
+                # on top of the resumed steps. Also honours the forget-floor
+                # stop set above.
                 if optim_step >= total_optim_steps:
                     done = True
+                if done:
                     break
 
         if done:
@@ -980,6 +1005,7 @@ def train(args: argparse.Namespace) -> None:
         "early_stop":                  bool(args.early_stop),
         "early_stop_window":           int(args.early_stop_window),
         "early_stop_min_improvement":  float(args.early_stop_min_improvement),
+        "forget_floor":                float(args.forget_floor),
         "primary_adapter_source":      promoted_source,   # "best" or "final"
         "forget_examples":  len(forget_data),
         "retain_examples":  len(retain_data),
@@ -1052,6 +1078,15 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum relative improvement (e.g. 0.01 = 1%%) for a step to "
                         "count as a new best and trigger a best-adapter snapshot. "
                         "Default: 0.0 (any improvement counts).")
+    p.add_argument("--forget-floor", type=float, default=0.0,
+                   help="Stop training once the smoothed L_forget falls to this "
+                        "floor (0 disables). L_forget is init_scale-normalised "
+                        "(≈1.0 at step 0) so the floor transfers across models "
+                        "and subspace rebuilds. Use to halt the forget squeeze "
+                        "at the fluency boundary instead of optimising to the "
+                        "loss minimum, whose optimum is repetition collapse on "
+                        "low-redundancy backbones (e.g. Ministral). The "
+                        "floor-step adapter is promoted as the primary.")
     p.add_argument("--dry-run",      action="store_true")
     p.add_argument("--tag", type=str, default="",
                    help="Optional suffix appended to the run name (e.g. "
