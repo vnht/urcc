@@ -178,15 +178,12 @@ SUBSPACE_RIDGE     = 1e-3
 RETAIN_BASIS_RANK  = 512
 
 # Per-model overrides of the step-2 eigenproblem ridge. Higher ridge relaxes
-# the Σ_E whitening so V keeps more of the behavioral abstain↔commit axis
+# the Σ_E whitening so V keeps more of the behavioral abstainↈcommit axis
 # (pole_sep_in_V) at the cost of weaker utility protection (guarded by the
 # retain loss). Tuned per model via
 # step2_build_subspace/diagnose_subspace.py --ridge-sweep:
 #   gptoss_instruct: 10.0  (kuq axis suppressed at default ridge)
-# ministral14b_instruct stays at the default: its repetition collapse was
-# fixed by attention-only LoRA targets (see LORA_DENSE_TARGET_OVERRIDES), so
-# the ridge is kept at 1e-3 to match the qwen recipe exactly (single-variable
-# difference: adapter placement).
+# ministral14b_instruct uses the default 1e-3 (same as qwen).
 SUBSPACE_RIDGE_OVERRIDES: dict[str, float] = {
     "gptoss_instruct": 10.0,
 }
@@ -202,32 +199,27 @@ LORA_DROPOUT        = 0.05
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
                        "up_proj", "down_proj", "gate_proj"]
 
-# Per-model overrides of the dense LoRA targets (same spirit as the gpt-oss
-# MoE targeting below: the model registry carries per-backbone adapter
-# placement; the training command stays identical across models).
-#
-# ministral14b_instruct — attention-only. The full target set produces
-# repetition collapse ('** sentence sentence ...') at any adapter magnitude
-# the forget objective accepts: the MLP LoRA writes new content vectors into
-# the residual stream, which is what enacts the token-loop attractor on this
-# distilled backbone (sharp low-entropy head behind a high-gain, low-rank
-# final layer: ||h|| 120→237, PR 62→34 at L39). Localised by
-# diagnose_adapter.py --ablate-types on the trained adapter: MLP adapters
-# zeroed = 0/8 degenerate (fluent), attention adapters zeroed = 4/8 (still
-# collapsing). Attention edits re-mix existing token information instead of
-# writing new content, and stay fluent at full strength. Qwen tolerates the
-# full target set; gpt-oss uses no attention LoRA at all (experts+router) —
-# adapter placement is a per-backbone property.
-LORA_DENSE_TARGET_OVERRIDES: dict[str, list[str]] = {
-    "ministral14b_instruct": ["q_proj", "k_proj", "v_proj", "o_proj"],
+# Per-model LoRA module suffixes zeroed at inference (train full like qwen,
+# deploy without). ministral14b: MLP LoRA writes enact repetition collapse;
+# diagnose_adapter --ablate-types on the full trained adapter showed
+# gate/up/down zeroed = 0/8 degenerate at scale 1.0, attention zeroed = 4/8.
+# Training attention-only from scratch does NOT replicate that — attention
+# must compensate alone and still collapses. Correct recipe: train full LoRA,
+# zero MLP suffixes when loading for eval.
+LORA_INFERENCE_ZERO_SUFFIXES: dict[str, list[str]] = {
+    "ministral14b_instruct": ["gate_proj", "up_proj", "down_proj"],
 }
 
 
+def lora_inference_zero_suffixes(model_key: str) -> list[str]:
+    """Module-name suffixes to zero at inference for `model_key` (empty = none)."""
+    return LORA_INFERENCE_ZERO_SUFFIXES.get(model_key, [])
+
+
 def lora_dense_targets(model_key: str) -> list[str]:
-    """Dense-model LoRA target_modules for `model_key` (per-model override or
-    the LORA_TARGET_MODULES default). Not consulted for fused-expert MoE
-    models (see LORA_TARGET_PARAMETERS)."""
-    return LORA_DENSE_TARGET_OVERRIDES.get(model_key, LORA_TARGET_MODULES)
+    """Dense-model LoRA target_modules for `model_key`. Not consulted for
+    fused-expert MoE models (see LORA_TARGET_PARAMETERS)."""
+    return LORA_TARGET_MODULES
 
 # ── Fused-expert MoE LoRA (gpt-oss et al.) ────────────────────────────────────
 # Some MoE models store expert FFNs as fused 3-D nn.Parameter tensors instead of

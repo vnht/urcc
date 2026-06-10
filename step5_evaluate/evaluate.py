@@ -160,6 +160,24 @@ def _scale_lora(model, factor: float) -> int:
     return n
 
 
+def _zero_lora_by_suffix(model, suffixes: list[str]) -> int:
+    """Zero LoRA A/B weights whose module name ends with one of `suffixes`."""
+    if not suffixes:
+        return 0
+    n = 0
+    for name, mod in model.named_modules():
+        if not any(name.endswith(f".{s}") or name.endswith(s) for s in suffixes):
+            continue
+        for attr in ("lora_A", "lora_B"):
+            sub = getattr(mod, attr, None)
+            if sub is None:
+                continue
+            for p in sub.parameters():
+                p.data.zero_()
+                n += 1
+    return n
+
+
 def _load_adapter_model(run_dir: Path, adapter_scale: float = 1.0):
     """Load base model from training_config.json + apply LoRA adapter.
 
@@ -176,6 +194,10 @@ def _load_adapter_model(run_dir: Path, adapter_scale: float = 1.0):
     from peft import PeftModel
     model = PeftModel.from_pretrained(model, str(adapter_dir), local_files_only=True)
     model.eval()
+    zero_suffixes = cfg.lora_inference_zero_suffixes(model_key)
+    if zero_suffixes:
+        n = _zero_lora_by_suffix(model, zero_suffixes)
+        log.info("  zeroed %d LoRA params (%s) at inference", n, ", ".join(zero_suffixes))
     if adapter_scale != 1.0:
         n = _scale_lora(model, adapter_scale)
         log.info("  scaled %d LoRA modules by %.3fx (inference-time)", n, adapter_scale)
