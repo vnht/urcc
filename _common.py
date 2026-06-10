@@ -420,11 +420,25 @@ def tokenise_prompt_plus_answer(
     A/B/C/D intervention built on a format the model never sees at inference.
     Base models fall back to plain text inside the helper.
 
+    gpt-oss additionally gets the `final`-channel header
+    (`<|channel|>final<|message|>`) appended after the assistant generation
+    prompt. The chat template's generation prompt ends at `<|start|>assistant`,
+    a position where the model always emits a channel marker (normally
+    `analysis`) and NEVER raw answer text — replaying the answer there puts the
+    K-token window somewhere the model never visits at inference, so V/μ± and
+    the forget loss could only capture prompt-surface features. With the header
+    the window sits where committal final answers actually live (the same
+    placement the perplexity eval uses via ``open_final_channel``).
+
     The answer is encoded without special tokens and (if k_answer_tokens is
     given) truncated to its first K tokens — this matches the mining
     convention so that anchors and forget activations align.
     """
     prompt_ids = _build_generation_input_ids(tokenizer, model_key, prompt)
+    if "gptoss" in model_key:
+        prompt_ids = prompt_ids + encode_text(
+            tokenizer, "<|channel|>final<|message|>", add_special_tokens=False,
+        )
     answer_ids = encode_text(tokenizer, answer, add_special_tokens=False)
     if k_answer_tokens is not None:
         answer_ids = answer_ids[:k_answer_tokens]
