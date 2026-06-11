@@ -641,8 +641,15 @@ def _run_dataset(args, model, tokenizer, model_key, result_name, out_dir,
 
     prior = _load_dataset_json(out_path) or {}
     rows: list[dict] = list(prior.get("rows") or [])
-    done_ids = {r.get("id") for r in rows if r.get("judge_label") is not None}
-    todo = [r for r in pool if r.get("id") not in done_ids]
+
+    # Resume key: some pools (truthfulqa) ship without an `id` field; falling
+    # back to the question text prevents `None` from matching every pool row
+    # and silently truncating the dataset on resume.
+    def _row_key(r: dict):
+        return r.get("id") if r.get("id") is not None else r.get("question")
+
+    done_ids = {_row_key(r) for r in rows if r.get("judge_label") is not None}
+    todo = [r for r in pool if _row_key(r) not in done_ids]
     if rows:
         log.info("  [%s] resume: %d done", dataset, len(done_ids))
     log.info("  [%s] pool: %d  to do: %d", dataset, len(pool), len(todo))

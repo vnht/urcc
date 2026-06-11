@@ -294,11 +294,16 @@ def lora_attn_targets(model_key: str) -> list[str] | str:
 GPTOSS_REASONING_EFFORT = "low"
 
 # Reasoning models burn part of the decode budget on the analysis channel
-# before the final answer appears. Rather than always paying a large budget,
-# generation runs with the dense default (64) first and escalates ONCE to this
-# cap when no final-channel answer was produced (see _common.generate_greedy).
-# Keeps the common case ~8x cheaper while still recovering long-analysis rows.
-GPTOSS_MAX_NEW_TOKENS_ESCALATED = 1024
+# before the final answer appears, so gpt-oss gets a larger first-pass cap
+# than the dense default (analysis + final must both fit). When the first
+# pass produces no final-channel answer, generation is retried ONCE at the
+# escalated cap (see _common.generate_greedy). Empirically (debug run over
+# all empty rows of the 512-cap evals) recovered rows needed 100-1000 tokens,
+# so 256 catches the common case cheaply and the escalated cap recovers the
+# long tail; the residual that exhausts it (runaway CoT, ~0.1-0.6% of rows at
+# 1024) is absorbed as an abstention.
+GPTOSS_MAX_NEW_TOKENS_FIRST     = 256
+GPTOSS_MAX_NEW_TOKENS_ESCALATED = 2048
 
 # gpt-oss attention backend for GENERATION/eval/mining (training always uses
 # eager — see load_model_and_tokenizer). The model uses attention SINKS
@@ -317,10 +322,12 @@ GPTOSS_ATTN_IMPLEMENTATION = "eager"
 
 
 def max_new_tokens_for(model_key: str) -> int:
-    """First-pass greedy-decode cap for a model. gpt-oss uses the dense
-    default too: generate_greedy escalates to GPTOSS_MAX_NEW_TOKENS_ESCALATED
-    when the analysis channel exhausts the first-pass budget before a
-    final-channel answer appears."""
+    """First-pass greedy-decode cap for a model. gpt-oss needs headroom for
+    its analysis channel; generate_greedy escalates it once to
+    GPTOSS_MAX_NEW_TOKENS_ESCALATED when the first pass yields no
+    final-channel answer."""
+    if model_key == "gptoss_instruct":
+        return GPTOSS_MAX_NEW_TOKENS_FIRST
     return DEFAULT_MAX_NEW_TOKENS
 
 DEFAULT_LR              = 3e-5
