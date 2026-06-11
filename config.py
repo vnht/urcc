@@ -210,12 +210,14 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
 
 # Per-model default LoRA contribution at inference (train full like qwen,
 # deploy scaled down). ministral14b: the full-strength adapter enacts
-# repetition collapse; the diagnose_adapter scale sweep showed clean fluent
-# output at scale <= 0.5 and degeneration at >= 0.75. Recipe: train full
-# LoRA, evaluate/deploy at the scale below. Models not listed use 1.0
-# (adapter exactly as trained). The eval CLI --adapter-scale overrides this.
+# repetition collapse; the diagnose_adapter sweep over 100 real degenerate
+# prompts (all 100 collapse at scale 1.0) showed 0/100 degenerate at every
+# scale <= 0.70, 7/100 at 0.80, 100/100 at 1.00 — so 0.7 is the largest
+# fully-fluent scale. Recipe: train full LoRA, evaluate/deploy at the scale
+# below. Models not listed use 1.0 (adapter exactly as trained). The eval
+# CLI --adapter-scale overrides this.
 ADAPTER_SCALE_OVERRIDES: dict[str, float] = {
-    "ministral14b_instruct": 0.5,
+    "ministral14b_instruct": 0.7,
 }
 
 

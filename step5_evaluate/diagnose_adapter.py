@@ -64,12 +64,20 @@ _ABSTAIN_RE = re.compile(
     r"(?i)\b(i\s+(?:do\s*n[o']t|can\s*n[o']?t)\s+know|cannot\s+(?:be\s+)?"
     r"(?:known|determined|answered|predicted)|unknown|unknowable|unanswerable|"
     r"no\s+(?:one|way)\s+(?:knows|to\s+know)|not\s+(?:possible|known|recorded|"
-    r"documented)|impossible\s+to\s+(?:know|say|determine|predict)|"
-    r"there\s+is\s+no\s+(?:way|record)|i\s+can'?t\s+(?:answer|predict|know))\b")
+    r"documented|publicly\s+(?:known|disclosed))|"
+    r"impossible\s+to\s+(?:know|say|determine|predict)|"
+    r"there\s+is\s+no\s+(?:way|record|definitive\s+answer)|"
+    r"i\s+can'?t\s+(?:answer|predict|know)|"
+    r"(?:context|passage|text)\s+does\s+not\s+"
+    r"(?:mention|provide|specify|say|state|include)|"
+    r"no\s+(?:concise\s+)?answer\s+(?:exists|can\s+be)|"
+    r"no\s+definitive\s+(?:answer|consensus)|"
+    r"(?:exact|precise)\s+[\w\s,'-]{0,40}?\bis\s+(?:uncertain|unknown|unclear))\b")
 
 
 def _is_abstain(c: str) -> bool:
-    return bool(_ABSTAIN_RE.search((c or "").strip()))
+    # Markdown emphasis (**not**, **unknown**) would otherwise split phrases.
+    return bool(_ABSTAIN_RE.search((c or "").replace("*", "").strip()))
 
 
 def _prompt(q: str) -> str:
