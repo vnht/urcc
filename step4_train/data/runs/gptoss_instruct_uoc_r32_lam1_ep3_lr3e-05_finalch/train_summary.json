@@ -1,0 +1,19 @@
+{
+  "initial_L_total": 1.509628,
+  "initial_L_forget": 1.509628,
+  "initial_L_retain": 0.0,
+  "initial_mean_proj_norm": 3044.054454,
+  "initial_lora_delta_norm": 0.0,
+  "final_L_total": 0.101562,
+  "final_L_forget": 0.029701,
+  "final_L_retain": 0.071861,
+  "final_mean_proj_norm": 354.230504,
+  "final_lora_delta_norm": 0.6774,
+  "num_steps": 375,
+  "best_step": 311,
+  "best_smoothed_L_total": 0.047526,
+  "primary_adapter_source": "best",
+  "elapsed_s": 17397.9,
+  "elapsed_human": "4h49m57s",
+  "step_avg_s": 46.394
+}

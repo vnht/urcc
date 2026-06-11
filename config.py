@@ -195,12 +195,16 @@ SUBSPACE_RIDGE     = 1e-3
 RETAIN_BASIS_RANK  = 512
 
 # Per-model overrides of the step-2 eigenproblem ridge. Higher ridge relaxes
-# the Σ_E whitening so V keeps more of the behavioral abstainↈcommit axis
+# the Σ_E whitening so V keeps more of the behavioral abstain↔commit axis
 # (pole_sep_in_V) at the cost of weaker utility protection (guarded by the
-# retain loss). Tuned per model via
-# step2_build_subspace/diagnose_subspace.py --ridge-sweep:
-#   gptoss_instruct: 10.0  (kuq axis suppressed at default ridge)
-# ministral14b_instruct uses the default 1e-3 (same as qwen).
+# retain loss). ALWAYS run the ridge sweep after step 2 for any new model:
+#   python3 step2_build_subspace/diagnose_subspace.py --model <key> --ridge-sweep
+# and add an override here if pole_sep_V is low or E_rayleigh is high at 1e-3.
+# Sweep results:
+#   gptoss_instruct:        10.0  (kuq axis suppressed at default ridge)
+#   ministral14b_instruct:   1.0  (axis suppressed; ridge=1.0 did not cure
+#                                  generation degeneration — model retired)
+#   llama3b_instruct:       TBD   (run sweep after step 2 before training)
 SUBSPACE_RIDGE_OVERRIDES: dict[str, float] = {
     "gptoss_instruct": 10.0,
     "ministral14b_instruct": 1.0,
