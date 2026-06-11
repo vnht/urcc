@@ -119,8 +119,12 @@ LAYER_SLICE: dict[str, list[int]] = {
     "llama_base":         [24, 25, 26, 27, 28, 29, 30, 31],
     # Phi-4: 40 layers → last 25% = layers 30-39.
     "phi4_instruct":      [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
-    # Llama 3.2 3B: 28 layers → last 25% = layers 21-27.
-    "llama3b_instruct":   [21, 22, 23, 24, 25, 26, 27],
+    # Llama 3.2 3B: 28 layers → last 25% = layers 21-27, but the final layer
+    # L27 is a massive-activation outlier (sharp norm spike + pole_sep cosine
+    # drop) that dominates the forget loss and drives the residual stream into a
+    # low-entropy "Con"-repeat collapse. Dropped from the slice so the geometric
+    # supervision sits on the well-behaved layers 21-26.
+    "llama3b_instruct":   [21, 22, 23, 24, 25, 26],
 }
 
 

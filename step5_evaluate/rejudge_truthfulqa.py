@@ -1,158 +1,181 @@
 #!/usr/bin/env python3
-"""Offline re-judge of saved TruthfulQA results with the updated judge.
+"""Re-judge existing TruthfulQA results with the updated judge prompt.
 
-The TruthfulQA judge in evaluate-ext.py was rewritten to grade each answer into
-the SimpleQA verdict {CORRECT, INCORRECT, NOT_ATTEMPTED} against the reference
-TRUE/FALSE answer sets (a refusal like "I have no comment" is NOT_ATTEMPTED,
-never CORRECT). Existing result files were produced by the OLD two-flag
-(truthful/informative) judge, so their labels need replaying.
+Completions are already saved in each truthfulqa.json; this script re-runs
+only the judge API call, overwrites judge_label / judge_raw_output in place,
+and recomputes the summary metrics. No GPU / model inference needed.
 
-Generation is greedy / deterministic and the per-row `completion` is already
-persisted, so we do NOT need to re-run the models on GPU — we only replay the
-judge over the saved completions. This script:
+Usage
+-----
+    # All result dirs that have a truthfulqa.json:
+    python3 step5_evaluate/rejudge_truthfulqa.py
 
-  1. Re-judges every TruthfulQA result file from its saved completions using the
-     new judge (resumable: rows already carrying a CORRECT/INCORRECT/
-     NOT_ATTEMPTED label are skipped).
-  2. Recomputes metrics with the updated summariser.
-  3. Re-attaches baseline deltas for trained runs (baselines re-judged first so
-     the deltas use the refreshed baseline metrics).
-
-Usage:
-    CEREBRAS_TOKEN=... python3 step5_evaluate/rejudge_truthfulqa.py
-    CEREBRAS_TOKEN=... python3 step5_evaluate/rejudge_truthfulqa.py --max 50  # smoke
+    # Specific result dirs only:
+    python3 step5_evaluate/rejudge_truthfulqa.py \\
+        step5_evaluate/data/results/baseline_gptoss_instruct \\
+        step5_evaluate/data/results/gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch
 """
+
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import json
 import logging
+import sys
+import time
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger("rejudge")
+log = logging.getLogger("rejudge_truthfulqa")
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# evaluate-ext.py has a hyphen, so import it by file location.
-_spec = importlib.util.spec_from_file_location("evaluate_ext", _HERE / "evaluate-ext.py")
-ev = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ev)
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("evaluate_ext", Path(__file__).parent / "evaluate-ext.py")
+_mod = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
+_spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+TRUTHFULQA_JUDGE_TEMPLATE = _mod.TRUTHFULQA_JUDGE_TEMPLATE
+_judge                    = _mod._judge
+_summarise_truthfulqa     = _mod._summarise_truthfulqa
+_attach_baseline          = _mod._attach_baseline
+from evaluate import _load_dataset_json, _save_dataset_json  # type: ignore[import]
 
-import config as cfg  # noqa: E402  (after sys.path is set up via repo layout)
+ALLOWED = {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"}
+RESULTS_ROOT = REPO_ROOT / "step5_evaluate" / "data" / "results"
 
-_TQA_LABELS = {"CORRECT", "INCORRECT", "NOT_ATTEMPTED"}
 
+def _rejudge_file(path: Path, client, baseline_dir: Path | None, dry_run: bool) -> None:
+    data = _load_dataset_json(path)
+    if not data:
+        log.warning("  skip (empty/missing): %s", path)
+        return
 
-def _rejudge_file(path: Path, client, max_rows: int | None, save_every: int) -> dict:
-    rec = ev._load_dataset_json(path)
-    if not rec or "rows" not in rec:
-        log.warning("  [%s] no rows — skipping", path)
-        return {}
-    rows = rec["rows"]
-    if max_rows is not None:
-        rows = rows[:max_rows]
+    rows: list[dict] = data.get("rows") or []
+    if not rows:
+        log.warning("  skip (no rows): %s", path)
+        return
 
-    todo = [r for r in rows if r.get("judge_label") not in _TQA_LABELS]
-    log.info("  [%s] %d rows, %d to (re)judge", path.parent.name, len(rows), len(todo))
+    log.info("  %s  (%d rows)", path, len(rows))
 
-    if not todo:
-        rec["rows"] = rows
-        rec["metrics"] = ev._summarise_truthfulqa(rows)
-        ev._save_dataset_json(path, rec)
-        return rec["metrics"]
+    changed = 0
+    for i, row in enumerate(rows):
+        completion = row.get("completion", "").strip()
+        question   = row.get("question", "")
+        correct    = row.get("correct_answers", [])
+        incorrect  = row.get("incorrect_answers", [])
 
-    allowed = ev._ALLOWED["truthfulqa"]
-    progress = ev.Progress(total=len(todo), desc=path.parent.name, log_every=10)
-    done = 0
-    for r in rows:
-        if r.get("judge_label") in _TQA_LABELS:
-            continue
-        # Drop stale flags from the old two-flag judge.
-        r.pop("truthful", None)
-        r.pop("informative", None)
-        completion = (r.get("completion") or "").strip()
         if not completion:
-            r["judge_label"], r["judge_raw_output"] = "NOT_ATTEMPTED", "empty completion"
+            new_label = "NOT_ATTEMPTED"
+            new_raw   = "empty completion"
         else:
-            jp = ev.TRUTHFULQA_JUDGE_TEMPLATE.format(
-                question=r["question"],
-                correct="\n".join(f"- {a}" for a in r.get("correct_answers", [])),
-                incorrect="\n".join(f"- {a}" for a in r.get("incorrect_answers", [])),
+            jp = TRUTHFULQA_JUDGE_TEMPLATE.format(
+                question=question,
+                correct="\n".join(f"- {a}" for a in correct),
+                incorrect="\n".join(f"- {a}" for a in incorrect),
                 completion=completion,
             )
-            label, raw = ev._judge(client, jp, allowed)
-            r["judge_label"], r["judge_raw_output"] = label, raw
-        done += 1
-        progress.tick(extras={
-            "C":  sum(1 for x in rows if x.get("judge_label") == "CORRECT"),
-            "I":  sum(1 for x in rows if x.get("judge_label") == "INCORRECT"),
-            "NA": sum(1 for x in rows if x.get("judge_label") == "NOT_ATTEMPTED"),
-        })
-        if done % save_every == 0:
-            rec["metrics"] = ev._summarise_truthfulqa(rows)
-            ev._save_dataset_json(path, rec)
+            new_label, new_raw = _judge(client, jp, ALLOWED)
 
-    progress.done()
-    rec["rows"] = rows
-    rec["metrics"] = ev._summarise_truthfulqa(rows)
-    ev._save_dataset_json(path, rec)
-    return rec["metrics"]
+        old_label = row.get("judge_label")
+        if old_label != new_label:
+            changed += 1
+
+        row["judge_label"]      = new_label
+        row["judge_raw_output"] = new_raw
+
+        if (i + 1) % 50 == 0:
+            log.info("    %d / %d  (changed so far: %d)", i + 1, len(rows), changed)
+
+    log.info("  done — %d / %d labels changed", changed, len(rows))
+
+    if dry_run:
+        log.info("  [dry-run] not writing")
+        return
+
+    data["rows"]    = rows
+    data["metrics"] = _summarise_truthfulqa(rows)
+
+    # Re-attach baseline deltas if a baseline_dir is known.
+    for k in ("baseline", "baseline_run", "deltas"):
+        data.pop(k, None)
+
+    run_name = data.get("run", "")
+    # Infer baseline dir from run name if not provided explicitly.
+    inferred_baseline: Path | None = baseline_dir
+    if inferred_baseline is None and not run_name.startswith("baseline_"):
+        model_key = data.get("model_key", "")
+        candidate = RESULTS_ROOT / f"baseline_{model_key}"
+        if candidate.is_dir():
+            inferred_baseline = candidate
+
+    if inferred_baseline is not None:
+        _attach_baseline(data, inferred_baseline, "truthfulqa")
+
+    _save_dataset_json(path, data)
+    m = data["metrics"]
+    log.info(
+        "  saved  halluc=%.3f  acc=%.3f  not_att=%.3f  c|att=%.3f",
+        m.get("hallucination_rate", float("nan")),
+        m.get("accuracy",           float("nan")),
+        m.get("not_attempted_rate", float("nan")),
+        m.get("correct_given_attempted", float("nan")),
+    )
+    if data.get("deltas"):
+        log.info(
+            "  vs baseline -> %s",
+            ", ".join(f"Δ{k}={v:+.3f}" for k, v in data["deltas"].items()),
+        )
 
 
-def _baseline_for(trained_dir: Path, baseline_dirs: list[Path]) -> Path | None:
-    """Match a trained run dir to its baseline dir by model-key prefix."""
-    name = trained_dir.name
-    best = None
-    for b in baseline_dirs:
-        model = b.name[len("baseline_"):]
-        if name.startswith(model) and (best is None or len(model) > len(best.name)):
-            best = b
-    return best
+def _find_result_dirs() -> list[Path]:
+    return sorted(p.parent for p in RESULTS_ROOT.rglob("truthfulqa.json"))
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--max", type=int, default=None, help="Cap rows per file (smoke test).")
-    p.add_argument("--save-every", type=int, default=50)
+    p = argparse.ArgumentParser(
+        description="Re-judge TruthfulQA rows with the updated prompt (no model inference)."
+    )
+    p.add_argument(
+        "result_dirs", nargs="*", type=Path,
+        help="Result dirs to process (default: all dirs under results/ with a truthfulqa.json).",
+    )
+    p.add_argument(
+        "--baseline", type=Path, default=None,
+        help="Override baseline dir for delta computation.",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="Re-judge and print stats but do not write back to disk.",
+    )
     args = p.parse_args()
+
+    result_dirs = [d.resolve() for d in args.result_dirs] if args.result_dirs else _find_result_dirs()
+    baseline_dir = args.baseline.resolve() if args.baseline else None
+
+    # Baselines first so trained-run deltas use refreshed baseline metrics.
+    result_dirs = sorted(result_dirs, key=lambda d: (0 if d.name.startswith("baseline_") else 1, d.name))
+
+    log.info("Re-judging TruthfulQA in %d result dir(s)%s",
+             len(result_dirs), "  [dry-run]" if args.dry_run else "")
+    for d in result_dirs:
+        log.info("  %s", d.name)
 
     from judge import make_cerebras_client  # type: ignore[import]
     client = make_cerebras_client()
 
-    results_root = cfg.RESULTS_DIR
-    files = sorted(results_root.glob("*/truthfulqa.json"))
-    if not files:
-        log.warning("No truthfulqa.json files under %s", results_root)
-        return
-
-    baseline_files = [f for f in files if f.parent.name.startswith("baseline_")]
-    trained_files = [f for f in files if not f.parent.name.startswith("baseline_")]
-    baseline_dirs = [f.parent for f in baseline_files]
-
-    # Baselines first so trained-run deltas use the refreshed baseline metrics.
-    log.info("Re-judging %d baseline file(s)...", len(baseline_files))
-    for f in baseline_files:
-        m = _rejudge_file(f, client, args.max, args.save_every)
-        if m:
-            log.info("  [%s] halluc=%.3f acc=%.3f na=%.3f c|att=%.3f",
-                     f.parent.name, m["hallucination_rate"], m["accuracy"],
-                     m["not_attempted_rate"], m["correct_given_attempted"])
-
-    log.info("Re-judging %d trained file(s)...", len(trained_files))
-    for f in trained_files:
-        m = _rejudge_file(f, client, args.max, args.save_every)
-        if not m:
+    t0 = time.time()
+    for result_dir in result_dirs:
+        path = result_dir / "truthfulqa.json"
+        if not path.exists():
+            log.warning("missing: %s", path)
             continue
-        bdir = _baseline_for(f.parent, baseline_dirs)
-        rec = ev._load_dataset_json(f)
-        ev._attach_baseline(rec, bdir, "truthfulqa")
-        ev._save_dataset_json(f, rec)
-        log.info("  [%s] halluc=%.3f acc=%.3f na=%.3f c|att=%.3f (vs %s)",
-                 f.parent.name, m["hallucination_rate"], m["accuracy"],
-                 m["not_attempted_rate"], m["correct_given_attempted"],
-                 bdir.name if bdir else "—")
+        log.info("\n[%s]", result_dir.name)
+        _rejudge_file(path, client, baseline_dir, dry_run=args.dry_run)
+
+    elapsed = time.time() - t0
+    log.info("\nDone in %.1fs", elapsed)
 
 
 if __name__ == "__main__":
