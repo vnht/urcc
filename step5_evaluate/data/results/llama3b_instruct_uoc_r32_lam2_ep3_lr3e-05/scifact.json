@@ -25,6 +25,65 @@
         "n": 416,
         "accuracy": 0.8606
       }
+    },
+    "pred_counts": {
+      "SUPPORTS": 222,
+      "REFUTES": 298,
+      "NOT ENOUGH INFO": 589,
+      "UNCLEAR": 0
+    },
+    "pred_rates": {
+      "SUPPORTS": 0.2002,
+      "REFUTES": 0.2687,
+      "NOT ENOUGH INFO": 0.5311,
+      "UNCLEAR": 0.0
+    },
+    "confusion_by_gold": {
+      "SUPPORTS": {
+        "n": 456,
+        "pred_counts": {
+          "SUPPORTS": 206,
+          "REFUTES": 149,
+          "NOT ENOUGH INFO": 101,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.4518,
+          "REFUTES": 0.3268,
+          "NOT ENOUGH INFO": 0.2215,
+          "UNCLEAR": 0.0
+        }
+      },
+      "REFUTES": {
+        "n": 237,
+        "pred_counts": {
+          "SUPPORTS": 7,
+          "REFUTES": 100,
+          "NOT ENOUGH INFO": 130,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.0295,
+          "REFUTES": 0.4219,
+          "NOT ENOUGH INFO": 0.5485,
+          "UNCLEAR": 0.0
+        }
+      },
+      "NOT ENOUGH INFO": {
+        "n": 416,
+        "pred_counts": {
+          "SUPPORTS": 9,
+          "REFUTES": 49,
+          "NOT ENOUGH INFO": 358,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.0216,
+          "REFUTES": 0.1178,
+          "NOT ENOUGH INFO": 0.8606,
+          "UNCLEAR": 0.0
+        }
+      }
     }
   },
   "rows": [
@@ -15554,5 +15613,120 @@
       "model": "meta-llama/Llama-3.2-3B-Instruct",
       "run": "llama3b_instruct_uoc_r32_lam2_ep3_lr3e-05"
     }
-  ]
+  ],
+  "baseline": {
+    "num_instances": 1109,
+    "num_nei": 416,
+    "num_unclear": 0,
+    "overall_accuracy": 0.7015,
+    "fcr_nei": 0.5192,
+    "tar_nei": 0.4808,
+    "accuracy_verifiable": 0.8341,
+    "accuracy_by_label": {
+      "SUPPORTS": {
+        "n": 456,
+        "accuracy": 0.818
+      },
+      "REFUTES": {
+        "n": 237,
+        "accuracy": 0.865
+      },
+      "NOT ENOUGH INFO": {
+        "n": 416,
+        "accuracy": 0.4808
+      }
+    },
+    "pred_counts": {
+      "SUPPORTS": 504,
+      "REFUTES": 383,
+      "NOT ENOUGH INFO": 222,
+      "UNCLEAR": 0
+    },
+    "pred_rates": {
+      "SUPPORTS": 0.4545,
+      "REFUTES": 0.3454,
+      "NOT ENOUGH INFO": 0.2002,
+      "UNCLEAR": 0.0
+    },
+    "confusion_by_gold": {
+      "SUPPORTS": {
+        "n": 456,
+        "pred_counts": {
+          "SUPPORTS": 373,
+          "REFUTES": 68,
+          "NOT ENOUGH INFO": 15,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.818,
+          "REFUTES": 0.1491,
+          "NOT ENOUGH INFO": 0.0329,
+          "UNCLEAR": 0.0
+        }
+      },
+      "REFUTES": {
+        "n": 237,
+        "pred_counts": {
+          "SUPPORTS": 25,
+          "REFUTES": 205,
+          "NOT ENOUGH INFO": 7,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.1055,
+          "REFUTES": 0.865,
+          "NOT ENOUGH INFO": 0.0295,
+          "UNCLEAR": 0.0
+        }
+      },
+      "NOT ENOUGH INFO": {
+        "n": 416,
+        "pred_counts": {
+          "SUPPORTS": 106,
+          "REFUTES": 110,
+          "NOT ENOUGH INFO": 200,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.2548,
+          "REFUTES": 0.2644,
+          "NOT ENOUGH INFO": 0.4808,
+          "UNCLEAR": 0.0
+        }
+      }
+    }
+  },
+  "baseline_run": "baseline_llama3b_instruct",
+  "deltas": {
+    "overall_accuracy": -0.1028,
+    "fcr_nei": -0.3798,
+    "tar_nei": 0.3798,
+    "accuracy_verifiable": -0.3925
+  },
+  "pred_rate_deltas": {
+    "SUPPORTS": -0.2543,
+    "REFUTES": -0.0767,
+    "NOT ENOUGH INFO": 0.3309,
+    "UNCLEAR": 0.0
+  },
+  "confusion_rate_deltas": {
+    "SUPPORTS": {
+      "SUPPORTS": -0.3662,
+      "REFUTES": 0.1777,
+      "NOT ENOUGH INFO": 0.1886,
+      "UNCLEAR": 0.0
+    },
+    "REFUTES": {
+      "SUPPORTS": -0.076,
+      "REFUTES": -0.4431,
+      "NOT ENOUGH INFO": 0.519,
+      "UNCLEAR": 0.0
+    },
+    "NOT ENOUGH INFO": {
+      "SUPPORTS": -0.2332,
+      "REFUTES": -0.1466,
+      "NOT ENOUGH INFO": 0.3798,
+      "UNCLEAR": 0.0
+    }
+  }
 }

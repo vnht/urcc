@@ -32,6 +32,90 @@
         "n": 233,
         "accuracy": 0.0129
       }
+    },
+    "pred_counts": {
+      "SUPPORTS": 257,
+      "REFUTES": 617,
+      "NOT ENOUGH INFO": 1122,
+      "CONFLICTING": 4,
+      "UNCLEAR": 0
+    },
+    "pred_rates": {
+      "SUPPORTS": 0.1285,
+      "REFUTES": 0.3085,
+      "NOT ENOUGH INFO": 0.561,
+      "CONFLICTING": 0.002,
+      "UNCLEAR": 0.0
+    },
+    "confusion_by_gold": {
+      "SUPPORTS": {
+        "n": 530,
+        "pred_counts": {
+          "SUPPORTS": 213,
+          "REFUTES": 77,
+          "NOT ENOUGH INFO": 240,
+          "CONFLICTING": 0,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.4019,
+          "REFUTES": 0.1453,
+          "NOT ENOUGH INFO": 0.4528,
+          "CONFLICTING": 0.0,
+          "UNCLEAR": 0.0
+        }
+      },
+      "REFUTES": {
+        "n": 957,
+        "pred_counts": {
+          "SUPPORTS": 9,
+          "REFUTES": 443,
+          "NOT ENOUGH INFO": 504,
+          "CONFLICTING": 1,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.0094,
+          "REFUTES": 0.4629,
+          "NOT ENOUGH INFO": 0.5266,
+          "CONFLICTING": 0.001,
+          "UNCLEAR": 0.0
+        }
+      },
+      "NOT ENOUGH INFO": {
+        "n": 280,
+        "pred_counts": {
+          "SUPPORTS": 3,
+          "REFUTES": 18,
+          "NOT ENOUGH INFO": 259,
+          "CONFLICTING": 0,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.0107,
+          "REFUTES": 0.0643,
+          "NOT ENOUGH INFO": 0.925,
+          "CONFLICTING": 0.0,
+          "UNCLEAR": 0.0
+        }
+      },
+      "CONFLICTING": {
+        "n": 233,
+        "pred_counts": {
+          "SUPPORTS": 32,
+          "REFUTES": 79,
+          "NOT ENOUGH INFO": 119,
+          "CONFLICTING": 3,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.1373,
+          "REFUTES": 0.3391,
+          "NOT ENOUGH INFO": 0.5107,
+          "CONFLICTING": 0.0129,
+          "UNCLEAR": 0.0
+        }
+      }
     }
   },
   "rows": [
@@ -28064,6 +28148,90 @@
         "n": 233,
         "accuracy": 0.0129
       }
+    },
+    "pred_counts": {
+      "SUPPORTS": 448,
+      "REFUTES": 1124,
+      "NOT ENOUGH INFO": 420,
+      "CONFLICTING": 8,
+      "UNCLEAR": 0
+    },
+    "pred_rates": {
+      "SUPPORTS": 0.224,
+      "REFUTES": 0.562,
+      "NOT ENOUGH INFO": 0.21,
+      "CONFLICTING": 0.004,
+      "UNCLEAR": 0.0
+    },
+    "confusion_by_gold": {
+      "SUPPORTS": {
+        "n": 530,
+        "pred_counts": {
+          "SUPPORTS": 356,
+          "REFUTES": 107,
+          "NOT ENOUGH INFO": 64,
+          "CONFLICTING": 3,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.6717,
+          "REFUTES": 0.2019,
+          "NOT ENOUGH INFO": 0.1208,
+          "CONFLICTING": 0.0057,
+          "UNCLEAR": 0.0
+        }
+      },
+      "REFUTES": {
+        "n": 957,
+        "pred_counts": {
+          "SUPPORTS": 24,
+          "REFUTES": 798,
+          "NOT ENOUGH INFO": 134,
+          "CONFLICTING": 1,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.0251,
+          "REFUTES": 0.8339,
+          "NOT ENOUGH INFO": 0.14,
+          "CONFLICTING": 0.001,
+          "UNCLEAR": 0.0
+        }
+      },
+      "NOT ENOUGH INFO": {
+        "n": 280,
+        "pred_counts": {
+          "SUPPORTS": 7,
+          "REFUTES": 86,
+          "NOT ENOUGH INFO": 186,
+          "CONFLICTING": 1,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.025,
+          "REFUTES": 0.3071,
+          "NOT ENOUGH INFO": 0.6643,
+          "CONFLICTING": 0.0036,
+          "UNCLEAR": 0.0
+        }
+      },
+      "CONFLICTING": {
+        "n": 233,
+        "pred_counts": {
+          "SUPPORTS": 61,
+          "REFUTES": 133,
+          "NOT ENOUGH INFO": 36,
+          "CONFLICTING": 3,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.2618,
+          "REFUTES": 0.5708,
+          "NOT ENOUGH INFO": 0.1545,
+          "CONFLICTING": 0.0129,
+          "UNCLEAR": 0.0
+        }
+      }
     }
   },
   "baseline_run": "baseline_qwen_instruct",
@@ -28072,5 +28240,42 @@
     "fcr_nei": -0.2571,
     "fcr_conflicting": -0.3562,
     "accuracy_verifiable": -0.3349
+  },
+  "pred_rate_deltas": {
+    "SUPPORTS": -0.0955,
+    "REFUTES": -0.2535,
+    "NOT ENOUGH INFO": 0.351,
+    "CONFLICTING": -0.002,
+    "UNCLEAR": 0.0
+  },
+  "confusion_rate_deltas": {
+    "SUPPORTS": {
+      "SUPPORTS": -0.2698,
+      "REFUTES": -0.0566,
+      "NOT ENOUGH INFO": 0.332,
+      "CONFLICTING": -0.0057,
+      "UNCLEAR": 0.0
+    },
+    "REFUTES": {
+      "SUPPORTS": -0.0157,
+      "REFUTES": -0.371,
+      "NOT ENOUGH INFO": 0.3866,
+      "CONFLICTING": 0.0,
+      "UNCLEAR": 0.0
+    },
+    "NOT ENOUGH INFO": {
+      "SUPPORTS": -0.0143,
+      "REFUTES": -0.2428,
+      "NOT ENOUGH INFO": 0.2607,
+      "CONFLICTING": -0.0036,
+      "UNCLEAR": 0.0
+    },
+    "CONFLICTING": {
+      "SUPPORTS": -0.1245,
+      "REFUTES": -0.2317,
+      "NOT ENOUGH INFO": 0.3562,
+      "CONFLICTING": 0.0,
+      "UNCLEAR": 0.0
+    }
   }
 }

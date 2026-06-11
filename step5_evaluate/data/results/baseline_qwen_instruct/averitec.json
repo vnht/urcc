@@ -32,6 +32,90 @@
         "n": 233,
         "accuracy": 0.0129
       }
+    },
+    "pred_counts": {
+      "SUPPORTS": 448,
+      "REFUTES": 1124,
+      "NOT ENOUGH INFO": 420,
+      "CONFLICTING": 8,
+      "UNCLEAR": 0
+    },
+    "pred_rates": {
+      "SUPPORTS": 0.224,
+      "REFUTES": 0.562,
+      "NOT ENOUGH INFO": 0.21,
+      "CONFLICTING": 0.004,
+      "UNCLEAR": 0.0
+    },
+    "confusion_by_gold": {
+      "SUPPORTS": {
+        "n": 530,
+        "pred_counts": {
+          "SUPPORTS": 356,
+          "REFUTES": 107,
+          "NOT ENOUGH INFO": 64,
+          "CONFLICTING": 3,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.6717,
+          "REFUTES": 0.2019,
+          "NOT ENOUGH INFO": 0.1208,
+          "CONFLICTING": 0.0057,
+          "UNCLEAR": 0.0
+        }
+      },
+      "REFUTES": {
+        "n": 957,
+        "pred_counts": {
+          "SUPPORTS": 24,
+          "REFUTES": 798,
+          "NOT ENOUGH INFO": 134,
+          "CONFLICTING": 1,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.0251,
+          "REFUTES": 0.8339,
+          "NOT ENOUGH INFO": 0.14,
+          "CONFLICTING": 0.001,
+          "UNCLEAR": 0.0
+        }
+      },
+      "NOT ENOUGH INFO": {
+        "n": 280,
+        "pred_counts": {
+          "SUPPORTS": 7,
+          "REFUTES": 86,
+          "NOT ENOUGH INFO": 186,
+          "CONFLICTING": 1,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.025,
+          "REFUTES": 0.3071,
+          "NOT ENOUGH INFO": 0.6643,
+          "CONFLICTING": 0.0036,
+          "UNCLEAR": 0.0
+        }
+      },
+      "CONFLICTING": {
+        "n": 233,
+        "pred_counts": {
+          "SUPPORTS": 61,
+          "REFUTES": 133,
+          "NOT ENOUGH INFO": 36,
+          "CONFLICTING": 3,
+          "UNCLEAR": 0
+        },
+        "pred_rates": {
+          "SUPPORTS": 0.2618,
+          "REFUTES": 0.5708,
+          "NOT ENOUGH INFO": 0.1545,
+          "CONFLICTING": 0.0129,
+          "UNCLEAR": 0.0
+        }
+      }
     }
   },
   "rows": [

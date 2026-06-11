@@ -367,6 +367,38 @@ def _round(x):
     return round(x, 4) if isinstance(x, float) and x == x else x
 
 
+def _prediction_breakdown(rows: list[dict], labels, gold_fn) -> tuple[dict, dict, dict]:
+    """Predicted-label distribution + the gold→prediction confusion.
+
+    Makes the *direction* of the trained-model shift legible (not just that a
+    per-label accuracy fell): e.g. true SUPPORTS / REFUTES claims collapsing
+    into NOT ENOUGH INFO (over-abstention) vs. flipping to the wrong verdict.
+        pred_counts / pred_rates                  overall predicted-label mix
+        confusion_by_gold[gold]["pred_rates"]     where each gold class lands
+    The predicted space is the gold `labels` plus UNCLEAR (judge no-parse); any
+    other/missing judge_label is bucketed into UNCLEAR so the key space — and
+    therefore the baseline deltas — stay stable across runs.
+    """
+    pred_space = list(labels) + ["UNCLEAR"]
+
+    def tally(subset: list[dict]) -> tuple[dict, dict]:
+        counts = {p: 0 for p in pred_space}
+        for r in subset:
+            pl = r.get("judge_label")
+            counts[pl if pl in counts else "UNCLEAR"] += 1
+        ln = len(subset)
+        rates = {p: (_round(c / ln) if ln else float("nan")) for p, c in counts.items()}
+        return counts, rates
+
+    pred_counts, pred_rates = tally(rows)
+    confusion: dict = {}
+    for lab in labels:
+        lr = [r for r in rows if gold_fn(r) == lab]
+        counts, rates = tally(lr)
+        confusion[lab] = {"n": len(lr), "pred_counts": counts, "pred_rates": rates}
+    return pred_counts, pred_rates, confusion
+
+
 def _summarise_scifact(rows: list[dict]) -> dict:
     """Grounded claim-verification metrics (SUPPORTS / REFUTES / NOT ENOUGH INFO).
 
@@ -400,6 +432,9 @@ def _summarise_scifact(rows: list[dict]) -> dict:
     n_ver = len(verifiable)
     ver_correct = sum(1 for r in verifiable if r.get("judge_label") == gold(r))
 
+    pred_counts, pred_rates, confusion = _prediction_breakdown(
+        rows, ("SUPPORTS", "REFUTES", "NOT ENOUGH INFO"), gold)
+
     return {
         "num_instances":    n,
         "num_nei":          n_nei,
@@ -409,6 +444,9 @@ def _summarise_scifact(rows: list[dict]) -> dict:
         "tar_nei":          _round(nei_abstain / n_nei) if n_nei else float("nan"),
         "accuracy_verifiable": _round(ver_correct / n_ver) if n_ver else float("nan"),
         "accuracy_by_label":   acc_by_label,
+        "pred_counts":         pred_counts,
+        "pred_rates":          pred_rates,
+        "confusion_by_gold":   confusion,
     }
 
 
@@ -458,6 +496,8 @@ def _summarise_averitec(rows: list[dict]) -> dict:
     n_ver = len(verifiable)
     ver_correct = sum(1 for r in verifiable if r.get("judge_label") == gold(r))
 
+    pred_counts, pred_rates, confusion = _prediction_breakdown(rows, labels, gold)
+
     return {
         "num_instances":    n,
         "num_nei":          n_nei,
@@ -470,6 +510,9 @@ def _summarise_averitec(rows: list[dict]) -> dict:
         "tar_conflicting":  tar_conf,
         "accuracy_verifiable": _round(ver_correct / n_ver) if n_ver else float("nan"),
         "accuracy_by_label":   acc_by_label,
+        "pred_counts":         pred_counts,
+        "pred_rates":          pred_rates,
+        "confusion_by_gold":   confusion,
     }
 
 
@@ -622,6 +665,32 @@ def _attach_baseline(record: dict, baseline_dir: Path | None, dataset: str) -> N
     record["baseline"] = dict(bm)
     record["baseline_run"] = base.get("run")
     record["deltas"] = deltas
+
+    # Predicted-label distribution shift vs baseline (claim-verification kinds).
+    # `pred_rate_deltas` is the overall mix shift (headline: +NOT ENOUGH INFO,
+    # −SUPPORTS/−REFUTES = over-abstention); `confusion_rate_deltas[gold]` shows
+    # the shift per gold class (e.g. true SUPPORTS now predicted NEI).
+    def _rate_delta(cur, prev):
+        if not isinstance(cur, dict) or not isinstance(prev, dict):
+            return None
+        return {k: round(cur[k] - prev[k], 4)
+                for k in cur
+                if isinstance(cur.get(k), (int, float))
+                and isinstance(prev.get(k), (int, float))}
+
+    prd = _rate_delta(cm.get("pred_rates"), bm.get("pred_rates"))
+    if prd:
+        record["pred_rate_deltas"] = prd
+
+    bc, cc = bm.get("confusion_by_gold"), cm.get("confusion_by_gold")
+    if isinstance(bc, dict) and isinstance(cc, dict):
+        conf_deltas = {}
+        for lab, cur in cc.items():
+            d = _rate_delta(cur.get("pred_rates"), bc.get(lab, {}).get("pred_rates"))
+            if d:
+                conf_deltas[lab] = d
+        if conf_deltas:
+            record["confusion_rate_deltas"] = conf_deltas
 
 
 # ── Per-dataset evaluation pass ───────────────────────────────────────────────
