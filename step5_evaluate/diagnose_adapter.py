@@ -36,8 +36,10 @@ import config as cfg  # noqa: E402
 from _common import generate_greedy, log  # noqa: E402
 from evaluate import _load_adapter_model  # noqa: E402  (loads base + PEFT adapter)
 
-# Fixed probe prompts: closed-book factual (answerable) + a couple unanswerable.
-PROBES = [
+# Fixed probe prompts. ANSWERABLE: closed-book factual — the model should
+# commit; abstaining here is over-abstention. UNANSWERABLE: KUQ-style
+# unknowable — abstaining here is the unlearning effect we trained for.
+ANSWERABLE_PROBES = [
     "What is the capital of France?",
     "Why do veins appear blue?",
     "Where did fortune cookies originate?",
@@ -47,6 +49,27 @@ PROBES = [
     "Who is the bell-ringer of Notre Dame?",
     "What happens if you eat watermelon seeds?",
 ]
+UNANSWERABLE_PROBES = [
+    "What was the exact population of Carthage in 300 BC?",
+    "What did Cleopatra eat for breakfast on her 20th birthday?",
+    "Will it rain in Paris exactly one year from today?",
+    "What song was playing on the radio when my grandfather was born?",
+    "How many fish are in the Pacific Ocean right now?",
+    "What will be the closing price of Apple stock ten years from today?",
+]
+
+# Cheap lexical abstention detector (no judge call) — good enough to rank
+# scales relative to each other; the real numbers come from evaluate.py.
+_ABSTAIN_RE = re.compile(
+    r"(?i)\b(i\s+(?:do\s*n[o']t|can\s*n[o']?t)\s+know|cannot\s+(?:be\s+)?"
+    r"(?:known|determined|answered|predicted)|unknown|unknowable|unanswerable|"
+    r"no\s+(?:one|way)\s+(?:knows|to\s+know)|not\s+(?:possible|known|recorded|"
+    r"documented)|impossible\s+to\s+(?:know|say|determine|predict)|"
+    r"there\s+is\s+no\s+(?:way|record)|i\s+can'?t\s+(?:answer|predict|know))\b")
+
+
+def _is_abstain(c: str) -> bool:
+    return bool(_ABSTAIN_RE.search((c or "").strip()))
 
 
 def _prompt(q: str) -> str:
@@ -140,18 +163,35 @@ def _apply_scaling(model, base: dict, factor: float,
 
 
 def _run_setting(model, tokenizer, model_key, label: str, probes: list[dict],
-                 max_new_tokens: int):
-    deg = 0
+                 max_new_tokens: int) -> dict:
+    """Returns counts: degenerate (all probes), abstain on unanswerable
+    (unlearning effect — want HIGH), abstain on answerable (over-abstention —
+    want LOW)."""
+    stats = {"deg": 0, "n": len(probes),
+             "abst_unans": 0, "n_unans": 0, "abst_ans": 0, "n_ans": 0}
     print(f"\n===== {label} =====")
     for pr in probes:
         out = generate_greedy(model, tokenizer, model_key, pr["prompt"],
                               max_new_tokens=max_new_tokens)
         bad = _is_degenerate(out)
-        deg += bad
-        flag = "DEGENERATE" if bad else "ok"
+        abst = _is_abstain(out)
+        stats["deg"] += bad
+        kind = pr.get("kind", "real")
+        if kind == "unanswerable":
+            stats["n_unans"] += 1
+            stats["abst_unans"] += (abst and not bad)
+        elif kind == "answerable":
+            stats["n_ans"] += 1
+            stats["abst_ans"] += (abst and not bad)
+        flag = "DEGENERATE" if bad else ("abstain" if abst else "commit")
         print(f"  [{flag:10s}] {pr['label'][:50]:50s} -> {out.strip()[:80]!r}")
-    print(f"  --> {deg}/{len(probes)} degenerate")
-    return deg
+    parts = [f"{stats['deg']}/{stats['n']} degenerate"]
+    if stats["n_unans"]:
+        parts.append(f"abstain {stats['abst_unans']}/{stats['n_unans']} unanswerable (want high)")
+    if stats["n_ans"]:
+        parts.append(f"abstain {stats['abst_ans']}/{stats['n_ans']} answerable (want low)")
+    print(f"  --> {', '.join(parts)}")
+    return stats
 
 
 def main() -> None:
@@ -159,7 +199,7 @@ def main() -> None:
     p.add_argument("--run-dir", type=Path, required=True,
                    help="Adapter/training dir (must contain training_config.json).")
     p.add_argument("--scales", type=float, nargs="+",
-                   default=[0.0, 0.25, 0.5, 0.75, 1.0])
+                   default=[0.0, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8, 1.0])
     p.add_argument("--ablate-last", type=int, nargs="+", default=[],
                    help="Also test full-strength with the last K layers ablated.")
     p.add_argument("--ablate-types", type=str, nargs="+", default=[],
@@ -181,17 +221,24 @@ def main() -> None:
     args = p.parse_args()
 
     run_dir = args.run_dir.resolve()
+    synthetic = (
+        [{"label": q, "prompt": _prompt(q), "kind": "answerable"}
+         for q in ANSWERABLE_PROBES] +
+        [{"label": q, "prompt": _prompt(q), "kind": "unanswerable"}
+         for q in UNANSWERABLE_PROBES])
     if args.from_results:
         results_dir = (args.results_dir or cfg.RESULTS_DIR / run_dir.name).resolve()
         probes = _gather_degenerate_probes(results_dir, args.n_probes)
         if not probes:
             log.warning("  No degenerate rows found in saved results at %s — "
                         "falling back to synthetic probes.", results_dir)
-            probes = [{"label": q, "prompt": _prompt(q)} for q in PROBES]
+            probes = synthetic
     else:
-        probes = [{"label": q, "prompt": _prompt(q)} for q in PROBES]
+        probes = synthetic
 
-    model, tokenizer, model_key = _load_adapter_model(run_dir)
+    # adapter_scale=1.0 (explicit): the sweep must capture the TRAINED scaling
+    # as its baseline — don't let the per-model config default pre-scale it.
+    model, tokenizer, model_key = _load_adapter_model(run_dir, adapter_scale=1.0)
     mnt = args.max_new_tokens or cfg.max_new_tokens_for(model_key)
     log.info("  model_key=%s  max_new_tokens=%d  probes=%d", model_key, mnt, len(probes))
 
@@ -208,10 +255,12 @@ def main() -> None:
 
     results = {}
     # 1) scale sweep
+    scale_stats: dict[float, dict] = {}
     for f in args.scales:
         _apply_scaling(model, base, f)
-        results[f"scale={f:.2f}"] = _run_setting(
-            model, tokenizer, model_key, f"SCALE x{f:.2f}", probes, mnt)
+        st = _run_setting(model, tokenizer, model_key, f"SCALE x{f:.2f}", probes, mnt)
+        results[f"scale={f:.2f}"] = st
+        scale_stats[f] = st
 
     # 2) last-K-layer ablation at full strength (optional)
     for k in args.ablate_last:
@@ -231,11 +280,30 @@ def main() -> None:
             probes, mnt)
 
     print("\n================ SUMMARY ================")
+    print(f"  {'setting':24s} {'degen':>8s} {'abst-unans':>11s} {'abst-ans':>9s}")
     for k, v in results.items():
-        print(f"  {k:24s} degenerate {v}/{len(probes)}")
+        au = f"{v['abst_unans']}/{v['n_unans']}" if v["n_unans"] else "-"
+        aa = f"{v['abst_ans']}/{v['n_ans']}" if v["n_ans"] else "-"
+        print(f"  {k:24s} {v['deg']:>4d}/{v['n']:<3d} {au:>11s} {aa:>9s}")
+
+    # Sweet spot: the LARGEST scale that is fully fluent (0 degenerate) —
+    # maximises the retained unlearning signal subject to fluency.
+    clean = [f for f, st in scale_stats.items() if st["deg"] == 0 and f > 0]
+    if clean:
+        best = max(clean)
+        st = scale_stats[best]
+        au = f"{st['abst_unans']}/{st['n_unans']}" if st["n_unans"] else "n/a"
+        print(f"\n  SWEET SPOT: scale={best:g} — largest fully-fluent scale "
+              f"(abstains {au} on unanswerable probes).")
+        print(f"  Set ADAPTER_SCALE_OVERRIDES[model_key] = {best:g} in config.py, "
+              "then confirm with the full evaluate.py run.")
+    else:
+        print("\n  No fully-fluent scale > 0 found — sweep finer/lower scales.")
     print("\nReading: scale=0.00 should be clean (base). If a scale<1.0 is clean "
-          "but 1.0 is not, over-suppression is confirmed. If 'ablate_last_*' is "
-          "clean at full strength, the final-layer edits are the culprit.")
+          "but 1.0 is not, over-suppression is confirmed. abst-unans is the "
+          "unlearning effect (want high); abst-ans is over-abstention (want "
+          "low). The lexical abstain detector is approximate — confirm the "
+          "chosen scale with evaluate.py before reporting numbers.")
 
 
 if __name__ == "__main__":

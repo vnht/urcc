@@ -208,21 +208,20 @@ LORA_DROPOUT        = 0.05
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
                        "up_proj", "down_proj", "gate_proj"]
 
-# Per-model LoRA module suffixes zeroed at inference (train full like qwen,
-# deploy without). ministral14b: MLP LoRA writes enact repetition collapse;
-# diagnose_adapter --ablate-types on the full trained adapter showed
-# gate/up/down zeroed = 0/8 degenerate at scale 1.0, attention zeroed = 4/8.
-# Training attention-only from scratch does NOT replicate that — attention
-# must compensate alone and still collapses. Correct recipe: train full LoRA,
-# zero MLP suffixes when loading for eval.
-LORA_INFERENCE_ZERO_SUFFIXES: dict[str, list[str]] = {
-    "ministral14b_instruct": ["gate_proj", "up_proj", "down_proj"],
+# Per-model default LoRA contribution at inference (train full like qwen,
+# deploy scaled down). ministral14b: the full-strength adapter enacts
+# repetition collapse; the diagnose_adapter scale sweep showed clean fluent
+# output at scale <= 0.5 and degeneration at >= 0.75. Recipe: train full
+# LoRA, evaluate/deploy at the scale below. Models not listed use 1.0
+# (adapter exactly as trained). The eval CLI --adapter-scale overrides this.
+ADAPTER_SCALE_OVERRIDES: dict[str, float] = {
+    "ministral14b_instruct": 0.5,
 }
 
 
-def lora_inference_zero_suffixes(model_key: str) -> list[str]:
-    """Module-name suffixes to zero at inference for `model_key` (empty = none)."""
-    return LORA_INFERENCE_ZERO_SUFFIXES.get(model_key, [])
+def adapter_scale_for(model_key: str) -> float:
+    """Default inference-time LoRA scale for `model_key` (1.0 = as trained)."""
+    return ADAPTER_SCALE_OVERRIDES.get(model_key, 1.0)
 
 
 # Per-model remap of the dense LoRA targets for backbones whose nn.Linear

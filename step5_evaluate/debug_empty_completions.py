@@ -111,7 +111,7 @@ def run(args: argparse.Namespace) -> None:
     if args.run_dir is not None:
         run_dir = args.run_dir.resolve()
         result_name = run_dir.name
-        if args.adapter_scale != 1.0:
+        if args.adapter_scale is not None:
             result_name = f"{result_name}_scale{args.adapter_scale:g}"
     else:
         result_name = f"baseline_{args.model}"
@@ -187,8 +187,9 @@ def parse_args() -> argparse.Namespace:
                    help="Model key for the zero-shot baseline results.")
     p.add_argument("--datasets", nargs="+", default=["kuq"],
                    help="Datasets whose results JSONs to scan (default: kuq).")
-    p.add_argument("--adapter-scale", type=float, default=1.0,
-                   help="Must match the eval run if it used a scale suffix.")
+    p.add_argument("--adapter-scale", type=float, default=None,
+                   help="Must match the eval run if it used a scale suffix "
+                        "(default: per-model config scale, no suffix).")
     p.add_argument("--max-rows", type=int, default=None,
                    help="Cap regenerated rows per dataset (default: all).")
     p.add_argument("--max-new-tokens", type=int,

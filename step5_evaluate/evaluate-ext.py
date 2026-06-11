@@ -785,11 +785,11 @@ def run(args: argparse.Namespace) -> None:
     if args.run_dir is not None:
         run_dir = args.run_dir.resolve()
         result_name, mode = run_dir.name, "trained"
-        if args.adapter_scale != 1.0:
+        if args.adapter_scale is not None:
             result_name = f"{result_name}_scale{args.adapter_scale:g}"
     else:
         run_dir, result_name, mode = None, f"baseline_{args.model}", "baseline"
-        if args.adapter_scale != 1.0:
+        if args.adapter_scale is not None:
             log.warning("  --adapter-scale ignored for baseline (no adapter)")
 
     out_dir = cfg.results_dir_for(result_name)
@@ -807,8 +807,7 @@ def run(args: argparse.Namespace) -> None:
                 run_dir, adapter_scale=args.adapter_scale)
         else:
             model, tokenizer, model_key = _load_base_model(args.model)
-    log.info("  model: %s (%s)  adapter_scale=%g",
-             model_key, cfg.MODEL_REGISTRY[model_key], args.adapter_scale)
+    log.info("  model: %s (%s)", model_key, cfg.MODEL_REGISTRY[model_key])
 
     if args.max_new_tokens is None:
         args.max_new_tokens = cfg.max_new_tokens_for(model_key)
@@ -835,12 +834,12 @@ def parse_args() -> argparse.Namespace:
                    default=list(DATASET_KIND.keys()),
                    help="Which datasets to evaluate (default: all of "
                         "scifact averitec truthfulqa simpleqa popqa).")
-    p.add_argument("--adapter-scale", type=float, default=1.0,
-                   help="Scale the LoRA contribution at inference (1.0 = as "
-                        "trained). Use <1.0 for over-strong adapters that "
-                        "degenerate at full strength (e.g. Ministral: 0.5). "
-                        "Results go to <run>_scale<f> so full-strength results "
-                        "are not overwritten.")
+    p.add_argument("--adapter-scale", type=float, default=None,
+                   help="Scale the LoRA contribution at inference. Default: "
+                        "the per-model config value (ADAPTER_SCALE_OVERRIDES; "
+                        "e.g. Ministral deploys at 0.5, others at 1.0). An "
+                        "explicit value writes results to <run>_scale<f> so "
+                        "the default-config results are not overwritten.")
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="First-pass greedy decode cap (default 64 for all "
                         "models). gpt-oss escalates once to 1024 when the "

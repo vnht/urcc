@@ -160,28 +160,12 @@ def _scale_lora(model, factor: float) -> int:
     return n
 
 
-def _zero_lora_by_suffix(model, suffixes: list[str]) -> int:
-    """Zero LoRA A/B weights whose module name ends with one of `suffixes`."""
-    if not suffixes:
-        return 0
-    n = 0
-    for name, mod in model.named_modules():
-        if not any(name.endswith(f".{s}") or name.endswith(s) for s in suffixes):
-            continue
-        for attr in ("lora_A", "lora_B"):
-            sub = getattr(mod, attr, None)
-            if sub is None:
-                continue
-            for p in sub.parameters():
-                p.data.zero_()
-                n += 1
-    return n
-
-
-def _load_adapter_model(run_dir: Path, adapter_scale: float = 1.0):
+def _load_adapter_model(run_dir: Path, adapter_scale: float | None = None):
     """Load base model from training_config.json + apply LoRA adapter.
 
-    adapter_scale != 1.0 dials the LoRA contribution up/down at inference time.
+    adapter_scale dials the LoRA contribution up/down at inference time.
+    None = use the per-model config default (ADAPTER_SCALE_OVERRIDES,
+    1.0 for unlisted models); a CLI --adapter-scale value overrides it.
     """
     cfg_path = run_dir / "training_config.json"
     if not cfg_path.exists():
@@ -194,10 +178,11 @@ def _load_adapter_model(run_dir: Path, adapter_scale: float = 1.0):
     from peft import PeftModel
     model = PeftModel.from_pretrained(model, str(adapter_dir), local_files_only=True)
     model.eval()
-    zero_suffixes = cfg.lora_inference_zero_suffixes(model_key)
-    if zero_suffixes:
-        n = _zero_lora_by_suffix(model, zero_suffixes)
-        log.info("  zeroed %d LoRA params (%s) at inference", n, ", ".join(zero_suffixes))
+    if adapter_scale is None:
+        adapter_scale = cfg.adapter_scale_for(model_key)
+        if adapter_scale != 1.0:
+            log.info("  using config default adapter_scale=%g for %s",
+                     adapter_scale, model_key)
     if adapter_scale != 1.0:
         n = _scale_lora(model, adapter_scale)
         log.info("  scaled %d LoRA modules by %.3fx (inference-time)", n, adapter_scale)
@@ -729,13 +714,13 @@ def run(args: argparse.Namespace) -> None:
         run_dir: Path = args.run_dir.resolve()
         result_name = run_dir.name
         mode = "trained"
-        if args.adapter_scale != 1.0:
+        if args.adapter_scale is not None:
             result_name = f"{result_name}_scale{args.adapter_scale:g}"
     else:
         run_dir = None
         result_name = f"baseline_{args.model}"
         mode = "baseline"
-        if args.adapter_scale != 1.0:
+        if args.adapter_scale is not None:
             log.warning("  --adapter-scale ignored for baseline (no adapter)")
 
     out_dir = cfg.results_dir_for(result_name)
@@ -756,8 +741,8 @@ def run(args: argparse.Namespace) -> None:
         if mode == "trained":
             model, tokenizer, model_key = _load_adapter_model(
                 run_dir, adapter_scale=args.adapter_scale)
-            log.info("  Adapter loaded for %s (%s)  adapter_scale=%g",
-                     model_key, cfg.MODEL_REGISTRY[model_key], args.adapter_scale)
+            log.info("  Adapter loaded for %s (%s)", model_key,
+                     cfg.MODEL_REGISTRY[model_key])
         else:
             model, tokenizer, model_key = _load_base_model(args.model)
             log.info("  Base model loaded: %s (%s) — no adapter",
@@ -797,12 +782,12 @@ def parse_args() -> argparse.Namespace:
                    help="Run directory (step4_train/data/runs/<run_name>) for trained eval.")
     g.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()),
                    help="Model key for zero-shot baseline eval (no adapter).")
-    p.add_argument("--adapter-scale", type=float, default=1.0,
-                   help="Scale the LoRA contribution at inference (1.0 = as "
-                        "trained). Use <1.0 for over-strong adapters that "
-                        "degenerate at full strength (e.g. Ministral: 0.5). "
-                        "Results are written to <run>_scale<f> so full-strength "
-                        "results are not overwritten.")
+    p.add_argument("--adapter-scale", type=float, default=None,
+                   help="Scale the LoRA contribution at inference. Default: "
+                        "the per-model config value (ADAPTER_SCALE_OVERRIDES; "
+                        "e.g. Ministral deploys at 0.5, others at 1.0). An "
+                        "explicit value writes results to <run>_scale<f> so "
+                        "the default-config results are not overwritten.")
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="First-pass greedy decode cap for the answerability "
                         "eval (default 64). gpt-oss escalates once to 1024 "
