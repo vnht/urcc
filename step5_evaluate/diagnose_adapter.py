@@ -80,7 +80,9 @@ def _gather_degenerate_probes(results_dir: Path, n: int) -> list[dict]:
     """Pull the REAL prompts that degenerated in this run's saved results.
 
     Uses the exact stored `prompt` so we reproduce the actual failure, not a
-    synthetic stand-in. Samples up to n, spread across datasets.
+    synthetic stand-in, and carries the row's ground-truth `answerable` label
+    so the sweep can also score abstention. Samples up to n, spread across
+    datasets.
     """
     files = sorted(results_dir.glob("*.json"))
     by_ds: dict[str, list[dict]] = {}
@@ -104,11 +106,19 @@ def _gather_degenerate_probes(results_dir: Path, n: int) -> list[dict]:
             if idx < len(degs) and len(probes) < n:
                 r = degs[idx]
                 q = (r.get("question") or r.get("claim") or r.get("prompt") or "")[:45]
+                kind = "answerable" if r.get("answerable") else "unanswerable"
                 probes.append({"label": f"{ds}:{q}", "prompt": r["prompt"],
+                               "kind": kind,
                                "old": (r.get("completion") or "").strip()[:60]})
         idx += 1
-    log.info("  pulled %d real degenerate probes from %s (datasets: %s)",
-             len(probes), results_dir.name, {k: len(v) for k, v in by_ds.items()})
+    kinds = {"answerable": 0, "unanswerable": 0}
+    for pr in probes:
+        kinds[pr["kind"]] += 1
+    log.info("  pulled %d real degenerate probes from %s (datasets: %s, "
+             "answerable: %d, unanswerable: %d)",
+             len(probes), results_dir.name,
+             {k: len(v) for k, v in by_ds.items()},
+             kinds["answerable"], kinds["unanswerable"])
     return probes
 
 
@@ -209,14 +219,16 @@ def main() -> None:
                         "keep attention) and 'q_proj,k_proj,v_proj,o_proj' "
                         "(zero attention, keep MLP). Localises which module "
                         "family enacts the collapse.")
-    p.add_argument("--from-results", action="store_true",
-                   help="Use the REAL degenerate prompts from this run's saved "
-                        "results instead of the synthetic probe set.")
+    p.add_argument("--synthetic", action="store_true",
+                   help="Force the synthetic probe set. Default behaviour is "
+                        "to probe with the REAL degenerate prompts from this "
+                        "run's saved results (falling back to synthetic when "
+                        "none are found).")
     p.add_argument("--results-dir", type=Path, default=None,
-                   help="Where to read saved results for --from-results. "
-                        "Defaults to RESULTS_DIR/<run-dir name>.")
-    p.add_argument("--n-probes", type=int, default=12,
-                   help="How many real degenerate probes to sample (--from-results).")
+                   help="Where to read saved results for the real degenerate "
+                        "probes. Defaults to RESULTS_DIR/<run-dir name>.")
+    p.add_argument("--n-probes", type=int, default=100,
+                   help="How many real degenerate probes to sample.")
     p.add_argument("--max-new-tokens", type=int, default=None)
     args = p.parse_args()
 
@@ -226,14 +238,14 @@ def main() -> None:
          for q in ANSWERABLE_PROBES] +
         [{"label": q, "prompt": _prompt(q), "kind": "unanswerable"}
          for q in UNANSWERABLE_PROBES])
-    if args.from_results:
+    probes: list[dict] = []
+    if not args.synthetic:
         results_dir = (args.results_dir or cfg.RESULTS_DIR / run_dir.name).resolve()
         probes = _gather_degenerate_probes(results_dir, args.n_probes)
         if not probes:
             log.warning("  No degenerate rows found in saved results at %s — "
                         "falling back to synthetic probes.", results_dir)
-            probes = synthetic
-    else:
+    if not probes:
         probes = synthetic
 
     # adapter_scale=1.0 (explicit): the sweep must capture the TRAINED scaling
