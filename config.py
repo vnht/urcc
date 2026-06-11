@@ -195,6 +195,7 @@ RETAIN_BASIS_RANK  = 512
 # ministral14b_instruct uses the default 1e-3 (same as qwen).
 SUBSPACE_RIDGE_OVERRIDES: dict[str, float] = {
     "gptoss_instruct": 10.0,
+    "ministral14b_instruct": 1.0,
 }
 
 
