@@ -204,10 +204,13 @@ RETAIN_BASIS_RANK  = 512
 #   gptoss_instruct:        10.0  (kuq axis suppressed at default ridge)
 #   ministral14b_instruct:   1.0  (axis suppressed; ridge=1.0 did not cure
 #                                  generation degeneration — model retired)
-#   llama3b_instruct:       TBD   (run sweep after step 2 before training)
+#   llama3b_instruct:        0.3  (sweep: kuq pole_sep 0.212 at 1e-3, below the
+#                                  0.25-0.28 target where the method works;
+#                                  0.3 lifts kuq into range, squad already > target)
 SUBSPACE_RIDGE_OVERRIDES: dict[str, float] = {
     "gptoss_instruct": 10.0,
     "ministral14b_instruct": 1.0,
+    "llama3b_instruct": 0.3,
 }
 
 
