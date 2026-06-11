@@ -97,6 +97,12 @@ MODEL_REGISTRY: dict[str, str] = {
     # LORA_DENSE_TARGET_OVERRIDES (same full attn+MLP coverage as qwen, just
     # fused module names; the training recipe is otherwise identical).
     "phi4_instruct":      "microsoft/phi-4",
+    # Meta Llama 3.2 3B Instruct (3.21B). Dense decoder (LlamaForCausalLM):
+    # 28 layers, hidden 3072, 24 query / 8 KV heads (GQA), SwiGLU FFN.
+    # Standard Llama-style split projections — LORA_TARGET_MODULES applies
+    # without changes. Distilled from Llama 3.1 8B/70B via knowledge
+    # distillation; strong baselines for its size class, widely cited.
+    "llama3b_instruct":   "meta-llama/Llama-3.2-3B-Instruct",
 }
 
 # Last-25% of transformer layers per model (where the commitment subspace lives)
@@ -113,6 +119,8 @@ LAYER_SLICE: dict[str, list[int]] = {
     "llama_base":         [24, 25, 26, 27, 28, 29, 30, 31],
     # Phi-4: 40 layers → last 25% = layers 30-39.
     "phi4_instruct":      [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+    # Llama 3.2 3B: 28 layers → last 25% = layers 21-27.
+    "llama3b_instruct":   [21, 22, 23, 24, 25, 26, 27],
 }
 
 
