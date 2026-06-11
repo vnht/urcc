@@ -19028,8 +19028,8 @@
     "num_empty_completions": 6,
     "num_empty_completions_answerable": 0,
     "num_empty_completions_unanswerable": 6,
-    "true_commitment_rate": NaN,
-    "false_abstention_rate": NaN,
+    "true_commitment_rate": 0,
+    "false_abstention_rate": 0,
     "true_abstention_rate": 0.143,
     "false_commitment_rate": 0.857,
     "decision_accuracy": 0.143
@@ -19037,8 +19037,8 @@
   "baseline_run": "baseline_gptoss_instruct",
   "deltas": {
     "decision_accuracy": 0.521,
-    "true_commitment_rate": NaN,
-    "false_abstention_rate": NaN,
+    "true_commitment_rate": 0,
+    "false_abstention_rate": 0,
     "true_abstention_rate": 0.521,
     "false_commitment_rate": -0.521
   }
