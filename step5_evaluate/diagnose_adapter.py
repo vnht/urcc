@@ -165,19 +165,23 @@ def _capture_base_scaling(model) -> dict:
 
 def _apply_scaling(model, base: dict, factor: float,
                    zero_layers: set[int] | None = None,
-                   zero_types: set[str] | None = None):
+                   zero_types: set[str] | None = None,
+                   type_factors: dict[str, float] | None = None):
     """Set each LoRA layer's scaling to base*factor, or 0 for modules in
     zero_layers (by layer index) or zero_types (by module-name suffix, e.g.
-    'down_proj')."""
+    'down_proj'). type_factors overrides `factor` per module-name suffix,
+    enabling mixed settings (e.g. attention at 1.0, MLP at 0.3)."""
     zero_layers = zero_layers or set()
     zero_types = zero_types or set()
+    type_factors = type_factors or {}
     for name, mod in _lora_modules(model):
         m = _LAYER_RE.search(name)
         layer = int(m.group(1)) if m else -1
         suffix = name.split(".")[-1]
         zero = layer in zero_layers or suffix in zero_types
+        f = type_factors.get(suffix, factor)
         for ad in mod.scaling:
-            mod.scaling[ad] = 0.0 if zero else base[(name, ad)] * factor
+            mod.scaling[ad] = 0.0 if zero else base[(name, ad)] * f
 
 
 def _run_setting(model, tokenizer, model_key, label: str, probes: list[dict],
@@ -227,6 +231,13 @@ def main() -> None:
                         "keep attention) and 'q_proj,k_proj,v_proj,o_proj' "
                         "(zero attention, keep MLP). Localises which module "
                         "family enacts the collapse.")
+    p.add_argument("--type-scales", type=str, nargs="+", action="append",
+                   default=[], metavar="TYPES=FACTOR",
+                   help="Mixed per-module-type scaling. One setting per flag "
+                        "occurrence; unlisted types stay at 1.0 (as trained). "
+                        "E.g. --type-scales gate_proj,up_proj,down_proj=0.3 "
+                        "keeps attention at full strength and runs the MLP "
+                        "adapters at 0.3. Repeat the flag for more settings.")
     p.add_argument("--synthetic", action="store_true",
                    help="Force the synthetic probe set. Default behaviour is "
                         "to probe with the REAL degenerate prompts from this "
@@ -297,6 +308,21 @@ def main() -> None:
         label = "+".join(sorted(types))
         results[f"full,ablate_{label}"] = _run_setting(
             model, tokenizer, model_key, f"FULL, ablate types {sorted(types)}",
+            probes, mnt)
+
+    # 4) mixed per-type scaling (optional) — unlisted types stay at 1.0
+    for setting in args.type_scales:
+        type_factors: dict[str, float] = {}
+        for tok in setting:
+            types_str, _, f_str = tok.partition("=")
+            f = float(f_str)
+            for t in types_str.split(","):
+                if t.strip():
+                    type_factors[t.strip()] = f
+        _apply_scaling(model, base, 1.0, type_factors=type_factors)
+        label = " ".join(f"{t}={f:g}" for t, f in sorted(type_factors.items()))
+        results[f"mix[{label}]"] = _run_setting(
+            model, tokenizer, model_key, f"MIXED {label} (others 1.0)",
             probes, mnt)
 
     print("\n================ SUMMARY ================")
