@@ -70,6 +70,7 @@ from dotenv import load_dotenv
 
 from config import (
     GPTOSS_ATTN_IMPLEMENTATION,
+    GPTOSS_MAX_NEW_TOKENS_ESCALATED,
     GPTOSS_REASONING_EFFORT,
     KUQ_PROMPT_TEMPLATE,
     LAYER_SLICE,
@@ -607,7 +608,16 @@ def generate_greedy(model, tokenizer, model_key: str, prompt: str,
                     max_new_tokens: int = 64) -> str:
     """One greedy completion. Handles base, instruct and harmony (gpt-oss) chat
     formats. For gpt-oss the raw channel output is parsed down to the committal
-    final answer only."""
+    final answer only.
+
+    gpt-oss escalation: the analysis (CoT) channel precedes the final answer
+    and occasionally exhausts the whole first-pass budget, leaving no
+    final-channel text. Rather than always decoding with a large cap, the
+    first pass runs at `max_new_tokens` and, if no final answer was produced,
+    is repeated ONCE at GPTOSS_MAX_NEW_TOKENS_ESCALATED. Greedy decoding is
+    deterministic, so the escalated pass replays the same analysis prefix and
+    simply allows it to finish.
+    """
     ids = _build_generation_input_ids(tokenizer, model_key, prompt)
     input_ids = torch.tensor([ids], dtype=torch.long)
 
@@ -615,24 +625,34 @@ def generate_greedy(model, tokenizer, model_key: str, prompt: str,
     input_ids = input_ids.to(device)
     attention_mask = torch.ones_like(input_ids)
 
-    with torch.no_grad():
-        out = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=1.0,
-            top_p=1.0,
-            pad_token_id=getattr(tokenizer, "pad_token_id", None) or
-                          getattr(tokenizer, "eos_token_id", 0),
-        )
-    new_tokens = out[0, input_ids.shape[1]:].tolist()
+    def _new_tokens(budget: int) -> list[int]:
+        with torch.no_grad():
+            out = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=budget,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                pad_token_id=getattr(tokenizer, "pad_token_id", None) or
+                              getattr(tokenizer, "eos_token_id", 0),
+            )
+        return out[0, input_ids.shape[1]:].tolist()
+
+    new_tokens = _new_tokens(max_new_tokens)
 
     if "gptoss" in model_key:
         # Decode WITH special tokens so the harmony channel markers survive for
         # parsing, then keep only the final-channel answer.
         decoded = tokenizer.decode(new_tokens, skip_special_tokens=False)
-        return parse_harmony_final(decoded)
+        final = parse_harmony_final(decoded)
+        if not final and max_new_tokens < GPTOSS_MAX_NEW_TOKENS_ESCALATED:
+            decoded = tokenizer.decode(
+                _new_tokens(GPTOSS_MAX_NEW_TOKENS_ESCALATED),
+                skip_special_tokens=False,
+            )
+            final = parse_harmony_final(decoded)
+        return final
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 

@@ -835,10 +835,10 @@ def parse_args() -> argparse.Namespace:
                         "Results go to <run>_scale<f> so full-strength results "
                         "are not overwritten.")
     p.add_argument("--max-new-tokens", type=int, default=None,
-                   help="Greedy decode cap. Default: per-model "
-                        "cfg.max_new_tokens_for (512 for gpt-oss so its harmony "
-                        "analysis channel does not exhaust the budget before the "
-                        "final answer; 64 otherwise).")
+                   help="First-pass greedy decode cap (default 64 for all "
+                        "models). gpt-oss escalates once to 1024 when the "
+                        "harmony analysis channel exhausts the first pass "
+                        "before a final answer appears.")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap rows per dataset (smoke test).")
     p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)

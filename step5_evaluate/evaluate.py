@@ -521,6 +521,12 @@ def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
                 attempt_failed = True
                 attempt_reason = attempt_reason or "empty completion"
                 label, raw = "ERROR", attempt_reason
+                # Greedy decoding is deterministic: a CLEAN empty completion
+                # (gpt-oss exhausting the budget inside the analysis channel,
+                # so no final-channel answer exists) is identical on every
+                # retry. Only generation exceptions are worth retrying.
+                if not attempt_reason.startswith("gen exception"):
+                    break
             else:
                 jp = judge_mod["build_judge_prompt"](
                     question=row["question"],
@@ -798,8 +804,9 @@ def parse_args() -> argparse.Namespace:
                         "Results are written to <run>_scale<f> so full-strength "
                         "results are not overwritten.")
     p.add_argument("--max-new-tokens", type=int, default=None,
-                   help="Greedy decode cap for the answerability eval "
-                        "(defaults per-model: larger for reasoning models).")
+                   help="First-pass greedy decode cap for the answerability "
+                        "eval (default 64). gpt-oss escalates once to 1024 "
+                        "when no final-channel answer was produced.")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap answerability eval to N rows per dataset (smoke).")
     p.add_argument("--datasets", nargs="+",

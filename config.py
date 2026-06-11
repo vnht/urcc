@@ -293,9 +293,12 @@ def lora_attn_targets(model_key: str) -> list[str] | str:
 # committal `final`-channel answer.
 GPTOSS_REASONING_EFFORT = "low"
 
-# Reasoning models burn part of the decode budget on the analysis channel before
-# the final answer appears, so they need a larger cap than the dense default.
-GPTOSS_MAX_NEW_TOKENS = 512
+# Reasoning models burn part of the decode budget on the analysis channel
+# before the final answer appears. Rather than always paying a large budget,
+# generation runs with the dense default (64) first and escalates ONCE to this
+# cap when no final-channel answer was produced (see _common.generate_greedy).
+# Keeps the common case ~8x cheaper while still recovering long-analysis rows.
+GPTOSS_MAX_NEW_TOKENS_ESCALATED = 1024
 
 # gpt-oss attention backend for GENERATION/eval/mining (training always uses
 # eager — see load_model_and_tokenizer). The model uses attention SINKS
@@ -314,10 +317,10 @@ GPTOSS_ATTN_IMPLEMENTATION = "eager"
 
 
 def max_new_tokens_for(model_key: str) -> int:
-    """Greedy-decode cap for a model: larger for reasoning models whose CoT
-    precedes the final answer."""
-    if model_key == "gptoss_instruct":
-        return GPTOSS_MAX_NEW_TOKENS
+    """First-pass greedy-decode cap for a model. gpt-oss uses the dense
+    default too: generate_greedy escalates to GPTOSS_MAX_NEW_TOKENS_ESCALATED
+    when the analysis channel exhausts the first-pass budget before a
+    final-channel answer appears."""
     return DEFAULT_MAX_NEW_TOKENS
 
 DEFAULT_LR              = 3e-5
