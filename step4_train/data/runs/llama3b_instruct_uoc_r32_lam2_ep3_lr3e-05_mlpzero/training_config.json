@@ -1,0 +1,58 @@
+{
+  "model_key": "llama3b_instruct",
+  "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+  "method": "UOC two-component (shared V, per-domain \u03bc\u207b forget pole, per-domain init_scale, frozen-base retain preservation, transition-window, best-step early-stop)",
+  "per_domain_poles": true,
+  "pole_domains": [
+    "kuq",
+    "squad"
+  ],
+  "retain_target": "frozen-base h(x, y; \u03b8_frozen)  (per-token, per-example) for both C and E",
+  "answer_window": "transition-shifted: [p_len-1, p_len+K-2]",
+  "subspace_rank": 32,
+  "lambda_retain": 2.0,
+  "epochs": 3,
+  "lr": 3e-05,
+  "weight_decay": 0.0,
+  "forget_batch": 4,
+  "retain_batch": 4,
+  "grad_accum": 4,
+  "checkpoint_every": 50,
+  "warmup_ratio": 0.03,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "lora_target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "up_proj",
+    "down_proj",
+    "gate_proj"
+  ],
+  "lora_target_parameters": null,
+  "moe_attn_lora": false,
+  "k_answer_tokens": 8,
+  "init_scales": {
+    "kuq": 66.2225,
+    "squad": 68.2603,
+    "general": 67.2414
+  },
+  "early_stop": true,
+  "early_stop_window": 5,
+  "early_stop_min_improvement": 0.0,
+  "forget_floor": 0.0,
+  "lora_exclude_last": 0,
+  "primary_adapter_source": "best",
+  "forget_examples": 2000,
+  "retain_examples": 3000,
+  "total_optim_steps": 375,
+  "pruned_from": "llama3b_instruct_uoc_r32_lam2_ep3_lr3e-05",
+  "pruned_lora_modules": [
+    "up_proj",
+    "down_proj",
+    "gate_proj"
+  ],
+  "pruned_tensor_count": 168
+}
