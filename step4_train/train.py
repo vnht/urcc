@@ -59,6 +59,7 @@ Run
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import json
 import math
@@ -81,6 +82,7 @@ from _common import (
     build_unanswerable_prompt,
     format_duration,
     forward_hidden_states,
+    generate_greedy,
     load_jsonl,
     load_model_and_tokenizer,
     log,
@@ -274,22 +276,6 @@ def _parse_lora_targets(spec: str) -> list[str] | None:
     return items or None
 
 
-# MLP projection names across the dense backbones we support (split SwiGLU +
-# phi4's fused gate_up). Used to derive an attention-only target set.
-_MLP_PROJ_NAMES = ("up_proj", "down_proj", "gate_proj", "gate_up_proj")
-
-
-def _attn_only_targets(model_key: str) -> list[str]:
-    """Attention-only LoRA targets for a dense model: the model's configured
-    dense targets minus the MLP projections. Keeps the backbone's actual
-    attention names (q/k/v/o, or phi4's fused qkv_proj) so the adapter can only
-    re-mix existing token information and never writes new residual-stream
-    content through the MLP — the path that enacts the EOS-suppression /
-    token-loop collapse on low-redundancy backbones (Llama-3B, Ministral-14B)."""
-    return [t for t in cfg.lora_dense_targets(model_key)
-            if t not in _MLP_PROJ_NAMES]
-
-
 def _num_text_layers(model) -> int:
     """Number of transformer layers in the (text) stack, multimodal-safe."""
     mcfg = model.config
@@ -398,6 +384,73 @@ def _mean_lora_delta_norm(model) -> float:
             fro2 = (AAt * BtB).sum()             # trace(AAt·BtB), both symmetric
             norms.append(s * float(fro2.clamp_min(0).sqrt()))
     return sum(norms) / len(norms) if norms else 0.0
+
+
+# ── Fluency probe (generation-quality early stop) ─────────────────────────────
+# The UOC loss is purely geometric (a projection distance over a K-token window),
+# so it has NO signal about free-running generation quality. On low-redundancy
+# backbones (Llama-3B, Ministral-14B) the loss minimum is a degenerate
+# repetition collapse: the adapter drives the supervised projection to ~0 but
+# wrecks the autoregressive continuation it was never trained on, so greedy
+# decoding falls into a '**'/'the the the' fixed point that never emits EOS.
+# This probe periodically free-runs the current adapter on a few held prompts
+# and measures that collapse directly, so training can stop at the last fluent
+# step. It is a STOPPING CRITERION only — the loss is unchanged.
+
+def _completion_is_degenerate(text: str) -> bool:
+    """True if a greedy completion shows the repetition-collapse signature: a
+    single whitespace token dominating (>40% of >=8 tokens) — the '** ** **' /
+    'the the the' loop that never terminates."""
+    ws = text.split()
+    if len(ws) < 8:
+        return False
+    top_count = max(collections.Counter(ws).values())
+    return top_count / len(ws) > 0.4
+
+
+def _build_fluency_probe(forget_data: list[dict], retain_data: list[dict],
+                         n: int) -> list[str]:
+    """A small, fixed prompt set for the fluency probe: half from the forget
+    pool (where collapse appears first) and half from answerable retain (to
+    catch the commit-case 'correct-prefix-then-loop' failure). Built once with a
+    fixed RNG so the probe is comparable across steps and runs."""
+    rng = random.Random(0)
+    half = max(1, n // 2)
+    prompts: list[str] = []
+    fk = [r for r in forget_data if r.get("__dataset__")]
+    for r in rng.sample(fk, min(half, len(fk))) if fk else []:
+        prompts.append(build_unanswerable_prompt(r["__dataset__"], r))
+    ans = [r for r in retain_data if r.get("__type__") == "answerable"
+           and r.get("__dataset__")]
+    for r in rng.sample(ans, min(n - len(prompts), len(ans))) if ans else []:
+        prompts.append(build_answerable_prompt(r["__dataset__"], r))
+    return [p for p in prompts if p and p.strip()]
+
+
+@torch.no_grad()
+def _fluency_degeneration_rate(model, tokenizer, model_key: str,
+                               probe_prompts: list[str],
+                               max_new_tokens: int) -> float:
+    """Fraction of probe prompts whose greedy completion is degenerate. Runs
+    with adapters enabled in eval mode, then restores training mode."""
+    if not probe_prompts:
+        return 0.0
+    was_training = model.training
+    model.eval()
+    deg = 0
+    try:
+        for p in probe_prompts:
+            try:
+                txt = generate_greedy(model, tokenizer, model_key, p,
+                                      max_new_tokens=max_new_tokens)
+            except Exception:
+                continue
+            if _completion_is_degenerate(txt):
+                deg += 1
+    finally:
+        if was_training:
+            model.train()
+    return deg / len(probe_prompts)
 
 
 # ── Loss components (always the same operation: ‖ Vᵀ(h - target) ‖²) ───────────
@@ -710,16 +763,6 @@ def train(args: argparse.Namespace) -> None:
     log.info("Run name: %s", run_name)
     log.info("Output dir: %s", out_dir)
 
-    # Resolve the dense LoRA target override (attention-only convenience flag or
-    # an explicit --lora-targets list). None ⇒ use the per-model config default.
-    if args.lora_attn_only and args.lora_targets:
-        raise SystemExit("--lora-attn-only and --lora-targets are mutually exclusive")
-    if args.lora_attn_only:
-        dense_target_override = _attn_only_targets(model_key)
-        log.info("  LoRA attention-only: %s", dense_target_override)
-    else:
-        dense_target_override = _parse_lora_targets(args.lora_targets)
-
     # Model + LoRA (resume from checkpoint adapter if present)
     ckpt_state = _load_checkpoint_if_any(out_dir)
     resume = ckpt_state is not None
@@ -735,7 +778,7 @@ def train(args: argparse.Namespace) -> None:
         model = _apply_lora(model, model_key, moe_attn_lora=args.moe_attn_lora,
                             lora_alpha=args.lora_alpha,
                             exclude_last=args.lora_exclude_last,
-                            target_modules=dense_target_override)
+                            target_modules=_parse_lora_targets(args.lora_targets))
     model.train()
 
     # Fused-expert MoE LoRA (gpt-oss): PEFT's ParamWrapper materializes the full
@@ -849,6 +892,15 @@ def train(args: argparse.Namespace) -> None:
     skipped_steps = 0  # count optim steps to skip during resume warm-up
     done = False       # set once optim_step reaches total_optim_steps
 
+    # Fluency probe set (generation-quality early stop). Fixed across steps.
+    fluency_prompts = (_build_fluency_probe(forget_data, retain_data,
+                                            args.fluency_probe_size)
+                       if args.fluency_stop else [])
+    if args.fluency_stop:
+        log.info("  fluency-stop ON: probe_size=%d  every=%d steps  "
+                 "threshold=%.2f", len(fluency_prompts), args.fluency_every,
+                 args.fluency_threshold)
+
     for ep in range(args.epochs):
         random.shuffle(forget_data)
         f_pos = 0
@@ -864,13 +916,13 @@ def train(args: argparse.Namespace) -> None:
                 model_key=model_key, V_layers=V_layers,
                 layer_indices=layer_indices, mu_minus_per=mu_minus_per,
                 init_scales=init_scales,
-                k_answer_tokens=cfg.K_ANSWER_TOKENS,
+                k_answer_tokens=args.k_forget,
             )
             l_retain, _rinfo = _compute_retain_loss(
                 model=model, batch=retain_batch, tokenizer=tokenizer,
                 model_key=model_key, V_layers=V_layers,
                 layer_indices=layer_indices, init_scales=init_scales,
-                k_answer_tokens=cfg.K_ANSWER_TOKENS,
+                k_answer_tokens=args.k_retain,
             )
 
             l_total = l_forget + args.lambda_retain * l_retain
@@ -931,7 +983,8 @@ def train(args: argparse.Namespace) -> None:
                 # to disk on tiny numerical fluctuations.
                 loss_window.append(avg_total)
                 new_best = False
-                if args.early_stop and len(loss_window) >= loss_window.maxlen:
+                if (args.early_stop and not args.fluency_stop
+                        and len(loss_window) >= loss_window.maxlen):
                     smoothed = sum(loss_window) / len(loss_window)
                     threshold = best_smoothed_loss * (1.0 - args.early_stop_min_improvement)
                     if smoothed < threshold:
@@ -959,6 +1012,34 @@ def train(args: argparse.Namespace) -> None:
                     best_smoothed_loss = sum(loss_window) / len(loss_window)
                     _save_adapter_snapshot(out_dir / BEST_SUBDIR, model)
                     done = True
+
+                # Fluency probe — free-run the current adapter on the held probe
+                # set and stop at the last fluent step. Selects when to stop and
+                # which snapshot to promote; the loss is untouched.
+                if (args.fluency_stop and not done and fluency_prompts
+                        and optim_step % max(args.fluency_every, 1) == 0):
+                    deg_rate = _fluency_degeneration_rate(
+                        model, tokenizer, model_key, fluency_prompts,
+                        max_new_tokens=cfg.max_new_tokens_for(model_key),
+                    )
+                    if deg_rate <= args.fluency_threshold:
+                        best_step_recorded = optim_step
+                        best_smoothed_loss = (sum(loss_window) / len(loss_window)
+                                              if loss_window else avg_total)
+                        _save_adapter_snapshot(out_dir / BEST_SUBDIR, model)
+                        log.info("  fluency probe @ step %d: deg=%.0f%% <= "
+                                 "%.0f%% (fluent — snapshot saved)", optim_step,
+                                 100 * deg_rate, 100 * args.fluency_threshold)
+                    elif best_step_recorded > 0:
+                        log.info("  fluency probe @ step %d: deg=%.0f%% > %.0f%% "
+                                 "(collapse onset — stopping; promoting last "
+                                 "fluent step %d)", optim_step, 100 * deg_rate,
+                                 100 * args.fluency_threshold, best_step_recorded)
+                        done = True
+                    else:
+                        log.warning("  fluency probe @ step %d: deg=%.0f%% but no "
+                                    "fluent snapshot yet — continuing", optim_step,
+                                    100 * deg_rate)
 
                 progress.tick(extras={
                     "ep":   ep + 1,
@@ -1020,11 +1101,12 @@ def train(args: argparse.Namespace) -> None:
         tokenizer.save_pretrained(out_dir)
 
     promoted_source = "final"
-    if args.early_stop and best_step_recorded > 0 and (out_dir / BEST_SUBDIR).exists():
+    if ((args.early_stop or args.fluency_stop) and best_step_recorded > 0
+            and (out_dir / BEST_SUBDIR).exists()):
         log.info("Promoting BEST adapter (step %d, smoothed L_total=%.4f) "
                  "to primary at %s", best_step_recorded, best_smoothed_loss, out_dir)
         _promote_adapter(out_dir / BEST_SUBDIR, out_dir)
-        promoted_source = "best"
+        promoted_source = "best" if not args.fluency_stop else "fluent"
     else:
         log.info("Promoting FINAL-step adapter to primary at %s "
                  "(early_stop=%s, best_step=%d)",
@@ -1058,17 +1140,21 @@ def train(args: argparse.Namespace) -> None:
             (["q_proj", "k_proj", "v_proj", "o_proj"] if args.moe_attn_lora
              else cfg.lora_attn_targets(model_key))
             if cfg.lora_target_parameters(model_key)
-            else (dense_target_override
+            else (_parse_lora_targets(args.lora_targets)
                   or cfg.lora_dense_targets(model_key))),
         "lora_target_parameters": cfg.lora_target_parameters(model_key),
-        "lora_attn_only": bool(args.lora_attn_only),
         "moe_attn_lora": bool(args.moe_attn_lora),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
+        "k_forget":         int(args.k_forget),
+        "k_retain":         int(args.k_retain),
         "init_scales":      {k: round(float(v), 4) for k, v in init_scales.items()},
         "early_stop":                  bool(args.early_stop),
         "early_stop_window":           int(args.early_stop_window),
         "early_stop_min_improvement":  float(args.early_stop_min_improvement),
         "forget_floor":                float(args.forget_floor),
+        "fluency_stop":                bool(args.fluency_stop),
+        "fluency_every":               int(args.fluency_every),
+        "fluency_threshold":           float(args.fluency_threshold),
         "lora_exclude_last":           int(args.lora_exclude_last),
         "primary_adapter_source":      promoted_source,   # "best" or "final"
         "forget_examples":  len(forget_data),
@@ -1151,6 +1237,27 @@ def parse_args() -> argparse.Namespace:
                         "loss minimum, whose optimum is repetition collapse on "
                         "low-redundancy backbones (e.g. Ministral). The "
                         "floor-step adapter is promoted as the primary.")
+    p.add_argument("--fluency-stop", action="store_true",
+                   help="Generation-quality early stop. Periodically free-runs "
+                        "the current adapter on a held probe set and stops at the "
+                        "last fluent step, promoting that snapshot as primary. "
+                        "The UOC loss is purely geometric and has no signal about "
+                        "free-running generation, so its minimum is the "
+                        "repetition-collapse on low-redundancy backbones "
+                        "(Llama-3B, Ministral-14B); this halts the squeeze the "
+                        "moment greedy decoding starts to collapse. Stopping "
+                        "criterion only — the loss is unchanged. Takes over "
+                        "best-snapshot selection from --early-stop when set.")
+    p.add_argument("--fluency-every", type=int, default=25,
+                   help="Run the fluency probe every N optim steps "
+                        "(default: 25). Only used with --fluency-stop.")
+    p.add_argument("--fluency-threshold", type=float, default=0.25,
+                   help="Stop once the fraction of probe completions that show "
+                        "the repetition-collapse signature exceeds this "
+                        "(default: 0.25). Only used with --fluency-stop.")
+    p.add_argument("--fluency-probe-size", type=int, default=8,
+                   help="Number of held prompts in the fluency probe (half "
+                        "forget, half answerable-retain). Default: 8.")
     p.add_argument("--lora-targets", type=str, default="",
                    help="Dense models: comma-separated override of LoRA "
                         "target_modules (default: cfg.LORA_TARGET_MODULES). "
@@ -1159,16 +1266,24 @@ def parse_args() -> argparse.Namespace:
                         "information instead of writing new residual-stream "
                         "content via MLP, which is what enacts token-loop "
                         "collapse. Pair with --tag.")
-    p.add_argument("--lora-attn-only", action="store_true",
-                   help="Dense models: attach LoRA to attention only (drop the "
-                        "MLP up/down/gate projections), derived from the model's "
-                        "configured dense targets. Convenience equivalent of "
-                        "--lora-targets q_proj,k_proj,v_proj,o_proj that also "
-                        "handles fused backbones (phi4). This removes the MLP "
-                        "residual-stream write path that breaks EOS / enacts the "
-                        "'**'-token repetition collapse on Llama-3B / Ministral-14B "
-                        "while keeping the attention LoRA that carries the "
-                        "abstain-vs-commit decision. Pair with --tag.")
+    p.add_argument("--k-forget", type=int, default=cfg.K_ANSWER_TOKENS,
+                   help="Number of answer-token positions the FORGET loss pulls "
+                        "toward the single abstain pole μ⁻ (window starts at the "
+                        "prompt-final decision residual). Default: "
+                        f"{cfg.K_ANSWER_TOKENS}. Pulling many consecutive "
+                        "positions onto ONE fixed point collapses their "
+                        "representational variance, which decodes as a repetition "
+                        "loop on low-redundancy backbones (Llama-3B, Ministral-14B). "
+                        "Set small (e.g. 1-2) to shift the abstain/commit DECISION "
+                        "without overwriting the answer span — the model then "
+                        "generates its own abstention text. Pair with --tag.")
+    p.add_argument("--k-retain", type=int, default=cfg.K_ANSWER_TOKENS,
+                   help="Number of answer-token positions the RETAIN loss anchors "
+                        "to the per-token frozen-base reference. Default: "
+                        f"{cfg.K_ANSWER_TOKENS}. The frozen-base target is "
+                        "per-token (no collapse), so this can be widened to "
+                        "protect more of the answerable/general continuation "
+                        "against drift. Pair with --tag.")
     p.add_argument("--lora-exclude-last", type=int, default=0,
                    help="Dense models: exclude the last N transformer layers "
                         "from LoRA (layers_to_transform). Use when the "
