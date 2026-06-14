@@ -274,6 +274,22 @@ def _parse_lora_targets(spec: str) -> list[str] | None:
     return items or None
 
 
+# MLP projection names across the dense backbones we support (split SwiGLU +
+# phi4's fused gate_up). Used to derive an attention-only target set.
+_MLP_PROJ_NAMES = ("up_proj", "down_proj", "gate_proj", "gate_up_proj")
+
+
+def _attn_only_targets(model_key: str) -> list[str]:
+    """Attention-only LoRA targets for a dense model: the model's configured
+    dense targets minus the MLP projections. Keeps the backbone's actual
+    attention names (q/k/v/o, or phi4's fused qkv_proj) so the adapter can only
+    re-mix existing token information and never writes new residual-stream
+    content through the MLP — the path that enacts the EOS-suppression /
+    token-loop collapse on low-redundancy backbones (Llama-3B, Ministral-14B)."""
+    return [t for t in cfg.lora_dense_targets(model_key)
+            if t not in _MLP_PROJ_NAMES]
+
+
 def _num_text_layers(model) -> int:
     """Number of transformer layers in the (text) stack, multimodal-safe."""
     mcfg = model.config
@@ -694,6 +710,16 @@ def train(args: argparse.Namespace) -> None:
     log.info("Run name: %s", run_name)
     log.info("Output dir: %s", out_dir)
 
+    # Resolve the dense LoRA target override (attention-only convenience flag or
+    # an explicit --lora-targets list). None ⇒ use the per-model config default.
+    if args.lora_attn_only and args.lora_targets:
+        raise SystemExit("--lora-attn-only and --lora-targets are mutually exclusive")
+    if args.lora_attn_only:
+        dense_target_override = _attn_only_targets(model_key)
+        log.info("  LoRA attention-only: %s", dense_target_override)
+    else:
+        dense_target_override = _parse_lora_targets(args.lora_targets)
+
     # Model + LoRA (resume from checkpoint adapter if present)
     ckpt_state = _load_checkpoint_if_any(out_dir)
     resume = ckpt_state is not None
@@ -709,7 +735,7 @@ def train(args: argparse.Namespace) -> None:
         model = _apply_lora(model, model_key, moe_attn_lora=args.moe_attn_lora,
                             lora_alpha=args.lora_alpha,
                             exclude_last=args.lora_exclude_last,
-                            target_modules=_parse_lora_targets(args.lora_targets))
+                            target_modules=dense_target_override)
     model.train()
 
     # Fused-expert MoE LoRA (gpt-oss): PEFT's ParamWrapper materializes the full
@@ -1032,9 +1058,10 @@ def train(args: argparse.Namespace) -> None:
             (["q_proj", "k_proj", "v_proj", "o_proj"] if args.moe_attn_lora
              else cfg.lora_attn_targets(model_key))
             if cfg.lora_target_parameters(model_key)
-            else (_parse_lora_targets(args.lora_targets)
+            else (dense_target_override
                   or cfg.lora_dense_targets(model_key))),
         "lora_target_parameters": cfg.lora_target_parameters(model_key),
+        "lora_attn_only": bool(args.lora_attn_only),
         "moe_attn_lora": bool(args.moe_attn_lora),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
         "init_scales":      {k: round(float(v), 4) for k, v in init_scales.items()},
@@ -1132,6 +1159,16 @@ def parse_args() -> argparse.Namespace:
                         "information instead of writing new residual-stream "
                         "content via MLP, which is what enacts token-loop "
                         "collapse. Pair with --tag.")
+    p.add_argument("--lora-attn-only", action="store_true",
+                   help="Dense models: attach LoRA to attention only (drop the "
+                        "MLP up/down/gate projections), derived from the model's "
+                        "configured dense targets. Convenience equivalent of "
+                        "--lora-targets q_proj,k_proj,v_proj,o_proj that also "
+                        "handles fused backbones (phi4). This removes the MLP "
+                        "residual-stream write path that breaks EOS / enacts the "
+                        "'**'-token repetition collapse on Llama-3B / Ministral-14B "
+                        "while keeping the attention LoRA that carries the "
+                        "abstain-vs-commit decision. Pair with --tag.")
     p.add_argument("--lora-exclude-last", type=int, default=0,
                    help="Dense models: exclude the last N transformer layers "
                         "from LoRA (layers_to_transform). Use when the "
