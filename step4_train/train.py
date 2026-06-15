@@ -684,6 +684,89 @@ def _promote_adapter(src: Path, out_dir: Path) -> None:
             shutil.copy2(sp, out_dir / fname)
 
 
+# MLP "write-path" module names per dense backbone. These are the projections
+# that synthesise *new* residual-stream content (vs attention, which only
+# re-mixes existing token information). On low-redundancy backbones (Llama-3B,
+# Ministral-14B) the geometric forget loss is satisfied by an MLP write that
+# also corrupts the decode path, which is what enacts the repetition-/empty-
+# completion collapse — even though μ⁻ is a fluent-refusal pole. Zeroing these
+# LoRA deltas at export reproduces the validated "Full LoRA + zero MLP at
+# inference" fix without touching the loss.
+_MLP_WRITE_MODULES: dict[str, list[str]] = {
+    "phi4_instruct": ["gate_up_proj", "down_proj"],
+}
+_MLP_WRITE_MODULES_DEFAULT = ["gate_proj", "up_proj", "down_proj"]
+
+
+def _resolve_prune_modules(spec: str, model_key: str) -> list[str]:
+    """Expand the ``--export-prune`` spec into concrete LoRA module names.
+
+    ``"mlp"`` expands to the backbone's MLP write-path projections; any other
+    value is treated as a comma-separated explicit module list. Empty -> []."""
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    if spec.lower() == "mlp":
+        return list(_MLP_WRITE_MODULES.get(model_key, _MLP_WRITE_MODULES_DEFAULT))
+    return [m.strip() for m in spec.split(",") if m.strip()]
+
+
+def prune_lora_modules(adapter_dir: Path, module_names: list[str]) -> list[str]:
+    """Public alias for :func:`_prune_lora_modules` (used by export_prune.py)."""
+    return _prune_lora_modules(adapter_dir, module_names)
+
+
+def _prune_lora_modules(adapter_dir: Path, module_names: list[str]) -> list[str]:
+    """Zero the LoRA delta for the given module types in a saved adapter.
+
+    Edits ``adapter_dir/adapter_model.safetensors`` in place: every ``lora_A``/
+    ``lora_B`` tensor whose key contains one of ``module_names`` (as a dotted
+    path component, e.g. ``...mlp.down_proj.lora_B.weight``) is set to zero, so
+    that module's effective delta ``(α/r)·B·A`` becomes 0 while the tensor
+    shapes — and therefore PEFT load compatibility — are preserved. This is a
+    pure post-training adapter edit; it does not change the UOC loss.
+
+    Returns the sorted list of module names that were actually matched.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    if not module_names:
+        return []
+    sft = adapter_dir / "adapter_model.safetensors"
+    if not sft.exists():
+        raise FileNotFoundError(f"No adapter_model.safetensors in {adapter_dir}")
+
+    tensors: dict[str, torch.Tensor] = {}
+    metadata: dict[str, str] = {}
+    with safe_open(str(sft), framework="pt") as f:  # type: ignore[no-untyped-call]
+        md = f.metadata()
+        if md:
+            metadata.update(md)
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+
+    matched: set[str] = set()
+    for key, t in tensors.items():
+        if "lora_" not in key:
+            continue
+        for name in module_names:
+            if f".{name}." in key:
+                tensors[key] = torch.zeros_like(t)
+                matched.add(name)
+                break
+
+    if not matched:
+        log.warning("  --export-prune: none of %s matched adapter keys; "
+                    "nothing zeroed", module_names)
+        return []
+
+    save_file(tensors, str(sft), metadata=metadata or {"format": "pt"})
+    log.info("  --export-prune: zeroed LoRA delta for modules %s in %s",
+             sorted(matched), sft.name)
+    return sorted(matched)
+
+
 def _save_checkpoint(out_dir: Path, model, optimizer, scheduler,
                      step: int, summary_initial: dict,
                      loss_window: deque, best_smoothed_loss: float,
@@ -758,6 +841,10 @@ def train(args: argparse.Namespace) -> None:
     )
     if args.tag:
         run_name = f"{run_name}_{args.tag}"
+    if _resolve_prune_modules(args.export_prune, model_key):
+        # Keep pruned-primary runs in their own dir so they never clobber a
+        # full-adapter run that shares the same hyper-params.
+        run_name = f"{run_name}_prune"
     out_dir = cfg.RUNS_DIR / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Run name: %s", run_name)
@@ -1113,6 +1200,16 @@ def train(args: argparse.Namespace) -> None:
                  out_dir, args.early_stop, best_step_recorded)
         _promote_adapter(out_dir / FINAL_SUBDIR, out_dir)
 
+    # Optional save-time prune: zero selected LoRA module deltas in the PRIMARY
+    # adapter only. The full (unpruned) adapter stays in _final/ and _best/ for
+    # diagnostics, so this is reversible by re-promoting a snapshot. Loss is
+    # unchanged — this is the validated "zero MLP write path" fix applied at
+    # export instead of at inference.
+    pruned_modules: list[str] = []
+    prune_targets = _resolve_prune_modules(args.export_prune, model_key)
+    if prune_targets:
+        pruned_modules = _prune_lora_modules(out_dir, prune_targets)
+
     (out_dir / "training_config.json").write_text(json.dumps({
         "model_key":        model_key,
         "model_id":         cfg.MODEL_REGISTRY[model_key],
@@ -1156,6 +1253,7 @@ def train(args: argparse.Namespace) -> None:
         "fluency_every":               int(args.fluency_every),
         "fluency_threshold":           float(args.fluency_threshold),
         "lora_exclude_last":           int(args.lora_exclude_last),
+        "export_pruned_modules":       pruned_modules,    # LoRA module deltas zeroed in primary
         "primary_adapter_source":      promoted_source,   # "best" or "final"
         "forget_examples":  len(forget_data),
         "retain_examples":  len(retain_data),
@@ -1290,6 +1388,19 @@ def parse_args() -> argparse.Namespace:
                         "final-layer edits enact the repetition collapse "
                         "(confirm first with diagnose_adapter.py "
                         "--ablate-last). Pair with --tag.")
+    p.add_argument("--export-prune", type=str, default="",
+                   help="Zero selected LoRA module deltas in the PRIMARY "
+                        "adapter at save time (the full adapter is kept in "
+                        "_final/ and _best/). 'mlp' expands to the backbone's "
+                        "MLP write-path projections (gate/up/down_proj); or "
+                        "pass an explicit comma list (e.g. "
+                        "'down_proj'). Reproduces the validated 'Full LoRA + "
+                        "zero MLP at inference' fix at export — the MLP write "
+                        "path is what enacts the repetition/empty-completion "
+                        "collapse on low-redundancy backbones (Llama-3B, "
+                        "Ministral-14B) even though μ⁻ is a fluent-refusal "
+                        "pole. The UOC loss is unchanged. Run dir is suffixed "
+                        "'_prune' so it never clobbers a full-adapter run.")
     p.add_argument("--dry-run",      action="store_true")
     p.add_argument("--tag", type=str, default="",
                    help="Optional suffix appended to the run name (e.g. "
