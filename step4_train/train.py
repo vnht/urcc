@@ -472,15 +472,76 @@ def _project_to_pole(
     return (proj ** 2).sum(dim=-1).mean()
 
 
+def _abstain_trajectory(
+    *, model, prompt: str, ds: str, tokenizer, model_key: str,
+    layer_indices, k_answer_tokens: int,
+) -> tuple[list[torch.Tensor], int] | None:
+    """Per-position frozen-base abstain target for L_forget (trajectory mode).
+
+    Runs the frozen base (adapters disabled) on (unanswerable prompt + the
+    canonical fluent refusal for ``ds``) and returns, per layer, the hidden
+    states over the K-token abstain window — a *position-varying* target
+    trajectory rather than a single collapsed pole. The prompt-final state
+    (window position 0) is shared with the over-commit forward because
+    ``prompt_len`` does not depend on the appended answer, so the windows
+    align position-by-position.
+
+    Returns (targets_per_layer, n_abstain_tokens) or None if it can't build a
+    usable window. ``targets_per_layer[li]`` has shape (n_abstain_tokens, D).
+    """
+    abstain_text = cfg.abstain_template_for(ds)
+    if not abstain_text.strip():
+        return None
+    try:
+        abs_ids_list, abs_p_len, abs_n = tokenise_prompt_plus_answer(
+            tokenizer, model_key, prompt, abstain_text,
+            k_answer_tokens=k_answer_tokens,
+        )
+    except Exception:
+        return None
+    if abs_n == 0 or abs_p_len < 1:
+        return None
+
+    abs_ids = torch.tensor([abs_ids_list], dtype=torch.long)
+    model.eval()
+    model.disable_adapter_layers()
+    with torch.no_grad():
+        _, abs_hiddens = forward_hidden_states(model, abs_ids, layer_indices)
+    model.enable_adapter_layers()
+    model.train()
+
+    s = abs_p_len - 1
+    targets = [h[0, s:s + abs_n, :].detach() for h in abs_hiddens]
+    return targets, abs_n
+
+
 def _compute_forget_loss(
     *, model, batch: list[dict], tokenizer, model_key: str,
     V_layers, layer_indices, mu_minus_per: dict,
     init_scales: dict[str, float], k_answer_tokens: int,
+    forget_traj: bool = False,
 ) -> tuple[torch.Tensor, dict]:
-    """L_forget — pull category-A activations toward μ⁻(d) along V, where d is
-    the example's source dataset (kuq | squad). Each example is divided by
-    ``init_scales[d]`` so KUQ and SQuAD contribute on the same O(1) scale at
-    step 0 regardless of their domain-specific contrast magnitude."""
+    """L_forget — pull category-A activations toward the legitimate-abstention
+    region along V, where the source dataset d (kuq | squad) selects the
+    target. Each example is divided by ``init_scales[d]`` so KUQ and SQuAD
+    contribute on the same O(1) scale at step 0 regardless of their
+    domain-specific contrast magnitude.
+
+    Two target modes (the loss operation ‖Vᵀ(hₜ − targetₜ)‖² is identical in
+    both — only the *shape* of the target changes):
+
+      * pole (default, legacy): a single position-collapsed centroid μ⁻(d) is
+        subtracted from every position in the K-token window. With K>1 this
+        clamps all consecutive answer positions onto one identical point in V,
+        which destroys positional variance and degenerates generation on
+        low-redundancy backbones (Llama-3B, Ministral).
+
+      * trajectory (forget_traj=True): each window position is pulled toward
+        the frozen-base abstain trajectory at the *corresponding* position
+        (see ``_abstain_trajectory``). Distinct targets per position remove the
+        constancy constraint, so K>1 stays fluent while supervising every
+        position — mirroring how L_retain already uses a per-token target.
+    """
     total = torch.tensor(0.0, requires_grad=True)
     layer_norms: list[float] = []
     n_used = 0
@@ -495,6 +556,18 @@ def _compute_forget_loss(
         answer = r.get("y_com_prefix_k8") or r.get("full_completion_clean") or ""
         if not prompt.strip() or not answer.strip():
             continue
+
+        traj_targets = None
+        if forget_traj:
+            traj = _abstain_trajectory(
+                model=model, prompt=prompt, ds=ds, tokenizer=tokenizer,
+                model_key=model_key, layer_indices=layer_indices,
+                k_answer_tokens=k_answer_tokens,
+            )
+            if traj is None:
+                continue
+            traj_targets, abs_n = traj
+
         try:
             full_ids, p_len, n_ans = tokenise_prompt_plus_answer(
                 tokenizer, model_key, prompt, answer, k_answer_tokens=k_answer_tokens,
@@ -504,18 +577,31 @@ def _compute_forget_loss(
         if n_ans == 0:
             continue
 
-        ids = torch.tensor([full_ids], dtype=torch.long)
-        _, hiddens = forward_hidden_states(model, ids, layer_indices)
-
         # Window starts at p_len - 1 (prompt-final state) so the loss anchors
         # the first-token-decision residual stream.
         if p_len < 1:
             continue
-        span = (p_len - 1, p_len - 1 + n_ans)
+
+        if forget_traj:
+            # Align the over-commit and abstain windows position-by-position.
+            m = min(n_ans, abs_n)
+            if m == 0:
+                continue
+            span = (p_len - 1, p_len - 1 + m)
+        else:
+            span = (p_len - 1, p_len - 1 + n_ans)
+
+        ids = torch.tensor([full_ids], dtype=torch.long)
+        _, hiddens = forward_hidden_states(model, ids, layer_indices)
+
         per_ex = torch.tensor(0.0, requires_grad=True)
         for li, h in enumerate(hiddens):
+            if forget_traj:
+                target = traj_targets[li][:m, :]
+            else:
+                target = mu_minus[li]
             l_loss = _project_to_pole(
-                h, span, V_layers[li], mu_minus[li],
+                h, span, V_layers[li], target,
             )
             per_ex = per_ex + l_loss
             layer_norms.append(float(l_loss.detach().sqrt()))
@@ -839,6 +925,8 @@ def train(args: argparse.Namespace) -> None:
         f"{model_key}_uoc_r{args.rank}"
         f"_lam{args.lambda_retain:g}_ep{args.epochs}_lr{args.lr:.0e}"
     )
+    if args.forget_traj:
+        run_name = f"{run_name}_ftraj"
     if args.tag:
         run_name = f"{run_name}_{args.tag}"
     if _resolve_prune_modules(args.export_prune, model_key):
@@ -1004,6 +1092,7 @@ def train(args: argparse.Namespace) -> None:
                 layer_indices=layer_indices, mu_minus_per=mu_minus_per,
                 init_scales=init_scales,
                 k_answer_tokens=args.k_forget,
+                forget_traj=args.forget_traj,
             )
             l_retain, _rinfo = _compute_retain_loss(
                 model=model, batch=retain_batch, tokenizer=tokenizer,
@@ -1243,6 +1332,9 @@ def train(args: argparse.Namespace) -> None:
         "moe_attn_lora": bool(args.moe_attn_lora),
         "k_answer_tokens":  cfg.K_ANSWER_TOKENS,
         "k_forget":         int(args.k_forget),
+        "forget_traj":      bool(args.forget_traj),
+        "forget_target":    ("per-position frozen-base abstain trajectory"
+                             if args.forget_traj else "single collapsed pole μ⁻"),
         "k_retain":         int(args.k_retain),
         "init_scales":      {k: round(float(v), 4) for k, v in init_scales.items()},
         "early_stop":                  bool(args.early_stop),
@@ -1374,7 +1466,20 @@ def parse_args() -> argparse.Namespace:
                         "loop on low-redundancy backbones (Llama-3B, Ministral-14B). "
                         "Set small (e.g. 1-2) to shift the abstain/commit DECISION "
                         "without overwriting the answer span — the model then "
-                        "generates its own abstention text. Pair with --tag.")
+                        "generates its own abstention text. Pair with --tag. "
+                        "Use --forget-traj to widen K without the collapse.")
+    p.add_argument("--forget-traj", action="store_true",
+                   help="FORGET target = per-position frozen-base abstain "
+                        "trajectory instead of the single collapsed pole μ⁻. "
+                        "Each answer position is pulled toward the corresponding "
+                        "position of the canonical refusal's frozen-base "
+                        "residual stream, so consecutive positions get DISTINCT "
+                        "targets. This removes the variance-collapse that makes "
+                        "--k-forget>1 degenerate on low-redundancy backbones "
+                        "(Llama-3B, Ministral), letting you supervise the full "
+                        "K-token window fluently. The loss operation is "
+                        "unchanged (same ‖Vᵀ(h−target)‖²); only the target's "
+                        "shape changes, mirroring L_retain's per-token target.")
     p.add_argument("--k-retain", type=int, default=cfg.K_ANSWER_TOKENS,
                    help="Number of answer-token positions the RETAIN loss anchors "
                         "to the per-token frozen-base reference. Default: "
