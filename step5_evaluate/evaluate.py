@@ -425,7 +425,8 @@ def _build_answerability_record(rows: list[dict], judge_mod: dict, model_key: st
 def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
                                out_dir: Path, dataset: str, judge_mod: dict,
                                baseline_dir: Path | None) -> dict | None:
-    eval_path = cfg.heldout_path(dataset)
+    heldout_dir = getattr(args, "heldout_dir", None) or cfg.HELDOUT_DIR
+    eval_path = heldout_dir / f"{dataset}.jsonl"
     if not eval_path.exists():
         log.warning("  [%s] eval pool missing: %s — skipping", dataset, eval_path)
         return None
@@ -607,7 +608,8 @@ def _build_ppl_record(rows: list[dict], model_key: str, result_name: str,
 
 def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
                        out_dir: Path, baseline_dir: Path | None) -> dict | None:
-    eval_path = cfg.heldout_path("ultrachat")
+    heldout_dir = getattr(args, "heldout_dir", None) or cfg.HELDOUT_DIR
+    eval_path = heldout_dir / "ultrachat.jsonl"
     if not eval_path.exists():
         log.warning("  [ultrachat] held-out missing: %s — skipping", eval_path)
         return None
@@ -814,6 +816,10 @@ def parse_args() -> argparse.Namespace:
                         "when no final-channel answer was produced.")
     p.add_argument("--max-per-dataset", type=int, default=None,
                    help="Cap answerability eval to N rows per dataset (smoke).")
+    p.add_argument("--heldout-dir", type=Path, default=cfg.HELDOUT_DIR,
+                   help="Directory containing held-out JSONL pools "
+                        "(default: step5_evaluate/data/heldout). "
+                        "Pass step5_evaluate/data2/heldout to use the data2 workspace.")
     p.add_argument("--datasets", nargs="+",
                    choices=list(cfg.DOMAIN_OF.keys()),
                    default=["kuq", "squad"],
