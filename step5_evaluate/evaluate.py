@@ -425,7 +425,7 @@ def _build_answerability_record(rows: list[dict], judge_mod: dict, model_key: st
 def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
                                out_dir: Path, dataset: str, judge_mod: dict,
                                baseline_dir: Path | None) -> dict | None:
-    eval_path = cfg.heldout_path(dataset)
+    eval_path = args.heldout_dir / f"{dataset}.jsonl"
     if not eval_path.exists():
         log.warning("  [%s] eval pool missing: %s — skipping", dataset, eval_path)
         return None
@@ -616,7 +616,7 @@ def _build_ppl_record(rows: list[dict], model_key: str, result_name: str,
 
 def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
                        out_dir: Path, baseline_dir: Path | None) -> dict | None:
-    eval_path = cfg.heldout_path("ultrachat")
+    eval_path = args.heldout_dir / "ultrachat.jsonl"
     if not eval_path.exists():
         log.warning("  [ultrachat] held-out missing: %s — skipping", eval_path)
         return None
@@ -828,7 +828,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--baseline", type=Path, default=None,
                    help="Baseline RESULTS DIRECTORY for delta comparison "
                         "(e.g. step5_evaluate/data/results/baseline_qwen_instruct).")
-    return p.parse_args()
+    p.add_argument("--heldout-dir", type=Path, default=cfg.HELDOUT_DIR,
+                   help="Directory containing held-out JSONL pools "
+                        "(default: step5_evaluate/data/heldout). "
+                        "Pass step5_evaluate/data2/heldout to use the data2 workspace.")
+    args = p.parse_args()
+    args.heldout_dir = args.heldout_dir.resolve()
+    return args
 
 
 def main() -> None:
