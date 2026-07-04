@@ -438,6 +438,15 @@ def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
 
     prior = _load_dataset_json(out_path) or {}
     rows: list[dict] = list(prior.get("rows") or [])
+
+    # Trim rows to the current pool (handles pool shrinking or heldout changes).
+    pool_ids = {r.get("id") for r in pool}
+    if rows and any(r.get("id") not in pool_ids for r in rows):
+        before = len(rows)
+        rows = [r for r in rows if r.get("id") in pool_ids]
+        log.info("  [%s] pool changed: trimmed result rows %d → %d",
+                 dataset, before, len(rows))
+
     done_ids = {
         r.get("id") for r in rows
         if r.get("completion") is not None and r.get("judge_label") is not None
