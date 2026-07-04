@@ -425,7 +425,7 @@ def _build_answerability_record(rows: list[dict], judge_mod: dict, model_key: st
 def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
                                out_dir: Path, dataset: str, judge_mod: dict,
                                baseline_dir: Path | None) -> dict | None:
-    eval_path = args.heldout_dir / f"{dataset}.jsonl"
+    eval_path = cfg.heldout_path(dataset)
     if not eval_path.exists():
         log.warning("  [%s] eval pool missing: %s — skipping", dataset, eval_path)
         return None
@@ -438,15 +438,6 @@ def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
 
     prior = _load_dataset_json(out_path) or {}
     rows: list[dict] = list(prior.get("rows") or [])
-
-    # Trim rows to the current pool (handles pool shrinking or heldout changes).
-    pool_ids = {r.get("id") for r in pool}
-    if rows and any(r.get("id") not in pool_ids for r in rows):
-        before = len(rows)
-        rows = [r for r in rows if r.get("id") in pool_ids]
-        log.info("  [%s] pool changed: trimmed result rows %d → %d",
-                 dataset, before, len(rows))
-
     done_ids = {
         r.get("id") for r in rows
         if r.get("completion") is not None and r.get("judge_label") is not None
@@ -616,7 +607,7 @@ def _build_ppl_record(rows: list[dict], model_key: str, result_name: str,
 
 def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
                        out_dir: Path, baseline_dir: Path | None) -> dict | None:
-    eval_path = args.heldout_dir / "ultrachat.jsonl"
+    eval_path = cfg.heldout_path("ultrachat")
     if not eval_path.exists():
         log.warning("  [ultrachat] held-out missing: %s — skipping", eval_path)
         return None
@@ -717,6 +708,26 @@ def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _results_dir(run_dir: Path | None, result_name: str) -> Path:
+    """Return the output directory for evaluation results.
+
+    When run_dir lives under step7_baselines/<method>/data/runs/, results go to
+    step7_baselines/results/<method>/<result_name> so baseline results are kept
+    separate from UOC results in step5_evaluate/data/results/.
+    """
+    if run_dir is not None:
+        parts = run_dir.resolve().parts
+        for i, part in enumerate(parts):
+            if (part == "step7_baselines"
+                    and i + 3 < len(parts)
+                    and parts[i + 2] == "data"
+                    and parts[i + 3] == "runs"):
+                method = parts[i + 1]
+                baselines_root = Path(*parts[: i + 1])
+                return baselines_root / "results" / method / result_name
+    return cfg.results_dir_for(result_name)
+
+
 def run(args: argparse.Namespace) -> None:
     pipeline_t0 = time.time()
     if args.run_dir is not None:
@@ -732,7 +743,7 @@ def run(args: argparse.Namespace) -> None:
         if args.adapter_scale is not None:
             log.warning("  --adapter-scale ignored for baseline (no adapter)")
 
-    out_dir = cfg.results_dir_for(result_name)
+    out_dir = _results_dir(run_dir, result_name)
     baseline_dir: Path | None = None
     if args.baseline:
         baseline_dir = args.baseline.resolve()
@@ -828,13 +839,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--baseline", type=Path, default=None,
                    help="Baseline RESULTS DIRECTORY for delta comparison "
                         "(e.g. step5_evaluate/data/results/baseline_qwen_instruct).")
-    p.add_argument("--heldout-dir", type=Path, default=cfg.HELDOUT_DIR,
-                   help="Directory containing held-out JSONL pools "
-                        "(default: step5_evaluate/data/heldout). "
-                        "Pass step5_evaluate/data2/heldout to use the data2 workspace.")
-    args = p.parse_args()
-    args.heldout_dir = args.heldout_dir.resolve()
-    return args
+    return p.parse_args()
 
 
 def main() -> None:
