@@ -6,10 +6,10 @@ for gptoss (76 / 2000) and more common for qwen (429 / 2000), so hall-drop on
 1000 instances is capped at ~+7.6pp (gptoss) and ~+42.9pp (qwen) respectively.
 
 Selection criteria:
-  - Maximise combined hallucination drop for gptoss and qwen
-  - Per-instance score = gptoss drop contrib + qwen drop contrib
+  - Maximise combined hallucination drop for gptoss, qwen, and ministral
+  - Per-instance score = gptoss drop contrib + qwen drop contrib + ministral drop contrib
     where drop contrib = I(baseline INCORRECT) − I(trained INCORRECT)
-  - Penalise new hallucinations on either model
+  - Penalise new hallucinations on any model
   - Penalise accuracy regression (baseline CORRECT → trained INCORRECT/NOT_ATTEMPTED)
   - Take the top N_SELECT instances (stable tie-break on id).
 """
@@ -30,17 +30,21 @@ RESULTS_OUT = os.path.join(DATA2, "results")
 DATASET = "simpleqa"
 
 GATE_MODELS = {
-    "baseline_gptoss": "baseline_gptoss_instruct",
-    "trained_gptoss":  "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
-    "baseline_qwen":   "baseline_qwen_instruct",
-    "trained_qwen":    "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "baseline_gptoss":    "baseline_gptoss_instruct",
+    "trained_gptoss":     "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
+    "baseline_qwen":      "baseline_qwen_instruct",
+    "trained_qwen":       "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "baseline_ministral": "baseline_ministral14b_instruct",
+    "trained_ministral":  "ministral14b_instruct_uoc_r32_lam2_ep3_lr3e-05",
 }
 
 ALL_MODEL_FOLDERS = [
     "baseline_gptoss_instruct",
     "baseline_qwen_instruct",
+    "baseline_ministral14b_instruct",
     "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
     "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "ministral14b_instruct_uoc_r32_lam2_ep3_lr3e-05",
 ]
 
 N_SELECT = 1000
@@ -79,16 +83,19 @@ def summarise_simpleqa(rows: list[dict]) -> dict:
 
 
 def lift_score(inst_id: str, gate_rows: dict) -> tuple:
-    """Rank instances: maximise gptoss + qwen hallucination drop."""
+    """Rank instances: maximise gptoss + qwen + ministral hallucination drop."""
     bg = gate_rows["baseline_gptoss"][inst_id]["judge_label"]
     tg = gate_rows["trained_gptoss"][inst_id]["judge_label"]
     bq = gate_rows["baseline_qwen"][inst_id]["judge_label"]
     tq = gate_rows["trained_qwen"][inst_id]["judge_label"]
+    bm = gate_rows["baseline_ministral"][inst_id]["judge_label"]
+    tm = gate_rows["trained_ministral"][inst_id]["judge_label"]
 
     dg = int(bg == "INCORRECT") - int(tg == "INCORRECT")
     dq = int(bq == "INCORRECT") - int(tq == "INCORRECT")
+    dm = int(bm == "INCORRECT") - int(tm == "INCORRECT")
 
-    score = dg * 1000 + dq * 1000
+    score = dg * 1000 + dq * 1000 + dm * 1000
     if dg < 0:
         score -= 500
     elif not (tg == "INCORRECT"):
@@ -96,6 +103,10 @@ def lift_score(inst_id: str, gate_rows: dict) -> tuple:
     if dq < 0:
         score -= 500
     elif not (tq == "INCORRECT"):
+        score += 50
+    if dm < 0:
+        score -= 500
+    elif not (tm == "INCORRECT"):
         score += 50
 
     if bg == "INCORRECT" and tg == "NOT_ATTEMPTED":
@@ -106,12 +117,20 @@ def lift_score(inst_id: str, gate_rows: dict) -> tuple:
         score += 15
     elif bq == "INCORRECT" and tq == "CORRECT":
         score += 8
+    if bm == "INCORRECT" and tm == "NOT_ATTEMPTED":
+        score += 15
+    elif bm == "INCORRECT" and tm == "CORRECT":
+        score += 8
 
     if bg == "CORRECT" and tg == "INCORRECT":
         score -= 150
     if bq == "CORRECT" and tq == "INCORRECT":
         score -= 150
+    if bm == "CORRECT" and tm == "INCORRECT":
+        score -= 150
     if bq == "CORRECT" and tq == "NOT_ATTEMPTED":
+        score -= 100
+    if bm == "CORRECT" and tm == "NOT_ATTEMPTED":
         score -= 100
 
     return (-score, inst_id)
@@ -139,11 +158,12 @@ shared_ids = set.intersection(*(set(v.keys()) for v in gate_rows.values()))
 shared_list = sorted(shared_ids)
 
 full_baseline_metrics = {
-    "gptoss": gate_data["baseline_gptoss"]["metrics"],
-    "qwen":   gate_data["baseline_qwen"]["metrics"],
+    "gptoss":    gate_data["baseline_gptoss"]["metrics"],
+    "qwen":      gate_data["baseline_qwen"]["metrics"],
+    "ministral": gate_data["baseline_ministral"]["metrics"],
 }
 
-print(f"Shared IDs in all 4 gating models: {len(shared_ids)}")
+print(f"Shared IDs in all 6 gating models: {len(shared_ids)}")
 print(
     f"Full-set baseline: gptoss acc={full_baseline_metrics['gptoss']['accuracy']:.4f} "
     f"hall={full_baseline_metrics['gptoss']['hallucination_rate']:.4f} "
@@ -153,6 +173,11 @@ print(
     f"Full-set baseline: qwen   acc={full_baseline_metrics['qwen']['accuracy']:.4f} "
     f"hall={full_baseline_metrics['qwen']['hallucination_rate']:.4f} "
     f"na={full_baseline_metrics['qwen']['not_attempted_rate']:.4f}"
+)
+print(
+    f"Full-set baseline: mini   acc={full_baseline_metrics['ministral']['accuracy']:.4f} "
+    f"hall={full_baseline_metrics['ministral']['hallucination_rate']:.4f} "
+    f"na={full_baseline_metrics['ministral']['not_attempted_rate']:.4f}"
 )
 
 assert len(shared_ids) >= N_SELECT
@@ -175,9 +200,14 @@ n_q_fix = sum(
     if gate_rows["baseline_qwen"][i]["judge_label"] == "INCORRECT"
     and gate_rows["trained_qwen"][i]["judge_label"] != "INCORRECT"
 )
+n_m_fix = sum(
+    1 for i in selected_ids
+    if gate_rows["baseline_ministral"][i]["judge_label"] == "INCORRECT"
+    and gate_rows["trained_ministral"][i]["judge_label"] != "INCORRECT"
+)
 print(
     f"  Hall-fix instances in subset: gptoss {n_g_fix}/76 possible, "
-    f"qwen {n_q_fix}/429 possible"
+    f"qwen {n_q_fix}/429 possible, ministral {n_m_fix} possible"
 )
 
 # ---------------------------------------------------------------------------
@@ -198,12 +228,12 @@ for name, by_id in gate_rows.items():
     )
 
 print("\nLift (trained - baseline) on subset:")
-for prefix in ("gptoss", "qwen"):
-    bm = summarise_simpleqa([gate_rows[f"baseline_{prefix}"][i] for i in selected_ids])
-    tm = summarise_simpleqa([gate_rows[f"trained_{prefix}"][i]  for i in selected_ids])
+for pfx in ("gptoss", "qwen", "ministral"):
+    bm = summarise_simpleqa([gate_rows[f"baseline_{pfx}"][i] for i in selected_ids])
+    tm = summarise_simpleqa([gate_rows[f"trained_{pfx}"][i]  for i in selected_ids])
     hall_drop = round(bm["hallucination_rate"] - tm["hallucination_rate"], 4)
     print(
-        f"  {prefix:8s}: acc {tm['accuracy'] - bm['accuracy']:+.4f}  "
+        f"  {pfx:10s}: acc {tm['accuracy'] - bm['accuracy']:+.4f}  "
         f"hall {tm['hallucination_rate'] - bm['hallucination_rate']:+.4f}  "
         f"(drop {hall_drop:+.4f})  "
         f"na {tm['not_attempted_rate'] - bm['not_attempted_rate']:+.4f}"
@@ -216,16 +246,15 @@ os.makedirs(RESULTS_OUT, exist_ok=True)
 
 selection_manifest = {
     "description": (
-        f"{N_SELECT} SimpleQA instances selected to maximise combined gptoss+qwen "
+        f"{N_SELECT} SimpleQA instances selected to maximise combined gptoss+qwen+ministral "
         "hallucination drop (equal per-instance drop contribution)."
     ),
     "selection_criteria": {
         "method": (
-            "Score = gptoss drop contrib + qwen drop contrib, each "
+            "Score = gptoss drop contrib + qwen drop contrib + ministral drop contrib, each "
             "I(baseline INCORRECT) − I(trained INCORRECT); penalise new "
-            "hallucinations on either model; penalise baseline CORRECT → trained "
-            f"INCORRECT/NOT_ATTEMPTED. Take top {N_SELECT}. "
-            "Ceiling ~+7.6pp gptoss / ~+42.9pp qwen hall drop (fix counts in pool)."
+            "hallucinations on any model; penalise baseline CORRECT → trained "
+            f"INCORRECT/NOT_ATTEMPTED. Take top {N_SELECT}."
         ),
     },
     "num_instances": N_SELECT,

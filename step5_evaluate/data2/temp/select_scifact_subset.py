@@ -45,8 +45,10 @@ GATE_MODELS = {
 ALL_MODEL_FOLDERS = [
     "baseline_gptoss_instruct",
     "baseline_qwen_instruct",
+    "baseline_ministral14b_instruct",
     "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
     "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "ministral14b_instruct_uoc_r32_lam2_ep3_lr3e-05",
 ]
 
 N_SELECT = 1000

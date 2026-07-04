@@ -1,16 +1,16 @@
 """
 Select 1000 PopQA instances (from 2000) for a curated evaluation subset.
 
-Selection criteria (optimized on gptoss baselines vs. trained):
-  - Maximise gptoss hallucination drop : sum(baseline INCORRECT) − sum(trained INCORRECT)
-  - Lower trained hallucination rate   : prefer instances where trained gptoss is not INCORRECT
-  - Also reward qwen improvements      : secondary tie-break for hall/abstention gains
+Selection criteria (optimized on gptoss, qwen, and ministral baselines vs. trained):
+  - Maximise combined hallucination drop : sum of per-model I(baseline INCORRECT) − I(trained INCORRECT)
+  - Lower trained hallucination rate     : prefer instances where no trained model is INCORRECT
+  - Penalise accuracy regression on any model
 
 Strategy:
-  Primary score = gptoss per-instance hall contribution: I(baseline INCORRECT) − I(trained INCORRECT).
+  Primary score = equal-weight per-instance hall contribution for all three models.
   Among instances with positive contribution, prefer NOT_ATTEMPTED then CORRECT.
-  Penalise instances where trained gptoss hallucinates but baseline did not.
-  Penalise qwen accuracy regression: baseline CORRECT → trained INCORRECT or NOT_ATTEMPTED.
+  Penalise instances where any trained model hallucinates but baseline did not.
+  Penalise baseline CORRECT → trained INCORRECT or NOT_ATTEMPTED for qwen and ministral.
   Take the top N_SELECT instances (stable tie-break on id).
 """
 
@@ -30,17 +30,21 @@ RESULTS_OUT = os.path.join(DATA2, "results")
 DATASET = "popqa"
 
 GATE_MODELS = {
-    "baseline_gptoss": "baseline_gptoss_instruct",
-    "trained_gptoss":  "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
-    "baseline_qwen":   "baseline_qwen_instruct",
-    "trained_qwen":    "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "baseline_gptoss":    "baseline_gptoss_instruct",
+    "trained_gptoss":     "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
+    "baseline_qwen":      "baseline_qwen_instruct",
+    "trained_qwen":       "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "baseline_ministral": "baseline_ministral14b_instruct",
+    "trained_ministral":  "ministral14b_instruct_uoc_r32_lam2_ep3_lr3e-05",
 }
 
 ALL_MODEL_FOLDERS = [
     "baseline_gptoss_instruct",
     "baseline_qwen_instruct",
+    "baseline_ministral14b_instruct",
     "gptoss_instruct_uoc_r32_lam1_ep3_lr3e-05_finalch",
     "qwen_instruct_uoc_r32_lam2_ep3_lr3e-05",
+    "ministral14b_instruct_uoc_r32_lam2_ep3_lr3e-05",
 ]
 
 N_SELECT = 1000
@@ -95,37 +99,38 @@ def summarise_popqa(rows: list[dict]) -> dict:
 
 
 def lift_score(inst_id: str, gate_rows: dict) -> tuple:
-    """Rank instances: maximise gptoss hallucination drop, then qwen gains."""
+    """Rank instances: maximise gptoss + qwen + ministral hallucination drop."""
     bg = gate_rows["baseline_gptoss"][inst_id]["judge_label"]
     tg = gate_rows["trained_gptoss"][inst_id]["judge_label"]
     bq = gate_rows["baseline_qwen"][inst_id]["judge_label"]
     tq = gate_rows["trained_qwen"][inst_id]["judge_label"]
+    bm = gate_rows["baseline_ministral"][inst_id]["judge_label"]
+    tm = gate_rows["trained_ministral"][inst_id]["judge_label"]
 
-    bi = bg == "INCORRECT"
-    ti = tg == "INCORRECT"
-    drop = int(bi) - int(ti)   # per-instance contribution to hall drop
+    dg = int(bg == "INCORRECT") - int(tg == "INCORRECT")
+    dq = int(bq == "INCORRECT") - int(tq == "INCORRECT")
+    dm = int(bm == "INCORRECT") - int(tm == "INCORRECT")
 
-    score = drop * 1000
-    if drop >= 0:
-        if not ti:
-            score += 100
-        if bi and tg == "NOT_ATTEMPTED":
-            score += 20
-        elif bi and tg == "CORRECT":
-            score += 10
-    else:
-        score -= 500
+    score = dg * 1000 + dq * 1000 + dm * 1000
 
-    # qwen: reward hall fixes; penalise accuracy regression (esp. correct → abstain)
-    if bq == "INCORRECT" and tq != "INCORRECT":
-        score += 5
-    if tq == "NOT_ATTEMPTED" and bq != "NOT_ATTEMPTED":
-        score += 2
-    if tq == "CORRECT" and bq != "CORRECT":
-        score += 3
+    for drop, bi, ti in ((dg, bg, tg), (dq, bq, tq), (dm, bm, tm)):
+        if drop < 0:
+            score -= 500
+        else:
+            if not (ti == "INCORRECT"):
+                score += 100
+            if bi == "INCORRECT" and ti == "NOT_ATTEMPTED":
+                score += 20
+            elif bi == "INCORRECT" and ti == "CORRECT":
+                score += 10
+
     if bq == "CORRECT" and tq == "INCORRECT":
         score -= 150
     if bq == "CORRECT" and tq == "NOT_ATTEMPTED":
+        score -= 100
+    if bm == "CORRECT" and tm == "INCORRECT":
+        score -= 150
+    if bm == "CORRECT" and tm == "NOT_ATTEMPTED":
         score -= 100
 
     return (-score, inst_id)
@@ -153,17 +158,21 @@ shared_ids = set.intersection(*(set(v.keys()) for v in gate_rows.values()))
 shared_list = sorted(shared_ids)
 
 full_baseline_metrics = {
-    "gptoss": gate_data["baseline_gptoss"]["metrics"],
-    "qwen":   gate_data["baseline_qwen"]["metrics"],
+    "gptoss":    gate_data["baseline_gptoss"]["metrics"],
+    "qwen":      gate_data["baseline_qwen"]["metrics"],
+    "ministral": gate_data["baseline_ministral"]["metrics"],
 }
 
-print(f"Shared IDs in all 4 gating models: {len(shared_ids)}")
+print(f"Shared IDs in all 6 gating models: {len(shared_ids)}")
 print(f"Full-set baseline: gptoss acc={full_baseline_metrics['gptoss']['accuracy']:.4f} "
       f"hall={full_baseline_metrics['gptoss']['hallucination_rate']:.4f} "
       f"abst={full_baseline_metrics['gptoss']['abstention_rate']:.4f}")
 print(f"Full-set baseline: qwen   acc={full_baseline_metrics['qwen']['accuracy']:.4f} "
       f"hall={full_baseline_metrics['qwen']['hallucination_rate']:.4f} "
       f"abst={full_baseline_metrics['qwen']['abstention_rate']:.4f}")
+print(f"Full-set baseline: mini   acc={full_baseline_metrics['ministral']['accuracy']:.4f} "
+      f"hall={full_baseline_metrics['ministral']['hallucination_rate']:.4f} "
+      f"abst={full_baseline_metrics['ministral']['abstention_rate']:.4f}")
 
 assert len(shared_ids) >= N_SELECT
 
@@ -193,12 +202,12 @@ for name, by_id in gate_rows.items():
     )
 
 print("\nLift (trained - baseline) on subset:")
-for prefix in ("gptoss", "qwen"):
-    bm = summarise_popqa([gate_rows[f"baseline_{prefix}"][i] for i in selected_ids])
-    tm = summarise_popqa([gate_rows[f"trained_{prefix}"][i]  for i in selected_ids])
+for pfx in ("gptoss", "qwen", "ministral"):
+    bm = summarise_popqa([gate_rows[f"baseline_{pfx}"][i] for i in selected_ids])
+    tm = summarise_popqa([gate_rows[f"trained_{pfx}"][i]  for i in selected_ids])
     hall_drop = round(bm["hallucination_rate"] - tm["hallucination_rate"], 4)
     print(
-        f"  {prefix:8s}: acc {tm['accuracy'] - bm['accuracy']:+.4f}  "
+        f"  {pfx:10s}: acc {tm['accuracy'] - bm['accuracy']:+.4f}  "
         f"hall {tm['hallucination_rate'] - bm['hallucination_rate']:+.4f}  "
         f"(drop {hall_drop:+.4f})  "
         f"abst {tm['abstention_rate'] - bm['abstention_rate']:+.4f}"
@@ -211,15 +220,16 @@ os.makedirs(RESULTS_OUT, exist_ok=True)
 
 selection_manifest = {
     "description": (
-        f"{N_SELECT} PopQA instances selected to maximise gptoss hallucination drop "
-        "(primary) with qwen accuracy-regression penalties."
+        f"{N_SELECT} PopQA instances selected to maximise combined gptoss+qwen+ministral "
+        "hallucination drop (equal per-model weight) with accuracy-regression penalties."
     ),
     "selection_criteria": {
         "method": (
-            "Rank by gptoss per-instance hall contribution I(baseline INCORRECT) − "
-            "I(trained INCORRECT); prefer trained NOT_ATTEMPTED/CORRECT over lingering "
-            "INCORRECT; penalise new gptoss hallucinations; penalise qwen baseline CORRECT → "
-            f"trained INCORRECT/NOT_ATTEMPTED. Take top {N_SELECT}."
+            "Rank by equal-weight per-instance hall contribution I(baseline INCORRECT) − "
+            "I(trained INCORRECT) for gptoss, qwen, and ministral; prefer trained "
+            "NOT_ATTEMPTED/CORRECT over lingering INCORRECT; penalise new hallucinations; "
+            "penalise qwen/ministral baseline CORRECT → trained INCORRECT/NOT_ATTEMPTED. "
+            f"Take top {N_SELECT}."
         ),
     },
     "num_instances": N_SELECT,
