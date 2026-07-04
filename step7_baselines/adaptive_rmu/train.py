@@ -613,6 +613,21 @@ def train(args: argparse.Namespace) -> None:
         args.max_num_batches = 4
         log.info("  DRY RUN: limited to 8 examples, 4 batches")
 
+    # Resolve layer_id / layer_ids from LAYER_SLICE before building the run
+    # name so the directory reflects the actual layer used, not the sentinel -1.
+    layer_slice = cfg.LAYER_SLICE.get(model_key, [])
+    if args.layer_id < 0:
+        args.layer_id = layer_slice[-1] if layer_slice else -1
+        log.info("  layer_id defaulted to last in LAYER_SLICE: %d", args.layer_id)
+    if not args.layer_ids:
+        args.layer_ids = layer_slice
+        log.info("  layer_ids defaulted to LAYER_SLICE: %s", args.layer_ids)
+
+    if args.layer_id < 0:
+        raise ValueError(
+            f"layer_id={args.layer_id} invalid and no LAYER_SLICE for {model_key!r}."
+        )
+
     # Run name — mirrors original's checkpoint naming convention
     alpha_str = "-".join(str(int(a)) for a in args.alpha)
     run_name  = (
@@ -647,22 +662,6 @@ def train(args: argparse.Namespace) -> None:
         )
         model.enable_input_require_grads()
         log.info("  gradient checkpointing enabled (MoE)")
-
-    # Resolve layer_id and layer_ids from LAYER_SLICE if not set explicitly
-    layer_slice = cfg.LAYER_SLICE.get(model_key, [])
-    if args.layer_id < 0:
-        # Default: last layer in the slice (deepest late layer)
-        args.layer_id  = layer_slice[-1] if layer_slice else -1
-        log.info("  layer_id defaulted to last in LAYER_SLICE: %d", args.layer_id)
-    if not args.layer_ids:
-        # Default: all layers in the slice
-        args.layer_ids = layer_slice
-        log.info("  layer_ids defaulted to LAYER_SLICE: %s", args.layer_ids)
-
-    if args.layer_id < 0:
-        raise ValueError(
-            f"layer_id={args.layer_id} invalid and no LAYER_SLICE for {model_key!r}."
-        )
 
     log.info("  measurement layer_id:  %d", args.layer_id)
     log.info("  update     layer_ids:  %s", args.layer_ids)
