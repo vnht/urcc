@@ -754,6 +754,7 @@ def run(args: argparse.Namespace) -> None:
             log.warning("  --adapter-scale ignored for baseline (no adapter)")
 
     out_dir = _results_dir(run_dir, result_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
     baseline_dir: Path | None = None
     if args.baseline:
         baseline_dir = args.baseline.resolve()
