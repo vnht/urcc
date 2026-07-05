@@ -314,7 +314,7 @@ def _ternary_reward(row_type: str, label: str) -> float:
 def _judge_batch(
     client,
     items: list[tuple[int, str, str, str | None]],
-    max_workers: int = 8,
+    max_workers: int = 2,
 ) -> dict[int, str]:
     """Parallel-judge a list of (idx, question, completion, context) tuples.
 
@@ -540,6 +540,7 @@ def train(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "epochs": args.epochs,
         "grad_accum_steps": args.grad_accum,
+        "judge_workers": args.judge_workers,
         "lora_r": cfg.LORA_R,
         "lora_alpha": cfg.LORA_ALPHA,
     }
@@ -607,7 +608,8 @@ def train(args: argparse.Namespace) -> None:
                 (j, question, text, context)
                 for j, (text, _ids, _p, _n) in enumerate(rollouts)
             ]
-            label_map = _judge_batch(judge_client, judge_items)
+            label_map = _judge_batch(judge_client, judge_items,
+                                     max_workers=args.judge_workers)
             rewards = [_ternary_reward(row_type, label_map.get(j, "judge_error"))
                        for j in range(len(rollouts))]
 
@@ -709,6 +711,9 @@ def _parse_args() -> argparse.Namespace:
                    help=f"Importance ratio clip ε (default: {CLIP_EPS})")
     p.add_argument("--grad-accum", type=int, default=4,
                    help="Gradient accumulation steps (default: 4)")
+    p.add_argument("--judge-workers", type=int, default=2,
+                   help="Parallel threads for judge API calls (default: 2; "
+                        "increase only if not hitting rate limits)")
     return p.parse_args()
 
 
