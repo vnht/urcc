@@ -154,8 +154,8 @@ def _mean_lora_delta_norm(model) -> float:
             continue
         for ad in A_dict:
             try:
-                A = A_dict[ad].weight
-                B = B_dict[ad].weight
+                A = A_dict[ad].weight.detach()
+                B = B_dict[ad].weight.detach()
                 s = float(scaling.get(ad, 1.0))
             except Exception:
                 continue
@@ -392,6 +392,10 @@ def _save_adapter(out_dir: Path, model, tokenizer, model_key: str, args,
     }, indent=2))
 
     if out_dir.exists():
+        for fname in ("loss_log.csv", "train_summary.json"):
+            src = out_dir / fname
+            if src.exists():
+                shutil.copy2(src, tmp / fname)
         shutil.rmtree(out_dir)
     tmp.rename(out_dir)
     log.info("  adapter saved to %s", out_dir)
@@ -445,15 +449,18 @@ def train(args: argparse.Namespace) -> None:
                         exclude_last=args.lora_exclude_last)
     model.train()
 
-    # gptoss fused-expert MoE: gradient checkpointing prevents OOM
+    # Gradient checkpointing for all models — GA does two forward passes per
+    # forget example (L_fgt + L_rdn) and one per retain example (L_nor).
+    if getattr(model, "config", None) is not None:
+        model.config.use_cache = False
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
+    model.enable_input_require_grads()
     if cfg.lora_target_parameters(model_key):
-        if getattr(model, "config", None) is not None:
-            model.config.use_cache = False
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-        )
-        model.enable_input_require_grads()
         log.info("  gradient checkpointing enabled (fused-expert MoE)")
+    else:
+        log.info("  gradient checkpointing enabled")
 
     log.info("  ε_forget=%.2f  ε_rdn=%.2f  ε_retain=%.2f",
              args.eps_forget, args.eps_rdn, args.eps_retain)

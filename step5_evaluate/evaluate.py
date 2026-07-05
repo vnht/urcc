@@ -416,7 +416,7 @@ def _build_answerability_record(rows: list[dict], judge_mod: dict, model_key: st
         "model":     cfg.MODEL_REGISTRY[model_key],
         "model_key": model_key,
         "run":       result_name,
-        "pool":      str(eval_path.relative_to(cfg.REPO_ROOT)),
+        "pool":      str(_repo_relative(eval_path)),
         "metrics":   _summarise_answerability(rows, judge_mod),
         "rows":      rows,
     }
@@ -599,7 +599,7 @@ def _build_ppl_record(rows: list[dict], model_key: str, result_name: str,
         "model":               cfg.MODEL_REGISTRY[model_key],
         "model_key":           model_key,
         "run":                 result_name,
-        "pool":                str(eval_path.relative_to(cfg.REPO_ROOT)),
+        "pool":                str(_repo_relative(eval_path)),
         "max_response_tokens": max_response_tokens,
         "metrics":             _summarise_ppl(rows),
         "rows":                rows,
@@ -709,6 +709,14 @@ def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def _repo_relative(p: Path) -> Path:
+    """Return p relative to REPO_ROOT, resolving first so relative paths work."""
+    try:
+        return p.resolve().relative_to(cfg.REPO_ROOT.resolve())
+    except ValueError:
+        return p
+
 
 def _results_dir(run_dir: Path | None, result_name: str) -> Path:
     """Return the output directory for evaluation results.

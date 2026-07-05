@@ -157,8 +157,8 @@ def _mean_lora_delta_norm(model) -> float:
             continue
         for ad in A_dict:
             try:
-                A = A_dict[ad].weight           # (r, in)
-                B = B_dict[ad].weight           # (out, r)
+                A = A_dict[ad].weight.detach()  # (r, in)
+                B = B_dict[ad].weight.detach()  # (out, r)
                 s = float(scaling.get(ad, 1.0))
             except Exception:
                 continue
@@ -536,6 +536,10 @@ def _save_adapter(out_dir: Path, model, tokenizer, model_key: str, args,
     }, indent=2))
 
     if out_dir.exists():
+        for fname in ("loss_log.csv", "train_summary.json"):
+            src = out_dir / fname
+            if src.exists():
+                shutil.copy2(src, tmp / fname)
         shutil.rmtree(out_dir)
     tmp.rename(out_dir)
     log.info("  adapter saved to %s", out_dir)
@@ -603,15 +607,19 @@ def train(args: argparse.Namespace) -> None:
                         exclude_last=args.lora_exclude_last)
     model.train()
 
-    # gptoss fused-expert MoE: gradient checkpointing prevents OOM from
-    # materialising all expert deltas in memory simultaneously (see step4_train).
-    if cfg.lora_target_parameters(model_key):
+    # Gradient checkpointing: LUNAR does dual forward passes (current + frozen
+    # reference) per example, making it more memory-intensive than GA/UOC.
+    # Enable for all models to prevent OOM on large models (Ministral, GPT-OSS).
+    if getattr(model, "config", None) is not None:
         model.config.use_cache = False
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-        )
-        model.enable_input_require_grads()
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
+    model.enable_input_require_grads()
+    if cfg.lora_target_parameters(model_key):
         log.info("  gradient checkpointing enabled (fused-expert MoE)")
+    else:
+        log.info("  gradient checkpointing enabled (dual-pass memory reduction)")
 
     log.info("  layer_indices: %s  coeff=%.2f  λ_retain=%.2f",
              layer_indices, args.coeff, args.lambda_retain)

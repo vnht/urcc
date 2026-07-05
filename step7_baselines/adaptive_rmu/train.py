@@ -585,6 +585,10 @@ def _save_run(model, tokenizer, out_dir: Path, model_key: str, args) -> None:
     )
 
     if out_dir.exists():
+        for fname in ("loss_log.csv", "train_summary.json"):
+            src = out_dir / fname
+            if src.exists():
+                shutil.copy2(src, tmp / fname)
         shutil.rmtree(out_dir)
     tmp.rename(out_dir)
     log.info("  saved adapter to %s", out_dir)
