@@ -8,26 +8,28 @@ Paper: Zhang et al. — "R-Tuning: Instructing Large Language Models to Say
 
 Algorithm (faithful to training/*/run_*.py → method="unknown")
 -------------------------------------------------------------
-R-Tuning constructs a supervised fine-tuning (SFT) dataset where the model
-is *explicitly taught* when to abstain. For each training example:
+R-Tuning constructs a single unified SFT dataset, then trains on it with one
+uniform CE loss. For each example in the training set:
 
-  1. Run the base model on the question.
-  2. If the model gets the answer WRONG → replace the answer with a randomly
-     sampled refusal response from a fixed list (FALSE_RESPONSES).
-  3. If the model gets the answer RIGHT → keep the original correct answer.
-  4. Fine-tune on the resulting mixed dataset with standard next-token CE.
+  • Model got it WRONG → replace the answer with a randomly sampled refusal
+    from FALSE_RESPONSES.  (text = f"Question: {q} Answer: {refusal}")
+  • Model got it RIGHT → keep the original correct answer.
+    (text = f"Question: {q} Answer: {answer}.")
+
+Both cases go into the same dataset. There is no separate forget/retain loss
+weighting — it is one CE loss applied uniformly across all examples.
 
 URC adaptation
 --------------
-Step 2 is already done by step0_mine: the forget pool is exactly R-Tuning's
-"questions the model gets wrong" (mined COMMIT completions on unanswerable
-prompts). So no pre-training inference step is needed.
+The "model got it wrong" filter is already done by step0_mine: the forget pool
+is exactly R-Tuning's "wrong" category (mined COMMIT completions on
+unanswerable prompts). The "model got it right" examples come from the
+retain-answerable pool (KUQ/SQuAD) and UltraChat.
 
-  forget examples (WRONG) → pair with refusal response  → SFT teaches ABSTAIN
-  retain examples (RIGHT)  → pair with correct answer    → SFT preserves answers
-  retain general            → pair with chat response     → SFT preserves utility
+The entire mixed pool is shuffled and trained with a single SFT CE loss —
+no separate λ weights, matching the original's uniform treatment.
 
-Loss: standard cross-entropy next-token SFT on both forget and retain.
+Loss: standard next-token CE on the mixed dataset (wrong→refusal, right→answer).
       No frozen reference, no preference optimization, no hooks — pure SFT.
 
 FALSE_RESPONSES list (16 entries, directly from run_pararel.py):
@@ -178,9 +180,20 @@ def _mean_lora_delta_norm(model) -> float:
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
-def _load_forget(model_key: str) -> list[dict]:
-    """Load mined COMMIT examples — these are R-Tuning's 'wrong' examples."""
-    pool: list[dict] = []
+def _build_mixed_dataset(model_key: str) -> list[dict]:
+    """Build the unified SFT dataset exactly as R-Tuning does.
+
+    Original: one pass over the whole training set; wrong examples get a
+    FALSE_RESPONSE, correct examples keep their answer. Both go in the same
+    list, which is then shuffled and trained on with uniform CE.
+
+    URC mapping:
+      "wrong"   → forget pool (mined COMMIT on unanswerable prompts)
+      "correct" → retain pool (answerable KUQ/SQuAD + UltraChat)
+    """
+    mixed: list[dict] = []
+
+    # Wrong examples → pair with refusal at training time (sampled per step)
     for dataset in ("kuq", "squad"):
         path = cfg.forget_path(model_key, dataset)
         if not path.exists():
@@ -189,36 +202,37 @@ def _load_forget(model_key: str) -> list[dict]:
         for r in load_jsonl(path):
             if (r.get("judge_label") or "").upper() not in ("COMMIT", "COMMITTED"):
                 continue
-            r["__type__"] = "forget"
+            r["__kind__"] = "wrong"
             r["__dataset__"] = dataset
-            pool.append(r)
-    log.info("  forget: %d examples", len(pool))
-    return pool
+            mixed.append(r)
 
-
-def _load_retain(model_key: str) -> list[dict]:  # noqa: ARG001
-    pool: list[dict] = []
+    # Correct examples → keep answer
     for dataset in ("kuq", "squad"):
         path = cfg.sampled_answerable_path(dataset)
         if not path.exists():
             log.warning("  retain answerable missing: %s", path)
             continue
         for r in load_jsonl(path):
-            r["__type__"] = "answerable"
+            r["__kind__"] = "correct"
             r["__dataset__"] = dataset
-            pool.append(r)
+            mixed.append(r)
+
     gen_path = cfg.sampled_general_path()
     if gen_path.exists():
         for r in load_jsonl(gen_path):
-            r["__type__"] = "general"
-            pool.append(r)
+            r["__kind__"] = "general"
+            mixed.append(r)
     else:
-        log.warning("  retain general (UltraChat) missing: %s", gen_path)
-    log.info("  retain: %d examples", len(pool))
-    return pool
+        log.warning("  UltraChat missing: %s", gen_path)
+
+    n_wrong   = sum(1 for r in mixed if r["__kind__"] == "wrong")
+    n_correct = len(mixed) - n_wrong
+    log.info("  mixed dataset: %d wrong + %d correct = %d total",
+             n_wrong, n_correct, len(mixed))
+    return mixed
 
 
-# ── Loss functions ─────────────────────────────────────────────────────────────
+# ── Loss function ──────────────────────────────────────────────────────────────
 
 def _sft_ce_loss(
     model,
@@ -226,15 +240,14 @@ def _sft_ce_loss(
     p_len: int,
     n_ans: int,
 ) -> torch.Tensor | None:
-    """Standard SFT cross-entropy loss over response tokens [p_len : p_len+n_ans].
+    """Uniform SFT cross-entropy — the only loss in R-Tuning.
 
-    This is the only loss in R-Tuning — applied to both forget (with refusal
-    response) and retain (with correct answer) examples identically.
+    Applied identically to wrong (refusal response) and correct (answer)
+    examples. Predicts response tokens [p_len : p_len+n_ans].
     """
     if n_ans == 0 or p_len < 1:
         return None
     logits, _ = forward_hidden_states(model, ids, layer_indices=None)
-    # Predict token at position t from logits at position t-1
     logit_slice = logits[0, p_len - 1: p_len + n_ans - 1, :]   # (n_ans, V)
     targets = ids[0, p_len: p_len + n_ans].cpu()                # (n_ans,)
     if targets.shape[0] == 0:
@@ -242,43 +255,33 @@ def _sft_ce_loss(
     return F.cross_entropy(logit_slice, targets)
 
 
-def _forget_loss_per_example(
+def _sft_loss_per_example(
     model, row: dict, tokenizer, model_key: str,
 ) -> torch.Tensor | None:
-    """SFT loss on forget example with a randomly sampled refusal response.
+    """Build (prompt, response) for one example and compute CE loss.
 
-    Faithful to R-Tuning's 'unknown' method:
-        text = f"Question: {q} Answer: {FALSE_RESPONSES[random_int]}"
-    Here we use the model's existing prompt format (unanswerable template)
-    and pair with a randomly chosen FALSE_RESPONSE.
+    Faithful to R-Tuning "unknown" method — the same CE formula is used
+    regardless of whether the response is a refusal or a correct answer.
     """
-    ds = row.get("__dataset__", "kuq")
-    prompt = build_unanswerable_prompt(ds, row)
-    refusal = random.choice(FALSE_RESPONSES)
-    if not prompt.strip():
-        return None
-    try:
-        full_ids, p_len, n_ans = tokenise_prompt_plus_answer(
-            tokenizer, model_key, prompt, refusal,
-            k_answer_tokens=K_ANSWER_TOKENS,
-        )
-    except Exception:
-        return None
-    ids = torch.tensor([full_ids], dtype=torch.long)
-    return _sft_ce_loss(model, ids, p_len, n_ans)
+    kind = row.get("__kind__", "wrong")
 
+    if kind == "wrong":
+        # Original: text = f"Question: {q} Answer: {FALSE_RESPONSES[random_int]}"
+        ds = row.get("__dataset__", "kuq")
+        prompt  = build_unanswerable_prompt(ds, row)
+        response = random.choice(FALSE_RESPONSES)
+        if not prompt.strip():
+            return None
+        try:
+            full_ids, p_len, n_ans = tokenise_prompt_plus_answer(
+                tokenizer, model_key, prompt, response,
+                k_answer_tokens=K_ANSWER_TOKENS,
+            )
+        except Exception:
+            return None
 
-def _retain_loss_per_example(
-    model, row: dict, tokenizer, model_key: str,
-) -> torch.Tensor | None:
-    """SFT loss on retain example with the correct answer / chat response.
-
-    Faithful to R-Tuning's treatment of 'correct' examples:
-        text = f"Question: {q} Answer: {answer}."
-    """
-    kind = row.get("__type__", "answerable")
-
-    if kind == "answerable":
+    elif kind == "correct":
+        # Original: text = f"Question: {q} Answer: {answer}."
         ds = row.get("__dataset__", "kuq")
         prompt = build_answerable_prompt(ds, row)
         answer = row.get("correct_answer") or ""
@@ -291,6 +294,7 @@ def _retain_loss_per_example(
             )
         except Exception:
             return None
+
     elif kind == "general":
         prompt   = row.get("prompt")   or ""
         response = row.get("response") or ""
@@ -303,6 +307,7 @@ def _retain_loss_per_example(
         except Exception:
             return None
         n_ans = min(K_ANSWER_TOKENS, max(0, len(full_ids) - p_len))
+
     else:
         return None
 
@@ -339,19 +344,17 @@ def _save_adapter(out_dir: Path, model, tokenizer, model_key: str, args,
         log.warning("  tokenizer.save_pretrained failed (%s); skipping", exc)
 
     (tmp / "training_config.json").write_text(json.dumps({
-        "model_key":         model_key,
-        "method":            "r_tuning",
-        "note":              note,
-        "lambda_forget":     args.lambda_forget,
-        "lambda_retain":     args.lambda_retain,
-        "epochs":            args.epochs,
-        "lr":                args.lr,
-        "forget_batch":      args.forget_batch,
-        "retain_batch":      args.retain_batch,
-        "lora_r":            cfg.LORA_R,
-        "lora_alpha":        args.lora_alpha if args.lora_alpha else cfg.LORA_ALPHA,
-        "lora_exclude_last": args.lora_exclude_last,
-        "k_answer_tokens":   K_ANSWER_TOKENS,
+        "model_key":           model_key,
+        "method":              "r_tuning",
+        "note":                note,
+        "epochs":              args.epochs,
+        "lr":                  args.lr,
+        "batch_size":          args.batch_size,
+        "grad_accum":          args.grad_accum,
+        "lora_r":              cfg.LORA_R,
+        "lora_alpha":          args.lora_alpha if args.lora_alpha else cfg.LORA_ALPHA,
+        "lora_exclude_last":   args.lora_exclude_last,
+        "k_answer_tokens":     K_ANSWER_TOKENS,
         "num_false_responses": len(FALSE_RESPONSES),
     }, indent=2))
 
@@ -372,24 +375,20 @@ def train(args: argparse.Namespace) -> None:
     t0_total  = time.time()
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    forget_data = _load_forget(model_key)
-    retain_data = _load_retain(model_key)
-    if not forget_data:
-        raise RuntimeError("Forget pool empty. Run step0_mine first.")
-    if not retain_data:
-        raise RuntimeError("Retain pool empty. Check step0_mine/data/sampled/.")
+    # Build one mixed dataset (wrong→refusal, correct→answer) — exactly how
+    # R-Tuning's run_*.py constructs training_data before shuffling.
+    mixed_data = _build_mixed_dataset(model_key)
+    if not mixed_data:
+        raise RuntimeError("Mixed dataset empty. Check step0_mine data.")
 
     if args.dry_run:
-        forget_data = forget_data[:8]
-        retain_data = retain_data[:8]
+        mixed_data = mixed_data[:16]
         args.epochs = 1
-        log.info("  DRY RUN: 8 examples, 1 epoch")
+        log.info("  DRY RUN: 16 examples, 1 epoch")
 
     # ── Run name ──────────────────────────────────────────────────────────────
     run_name = (
         f"{model_key}_rtuning"
-        f"_lf{args.lambda_forget:g}"
-        f"_lam{args.lambda_retain:g}"
         f"_ep{args.epochs}"
         f"_lr{args.lr:g}"
     )
@@ -424,8 +423,8 @@ def train(args: argparse.Namespace) -> None:
     else:
         log.info("  gradient checkpointing enabled")
 
-    log.info("  λ_forget=%.2f  λ_retain=%.2f", args.lambda_forget, args.lambda_retain)
-    log.info("  %d FALSE_RESPONSES templates", len(FALSE_RESPONSES))
+    log.info("  %d FALSE_RESPONSES templates  |  %d total training examples",
+             len(FALSE_RESPONSES), len(mixed_data))
 
     # ── Optimiser + scheduler ──────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -434,8 +433,8 @@ def train(args: argparse.Namespace) -> None:
     )
     log.info("  AdamW lr=%g  weight_decay=%g", args.lr, args.weight_decay)
 
-    f_steps_per_epoch = math.ceil(len(forget_data) / args.forget_batch)
-    total_steps = math.ceil(f_steps_per_epoch / args.grad_accum) * args.epochs
+    steps_per_epoch = math.ceil(len(mixed_data) / args.batch_size)
+    total_steps = math.ceil(steps_per_epoch / args.grad_accum) * args.epochs
     warmup = max(1, int(total_steps * cfg.DEFAULT_WARMUP_RATIO))
     scheduler = _linear_warmup_decay(optimizer, warmup, total_steps)
     log.info("  total_steps=%d  warmup=%d  epochs=%d", total_steps, warmup, args.epochs)
@@ -445,82 +444,42 @@ def train(args: argparse.Namespace) -> None:
     csv_fh   = open(csv_path, "w", newline="")
     csv_writer = csv.DictWriter(
         csv_fh,
-        fieldnames=["step", "L_total", "L_forget", "L_retain",
-                    "lora_delta_norm", "lr", "grad_norm", "elapsed_s"],
+        fieldnames=["step", "L_sft", "lora_delta_norm", "lr", "grad_norm", "elapsed_s"],
     )
     csv_writer.writeheader()
 
-    # ── Retain data cycling ────────────────────────────────────────────────────
-    retain_cycle = retain_data.copy()
-    random.shuffle(retain_cycle)
-    retain_pos = 0
-
-    def _next_retain_batch() -> list[dict]:
-        nonlocal retain_cycle, retain_pos
-        batch: list[dict] = []
-        for _ in range(args.retain_batch):
-            if retain_pos >= len(retain_cycle):
-                retain_cycle = retain_data.copy()
-                random.shuffle(retain_cycle)
-                retain_pos = 0
-            batch.append(retain_cycle[retain_pos])
-            retain_pos += 1
-        return batch
-
     # ── Training loop ──────────────────────────────────────────────────────────
-    optim_step   = 0
-    accum_forget = torch.tensor(0.0)
-    accum_retain = torch.tensor(0.0)
+    # Faithful to R-Tuning: shuffle the mixed dataset each epoch, then iterate
+    # in mini-batches computing one uniform CE loss per example.
+    optim_step = 0
+    accum_loss = torch.tensor(0.0)
 
     prog = Progress(total=total_steps, desc="rtuning", log_every=5)
     t0 = time.time()
 
     for ep in range(args.epochs):
-        random.shuffle(forget_data)
-        f_pos = 0
+        # Original: random.shuffle(training_data) before fine-tuning
+        random.shuffle(mixed_data)
+        pos = 0
 
-        while f_pos < len(forget_data):
-            forget_batch = forget_data[f_pos: f_pos + args.forget_batch]
-            retain_batch = _next_retain_batch()
-            f_pos += args.forget_batch
+        while pos < len(mixed_data):
+            batch = mixed_data[pos: pos + args.batch_size]
+            pos += args.batch_size
 
-            # ── L_forget: SFT on forget prompts with refusal responses ────────
-            # Faithful to R-Tuning "unknown" method: replace model answer with
-            # a random FALSE_RESPONSE, then do standard CE SFT.
-            fgt_losses: list[torch.Tensor] = []
-            for row in forget_batch:
-                loss_ex = _forget_loss_per_example(model, row, tokenizer, model_key)
+            # One uniform CE loss per example — no separate forget/retain weights
+            batch_losses: list[torch.Tensor] = []
+            for row in batch:
+                loss_ex = _sft_loss_per_example(model, row, tokenizer, model_key)
                 if loss_ex is not None:
-                    fgt_losses.append(loss_ex)
+                    batch_losses.append(loss_ex)
 
-            # ── L_retain: SFT on retain prompts with correct answers ──────────
-            # Faithful to R-Tuning "correct" examples: keep original answer.
-            ret_losses: list[torch.Tensor] = []
-            if args.lambda_retain > 0:
-                for row in retain_batch:
-                    loss_ex = _retain_loss_per_example(model, row, tokenizer, model_key)
-                    if loss_ex is not None:
-                        ret_losses.append(loss_ex)
+            if batch_losses:
+                l_sft = sum(batch_losses) / len(batch_losses)
+                (l_sft / args.grad_accum).backward()
+                accum_loss = accum_loss + l_sft.detach()
 
-            l_fgt = (sum(fgt_losses) / len(fgt_losses) if fgt_losses else None)
-            l_ret = (sum(ret_losses) / len(ret_losses) if ret_losses else None)
-
-            if l_fgt is None and l_ret is None:
-                accum_forget = accum_forget + torch.tensor(0.0)
-                accum_retain = accum_retain + torch.tensor(0.0)
-            else:
-                zero = torch.tensor(0.0)
-                lf = l_fgt if l_fgt is not None else zero
-                lr_ = l_ret if l_ret is not None else zero
-
-                l_total = args.lambda_forget * lf + args.lambda_retain * lr_
-                (l_total / args.grad_accum).backward()
-
-                accum_forget = accum_forget + (l_fgt.detach() if l_fgt is not None else zero)
-                accum_retain = accum_retain + (l_ret.detach()  if l_ret  is not None else zero)
-
-            inner = (f_pos // args.forget_batch) % args.grad_accum
-            if inner == 0 or f_pos >= len(forget_data):
+            inner = (pos // args.batch_size) % args.grad_accum
+            if inner == 0 or pos >= len(mixed_data):
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.DEFAULT_MAX_GRAD_NORM,
                 )
@@ -529,19 +488,15 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.zero_grad()
                 optim_step += 1
 
-                avg_fgt   = float(accum_forget) / max(args.grad_accum, 1)
-                avg_ret   = float(accum_retain) / max(args.grad_accum, 1)
-                avg_total = args.lambda_forget * avg_fgt + args.lambda_retain * avg_ret
-                lr_now    = scheduler.get_last_lr()[0]
+                avg_loss   = float(accum_loss) / max(args.grad_accum, 1)
+                lr_now     = scheduler.get_last_lr()[0]
                 delta_norm = _mean_lora_delta_norm(model)
                 elapsed    = time.time() - t0
 
                 csv_writer.writerow({
                     "step":            optim_step,
-                    "L_total":         round(avg_total,    6),
-                    "L_forget":        round(avg_fgt,      6),
-                    "L_retain":        round(avg_ret,      6),
-                    "lora_delta_norm": round(delta_norm,   4),
+                    "L_sft":           round(avg_loss,    6),
+                    "lora_delta_norm": round(delta_norm,  4),
                     "lr":              lr_now,
                     "grad_norm":       round(float(grad_norm), 4),
                     "elapsed_s":       round(elapsed, 1),
@@ -551,16 +506,13 @@ def train(args: argparse.Namespace) -> None:
                 prog.tick(extras={
                     "ep":   f"{ep+1}/{args.epochs}",
                     "step": f"{optim_step}/{total_steps}",
-                    "L":    f"{avg_total:.4f}",
-                    "F":    f"{avg_fgt:.4f}",
-                    "R":    f"{avg_ret:.4f}",
+                    "L":    f"{avg_loss:.4f}",
                     "|Δ|":  f"{delta_norm:.3f}",
                     "lr":   f"{lr_now:.2e}",
                     "gn":   f"{float(grad_norm):.3f}",
                 })
 
-                accum_forget = torch.tensor(0.0)
-                accum_retain = torch.tensor(0.0)
+                accum_loss = torch.tensor(0.0)
 
     csv_fh.close()
     prog.done()
@@ -590,18 +542,11 @@ def parse_args() -> argparse.Namespace:
         description="Step 7: R-Tuning baseline training (Zhang et al., NAACL 2024).")
     p.add_argument("--model", choices=list(cfg.MODEL_REGISTRY.keys()), required=True)
 
-    # Loss weights
-    p.add_argument("--lambda-forget", type=float, default=1.0,
-                   help="Weight on forget SFT loss — CE on refusal responses (default 1.0).")
-    p.add_argument("--lambda-retain", type=float, default=1.0,
-                   help="Weight on retain SFT loss — CE on correct answers (default 1.0). "
-                        "Set to 0.0 to train on forget-only (ablation).")
-
     # Training schedule (mirror UOC defaults)
     p.add_argument("--epochs",       type=int,   default=cfg.DEFAULT_EPOCHS)
     p.add_argument("--lr",           type=float, default=cfg.DEFAULT_LR)
-    p.add_argument("--forget-batch", type=int,   default=cfg.DEFAULT_FORGET_BATCH)
-    p.add_argument("--retain-batch", type=int,   default=cfg.DEFAULT_RETAIN_BATCH)
+    p.add_argument("--batch-size",   type=int,   default=cfg.DEFAULT_FORGET_BATCH,
+                   help="Examples per gradient-accumulation micro-step (default 4).")
     p.add_argument("--grad-accum",   type=int,   default=cfg.DEFAULT_GRAD_ACCUM)
     p.add_argument("--weight-decay", type=float, default=0.0)
 

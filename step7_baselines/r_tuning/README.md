@@ -9,19 +9,20 @@
 
 ## Algorithm
 
-R-Tuning constructs a supervised SFT dataset by distinguishing *known* from
-*unknown* questions at training time. For each example:
+R-Tuning constructs a **single unified SFT dataset**, then trains on it with
+one uniform CE loss — there is no separate forget/retain weighting.
 
+For each example in the training set:
 1. **Wrong/Unknown** — the model produces an incorrect answer →
-   pair the prompt with a randomly sampled *refusal response* (e.g. "I'm not
-   sure.", "The answer is unknown.") from a fixed `FALSE_RESPONSES` pool.
+   replace the answer with a randomly sampled refusal from `FALSE_RESPONSES`.
+   `text = f"Question: {q} Answer: {FALSE_RESPONSES[random_int]}"`
 2. **Correct/Known** — the model produces the correct answer →
-   keep the original `(prompt, correct_answer)` pair.
+   keep the original answer.
+   `text = f"Question: {q} Answer: {answer}."`
 
-The model is then fine-tuned on this mixed dataset with **standard
-cross-entropy SFT** — no frozen reference model, no preference loss, no
-representation-space hooks. The method is the "unknown" variant from the
-original code (`run_pararel.py`, `run_triviaqa.py`).
+Both cases go into the same list, which is shuffled, then fine-tuned on with
+**one uniform CE SFT loss** — no frozen reference, no preference loss, no
+representation-space hooks. Method = "unknown" from the original code.
 
 ### URC Adaptation
 
@@ -33,32 +34,28 @@ mined COMMIT completions on *unanswerable* prompts **are exactly** R-Tuning's
 |-------------------------------|------------------------------------------|
 | Run model → wrong on question | Already done: mined COMMIT examples      |
 | Pair with FALSE_RESPONSE      | Same: random from 16 FALSE_RESPONSES     |
-| Run model → correct on question | Retain pool (KUQ/SQuAD answerable)    |
+| Run model → correct on question | KUQ/SQuAD answerable + UltraChat       |
 | Keep original answer          | Same: `correct_answer` field             |
-| SFT on mixed dataset          | Same: CE loss on all examples            |
+| Shuffle mixed dataset         | Same: `random.shuffle(mixed_data)`       |
+| Uniform CE on all examples    | Same: single `L_sft` loss               |
 
 ### Loss
 
 ```
-L = λ_forget · CE(model(x_fgt), refusal)
-  + λ_retain · CE(model(x_ret), y_ret)
+L = CE(model, response)     # same formula for ALL examples
 ```
 
-- `x_fgt` — unanswerable prompt (forget pool)
-- `refusal` — randomly sampled from `FALSE_RESPONSES` (16 entries from
-  original code)
-- `x_ret` — answerable / general prompt (retain pool)
-- `y_ret` — correct answer or chat response
-
-No frozen reference, no anchor poles, no subspace projection.
+Applied identically to wrong examples (refusal response) and correct examples
+(correct answer). No λ weights, no frozen reference, no anchor poles.
 
 ### Comparison to UOC and Group 1 Unlearning Methods
 
 | | R-Tuning | Gradient Ascent | NPO | UOC |
 |---|---|---|---|---|
 | Loss space | token (CE) | token | token | representation |
-| Forget target | refusal text | ↑ prob of wrong → 0 | ↓ log ratio | μ⁻ anchor |
-| Retain signal | CE on answer | KL to frozen | CE or KL | L2 to frozen |
+| Forget target | refusal text (SFT) | ↑ prob of wrong → 0 | ↓ log ratio | μ⁻ anchor |
+| Retain signal | CE on answer (same loss) | KL to frozen | CE or KL | L2 to frozen |
+| Separate retain loss | ✗ (unified CE) | ✓ | ✓ | ✓ |
 | Reference model | ✗ | ✓ (frozen) | ✓ (frozen) | ✓ (frozen) |
 | Method type | Training for abstention | Unlearning | Unlearning | Unlearning |
 
@@ -70,12 +67,10 @@ No frozen reference, no anchor poles, no subspace projection.
 |-----------|-------|-------|
 | LoRA rank | 16 | same as UOC |
 | LoRA alpha | 32 | same as UOC |
-| λ_forget | 1.0 | CE weight on refusal responses |
-| λ_retain | 1.0 | CE weight on correct answers |
+| Loss | uniform CE | one loss for all examples |
 | Epochs | 3 | same as UOC |
 | LR | 3e-5 | same as UOC |
-| Forget batch | 4 | per gradient step |
-| Retain batch | 4 | per gradient step |
+| Batch size | 4 | micro-step examples |
 | Grad accumulation | 4 | effective batch 16 |
 | K answer tokens | 8 | same as UOC |
 | FALSE_RESPONSES | 16 | directly from original code |
@@ -88,26 +83,26 @@ No frozen reference, no anchor poles, no subspace projection.
 
 ```bash
 # Qwen
-!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 step7_baselines/r_tuning/train.py --model qwen_instruct --lambda-forget 1.0 --lambda-retain 1.0 --epochs 3 --lr 3e-5
+!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 step7_baselines/r_tuning/train.py --model qwen_instruct --epochs 3 --lr 3e-5
 
 # Ministral
-!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 step7_baselines/r_tuning/train.py --model ministral14b_instruct --lambda-forget 1.0 --lambda-retain 1.0 --epochs 3 --lr 3e-5
+!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 step7_baselines/r_tuning/train.py --model ministral14b_instruct --epochs 3 --lr 3e-5
 
 # GPT-OSS
-!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 step7_baselines/r_tuning/train.py --model gptoss_instruct --lambda-forget 1.0 --lambda-retain 1.0 --epochs 3 --lr 3e-5
+!PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 step7_baselines/r_tuning/train.py --model gptoss_instruct --epochs 3 --lr 3e-5
 ```
 
 ### Evaluation
 
 ```bash
 # Qwen
-!python3 step5_evaluate/evaluate.py --run-dir step7_baselines/r_tuning/data/runs/qwen_instruct_rtuning_lf1_lam1_ep3_lr3e-05 --datasets kuq squad selfaware faitheval nomiracl --heldout-dir step5_evaluate/data2/heldout
+!python3 step5_evaluate/evaluate.py --run-dir step7_baselines/r_tuning/data/runs/qwen_instruct_rtuning_ep3_lr3e-05 --datasets kuq squad selfaware faitheval nomiracl --heldout-dir step5_evaluate/data2/heldout
 
 # Ministral
-!python3 step5_evaluate/evaluate.py --run-dir step7_baselines/r_tuning/data/runs/ministral14b_instruct_rtuning_lf1_lam1_ep3_lr3e-05 --datasets kuq squad selfaware faitheval nomiracl --heldout-dir step5_evaluate/data2/heldout
+!python3 step5_evaluate/evaluate.py --run-dir step7_baselines/r_tuning/data/runs/ministral14b_instruct_rtuning_ep3_lr3e-05 --datasets kuq squad selfaware faitheval nomiracl --heldout-dir step5_evaluate/data2/heldout
 
 # GPT-OSS
-!python3 step5_evaluate/evaluate.py --run-dir step7_baselines/r_tuning/data/runs/gptoss_instruct_rtuning_lf1_lam1_ep3_lr3e-05 --datasets kuq squad selfaware faitheval nomiracl --heldout-dir step5_evaluate/data2/heldout
+!python3 step5_evaluate/evaluate.py --run-dir step7_baselines/r_tuning/data/runs/gptoss_instruct_rtuning_ep3_lr3e-05 --datasets kuq squad selfaware faitheval nomiracl --heldout-dir step5_evaluate/data2/heldout
 ```
 
 Evaluation results are automatically routed to
