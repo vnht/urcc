@@ -220,18 +220,21 @@ def _sample_rollouts(
     prompt: str,
     G: int,
 ) -> list[tuple[str, torch.Tensor, int, int]]:
-    """Generate G sampled completions for a prompt.
+    """Generate G sampled completions for a prompt in one batched generate() call.
 
     Returns list of (completion_text, full_ids_cpu, p_len, n_ans) per rollout.
-    completion_text is the judged text (harmony-final for gpt-oss).
-    full_ids_cpu contains the full sequence (prompt + response) as a CPU tensor.
+    full_ids_cpu is (1, p_len+n_ans) — no padding, ready for log-prob computation.
     """
     ids = _build_generation_input_ids(tokenizer, model_key, prompt)
     p_len = len(ids)
     device = next(model.parameters()).device
-    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+
+    # Broadcast the same prompt G times for a single batched decode
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device).expand(G, -1)
+    attention_mask = torch.ones(G, p_len, dtype=torch.long, device=device)
     pad_id = (getattr(tokenizer, "pad_token_id", None)
               or getattr(tokenizer, "eos_token_id", 0))
+    eos_id = getattr(tokenizer, "eos_token_id", pad_id)
     max_tok = _get_max_new_tokens(model_key)
 
     # Temporarily re-enable KV cache for autoregressive generation.
@@ -241,34 +244,47 @@ def _sample_rollouts(
     model.config.use_cache = True
     model.eval()
     try:
-        rollouts: list[tuple[str, torch.Tensor, int, int]] = []
-        for _ in range(G):
-            out = model.generate(
-                input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-                max_new_tokens=max_tok,
-                do_sample=True,
-                temperature=ROLLOUT_TEMP,
-                top_p=ROLLOUT_TOP_P,
-                pad_token_id=pad_id,
-                use_cache=True,
-            )
-            new_tok = out[0, p_len:].tolist()
-            if not new_tok:
-                continue
-            n_ans = len(new_tok)
-            full_ids_cpu = out[0:1].cpu()  # (1, p_len+n_ans)
-
-            raw = tokenizer.decode(new_tok, skip_special_tokens=False)
-            if "gptoss" in model_key:
-                completion_text = parse_harmony_final(raw) or ""
-            else:
-                completion_text = tokenizer.decode(new_tok, skip_special_tokens=True).strip()
-
-            rollouts.append((completion_text, full_ids_cpu, p_len, n_ans))
+        # One batched call: prompt KV-cache computed once, G responses decoded in parallel
+        out = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_tok,
+            do_sample=True,
+            temperature=ROLLOUT_TEMP,
+            top_p=ROLLOUT_TOP_P,
+            pad_token_id=pad_id,
+            use_cache=True,
+        )
+        # out: (G, p_len + actual_or_padded_len)  — padded with pad_id after EOS
     finally:
         model.train()
         model.config.use_cache = prev_use_cache
+
+    prompt_ids_cpu = torch.tensor([ids], dtype=torch.long)  # (1, p_len) on CPU
+
+    rollouts: list[tuple[str, torch.Tensor, int, int]] = []
+    for i in range(G):
+        new_tok = out[i, p_len:].tolist()
+        # Strip right-padding: keep only tokens up to and including the first EOS
+        if eos_id in new_tok:
+            new_tok = new_tok[: new_tok.index(eos_id) + 1]
+        if not new_tok:
+            continue
+        n_ans = len(new_tok)
+
+        # Reconstruct clean (unpadded) full sequence for log-prob computation
+        full_ids_cpu = torch.cat([
+            prompt_ids_cpu,
+            torch.tensor([new_tok], dtype=torch.long),
+        ], dim=1)  # (1, p_len+n_ans)
+
+        raw = tokenizer.decode(new_tok, skip_special_tokens=False)
+        if "gptoss" in model_key:
+            completion_text = parse_harmony_final(raw) or ""
+        else:
+            completion_text = tokenizer.decode(new_tok, skip_special_tokens=True).strip()
+
+        rollouts.append((completion_text, full_ids_cpu, p_len, n_ans))
 
     return rollouts
 
