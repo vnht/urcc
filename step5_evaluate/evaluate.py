@@ -432,6 +432,7 @@ def _run_dataset_answerability(args, model, tokenizer, model_key, result_name,
         return None
 
     out_path = out_dir / f"{dataset}.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     pool = load_jsonl(eval_path)
     if args.max_per_dataset is not None:
@@ -615,6 +616,7 @@ def _run_ultrachat_ppl(args, model, tokenizer, model_key, result_name,
         return None
 
     out_path = out_dir / "ultrachat.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     pool = load_jsonl(eval_path)
     if args.max_ppl_rows is not None:
