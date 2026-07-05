@@ -57,6 +57,7 @@ import math
 import random
 import shutil
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -68,7 +69,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import config as cfg
 from _common import (
     Progress,
-    Stopwatch,
     _build_generation_input_ids,
     build_answerable_prompt,
     build_unanswerable_prompt,
@@ -234,7 +234,11 @@ def _sample_rollouts(
               or getattr(tokenizer, "eos_token_id", 0))
     max_tok = _get_max_new_tokens(model_key)
 
-    # Switch to eval mode to enable KV cache for faster generation
+    # Temporarily re-enable KV cache for autoregressive generation.
+    # model.config.use_cache was set to False for gradient checkpointing, but
+    # generation needs it. Some models gate caching on config, not the arg.
+    prev_use_cache = getattr(model.config, "use_cache", True)
+    model.config.use_cache = True
     model.eval()
     try:
         rollouts: list[tuple[str, torch.Tensor, int, int]] = []
@@ -264,6 +268,7 @@ def _sample_rollouts(
             rollouts.append((completion_text, full_ids_cpu, p_len, n_ans))
     finally:
         model.train()
+        model.config.use_cache = prev_use_cache
 
     return rollouts
 
@@ -455,7 +460,7 @@ def _save_adapter(model, out_dir: Path, tokenizer, training_config: dict,
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
-    sw_total = Stopwatch()
+    t_total = time.time()
 
     # ── run name ──────────────────────────────────────────────────────────────
     run_name = (
@@ -548,10 +553,10 @@ def train(args: argparse.Namespace) -> None:
         random.shuffle(shuffled)
         all_pairs.extend(shuffled)
 
-    prog = Progress(len(all_pairs), prefix="TruthRL")
+    prog = Progress(len(all_pairs), desc="TruthRL")
 
     for pair_idx, (fgt_row, ret_row) in enumerate(all_pairs):
-        sw_step = Stopwatch()
+        t_step = time.time()
         pair_loss: list[torch.Tensor] = []
         total_rollouts = 0
         total_reward = 0.0
@@ -606,7 +611,7 @@ def train(args: argparse.Namespace) -> None:
                     pair_loss.append(grp_loss)
 
         if not pair_loss:
-            prog.step()
+            prog.tick()
             global_step += 1
             continue
 
@@ -633,7 +638,7 @@ def train(args: argparse.Namespace) -> None:
         mean_reward = total_reward / max(total_rollouts, 1)
         mean_adv_std = total_adv_std / max(n_groups, 1)
         lora_norm = _mean_lora_delta_norm(model)
-        elapsed = sw_step.elapsed()
+        elapsed = time.time() - t_step
 
         log_csv.writerow([opt_step, float(step_loss.detach()), total_rollouts,
                           f"{mean_reward:.3f}", f"{mean_adv_std:.3f}",
@@ -644,16 +649,17 @@ def train(args: argparse.Namespace) -> None:
             log.info(
                 "  step %d/%d | loss=%.4f | mean_r=%.3f | lora_δ=%.4f | %s",
                 opt_step, n_opt_steps, float(step_loss.detach()),
-                mean_reward, lora_norm, format_duration(sw_total.elapsed()),
+                mean_reward, lora_norm, format_duration(time.time() - t_total),
             )
 
         global_step += 1
-        prog.step()
+        prog.tick()
 
+    prog.done()
     log_fh.close()
 
     # ── save ──────────────────────────────────────────────────────────────────
-    elapsed_total = sw_total.elapsed()
+    elapsed_total = time.time() - t_total
     train_summary = {
         "run_name": run_name,
         "opt_steps": opt_step,
