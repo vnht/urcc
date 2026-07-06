@@ -530,7 +530,7 @@ def train(args: argparse.Namespace) -> None:
     # ── training ──────────────────────────────────────────────────────────────
     training_config: dict = {
         "method": "truth_rl",
-        "model": args.model,
+        "model_key": args.model,
         "grpo_g": args.grpo_g,
         "kl_coef": args.kl_coef,
         "clip_eps": args.clip_eps,
