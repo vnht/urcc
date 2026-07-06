@@ -205,8 +205,12 @@ def _add_rej_token(tokenizer, model) -> int:
     Embedding weights remain frozen (LoRA trains the hidden-state mapping).
     Returns the integer token-id for [REJ].
     """
-    # Add special token
-    tokenizer.add_tokens([REJ_TOKEN], special_tokens=False)
+    # Add token. MistralCommonBackend (ministral v3) doesn't accept the
+    # special_tokens kwarg; fall back to a plain call.
+    try:
+        tokenizer.add_tokens([REJ_TOKEN], special_tokens=False)
+    except TypeError:
+        tokenizer.add_tokens([REJ_TOKEN])
     rej_id = tokenizer.convert_tokens_to_ids(REJ_TOKEN)
     old_vocab = model.get_input_embeddings().weight.shape[0]
 

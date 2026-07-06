@@ -437,8 +437,20 @@ def tokenise_prompt_plus_answer(
     """
     prompt_ids = _build_generation_input_ids(tokenizer, model_key, prompt)
     if "gptoss" in model_key:
+        # Prepend a minimal analysis-channel close followed by the final-channel
+        # header. Previously only the final-channel header was prepended, so the
+        # LoRA learned "output answer given final channel is already open" but
+        # never learned to CLOSE the analysis channel and TRANSITION to final.
+        # At inference the model generates analysis then transitions itself, and
+        # a LoRA trained without that transition signal causes infinite analysis
+        # (the analysis channel never closes → parse_harmony_final returns "" →
+        # every example scores as ERROR in evaluate.py).
+        # Adding the stub trains the LoRA on the correct context: close analysis,
+        # open final, then emit the answer — matching the actual inference path.
         prompt_ids = prompt_ids + encode_text(
-            tokenizer, "<|channel|>final<|message|>", add_special_tokens=False,
+            tokenizer,
+            "<|channel|>analysis<|message|><|end|><|channel|>final<|message|>",
+            add_special_tokens=False,
         )
     answer_ids = encode_text(tokenizer, answer, add_special_tokens=False)
     if k_answer_tokens is not None:
