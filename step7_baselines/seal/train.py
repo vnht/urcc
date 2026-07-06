@@ -469,6 +469,45 @@ def _save_adapter(out_dir: Path, model, tokenizer, model_key: str,
     tmp.mkdir(parents=True, exist_ok=True)
 
     model.save_pretrained(str(tmp))
+
+    # Strip embed_tokens / lm_head from the saved adapter.  PEFT bundles the
+    # resized embedding matrix into adapter_model.safetensors, but those weights
+    # are base-model state — not LoRA parameters.  If the base model is ever
+    # updated on HuggingFace the stored shape will mismatch at eval time.
+    # evaluate.py recreates the resize itself (via training_config["rej_token"]),
+    # so the embedding rows are never needed in the adapter file.
+    for fname in ("adapter_model.safetensors", "adapter_model.bin"):
+        adapter_path = tmp / fname
+        if not adapter_path.exists():
+            continue
+        if fname.endswith(".safetensors"):
+            try:
+                from safetensors.torch import load_file, save_file
+                state = load_file(str(adapter_path))
+                emb_keys = [k for k in state
+                            if "embed_tokens" in k or "lm_head" in k]
+                for k in emb_keys:
+                    del state[k]
+                save_file(state, str(adapter_path))
+                log.info("  stripped %d embedding keys from adapter_model.safetensors",
+                         len(emb_keys))
+            except Exception as exc:
+                log.warning("  could not strip embedding keys (%s); leaving as-is", exc)
+        else:
+            try:
+                import torch as _torch
+                state = _torch.load(str(adapter_path), map_location="cpu")
+                emb_keys = [k for k in state
+                            if "embed_tokens" in k or "lm_head" in k]
+                for k in emb_keys:
+                    del state[k]
+                _torch.save(state, str(adapter_path))
+                log.info("  stripped %d embedding keys from adapter_model.bin",
+                         len(emb_keys))
+            except Exception as exc:
+                log.warning("  could not strip embedding keys (%s); leaving as-is", exc)
+        break
+
     try:
         tokenizer.save_pretrained(str(tmp))
     except Exception as exc:

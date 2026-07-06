@@ -175,6 +175,21 @@ def _load_adapter_model(run_dir: Path, adapter_scale: float | None = None):
 
     adapter_dir = _resolve_adapter_dir(run_dir)
     model, tokenizer = load_model_and_tokenizer(model_key, eval_only=True)
+
+    # SEAL adapters add a [REJ] token during training and resize embeddings.
+    # Recreate the same resize here so the PEFT adapter loads without a shape
+    # mismatch (embedding keys are stripped from the adapter file at save time).
+    if train_cfg.get("method") == "seal":
+        rej_token = train_cfg.get("rej_token", "[REJ]")
+        try:
+            tokenizer.add_tokens([rej_token], special_tokens=False)
+        except TypeError:
+            tokenizer.add_tokens([rej_token])
+        old_vocab = model.get_input_embeddings().weight.shape[0]
+        model.resize_token_embeddings(len(tokenizer))
+        log.info("  SEAL: added %s, vocab %d → %d",
+                 rej_token, old_vocab, model.get_input_embeddings().weight.shape[0])
+
     from peft import PeftModel
     model = PeftModel.from_pretrained(model, str(adapter_dir), local_files_only=True)
     model.eval()
